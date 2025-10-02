@@ -35,20 +35,19 @@ map.on("click",()=>{
   clearRouteHighlights();
 });
 
-// If user drags the map, stop following the vehicle
+
 map.on("dragstart", ()=> { pinnedFollow=false; });
-// If any popup closes, stop following unless we re-pin later
 map.on("popupclose", ()=> { pinnedFollow=false; });
 
 const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"};
 const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8"};
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 
-// Polling jitter to desync tabs
+
 const MIN_POLL_MS=12000, MAX_POLL_MS=18000;
 function basePollDelay(){return MIN_POLL_MS+Math.floor(Math.random()*(MAX_POLL_MS-MIN_POLL_MS+1));}
 
-// Per endpoint backoff
+
 const BACKOFF_START_MS=15000, BACKOFF_MAX_MS=120000;
 const backoff = {
   realtime: { ms:0, until:0 },
@@ -67,7 +66,7 @@ function applyRateLimitBackoff(retryAfterMs, who){
 let vehiclesAbort, vehiclesInFlight=false, pollTimeoutId=null, pageVisible=!document.hidden;
 let hidePauseTimerId=null; const HIDE_PAUSE_DELAY_MS=10000;
 
-// Debug + mobile last-update helpers
+
 function setDebug(msg){ if(debugBox) debugBox.textContent=msg; }
 function setLastUpdateTs(ts){
   if (!mobileUpdateEl) return;
@@ -92,7 +91,6 @@ function buildBusTypeIndex(json){const idx={}; if(!json||typeof json!=="object")
 function getBusType(op,num){const ix=busTypeIndex[op]; return ix?(ix[num]||""):"";}
 function trainColorForRoute(s){ if(!s) return vehicleColors.train; if(s.includes("STH"))return trainLineColors.STH; if(s.includes("WEST"))return trainLineColors.WEST; if(s.includes("EAST"))return trainLineColors.EAST; if(s.includes("ONE"))return trainLineColors.ONE; return vehicleColors.train; }
 
-
 function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine){
   return `<div style="font-size:0.9em;line-height:1.3;">
       <b>Route:</b> ${routeName}<br>
@@ -105,7 +103,6 @@ function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,spee
       ${bikesLine}
     </div>`;
 }
-
 
 function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
   const isMobile=window.innerWidth<=600;
@@ -121,7 +118,6 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
     if(m._baseRadius==null) m._baseRadius=baseRadius;
     Object.assign(m,fields);
 
-
     Object.values(vehicleLayers).forEach(l=>l.removeLayer(m));
     (vehicleLayers[type]||vehicleLayers.out).addLayer(m);
   }else{
@@ -135,7 +131,7 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
       marker.on("mouseout", function(){ if(pinnedPopup!==this) this.closePopup(); });
       marker.on("click",    function(e){
         if(pinnedPopup&&pinnedPopup!==this) pinnedPopup.closePopup();
-        pinnedPopup=this; pinnedFollow=true; // start following when user pins
+        pinnedPopup=this; pinnedFollow=true;
         this.openPopup();
         e?.originalEvent?.stopPropagation?.();
       });
@@ -160,7 +156,6 @@ function updateVehicleCount(){
   style.textContent=`.veh-highlight{stroke:#333;stroke-width:3;}`;
   document.head.appendChild(style);
 })();
-
 
 function updateControlsHeight() {
   const el = document.getElementById("controls");
@@ -222,7 +217,7 @@ function resolveQueryToMarkers(raw){
 }
 function isMobileScreen(){ return window.innerWidth <= 600; }
 
-// Search control in top-left under the map controls
+// Search control 
 const SearchControl=L.Control.extend({
   options:{position:"topleft"},
   onAdd:function(){
@@ -253,7 +248,7 @@ const SearchControl=L.Control.extend({
 
       if (pinnedPopup && pinnedPopup !== m) pinnedPopup.closePopup();
       pinnedPopup = m;
-      pinnedFollow = true;  // start following when user searches and selects
+      pinnedFollow = true;
 
       const needMove =
         map.getZoom() < targetZoom ||
@@ -272,7 +267,7 @@ const SearchControl=L.Control.extend({
         const once = () => { if (done) return; done = true; map.off("moveend", once); doOpen(); };
         map.once("moveend", once);
         map.setView(ll, targetZoom, { animate: true });
-        setTimeout(once, 600); // safety on some mobile browsers
+        setTimeout(once, 600);
       } else {
         doOpen();
       }
@@ -352,7 +347,6 @@ const SearchControl=L.Control.extend({
       }
       sugg.innerHTML=html.join("");
 
-  
       sugg.querySelectorAll(".suggestion-item").forEach(el=>{
         el.addEventListener("pointerup",(ev)=>{
           ev.preventDefault(); ev.stopPropagation();
@@ -377,7 +371,6 @@ const SearchControl=L.Control.extend({
   }
 });
 map.addControl(new SearchControl());
-
 
 async function fetchTripsBatch(tripIds){
   const idsToFetch=tripIds.filter(t=>t && !tripCache[t]); if(!idsToFetch.length) return;
@@ -405,7 +398,6 @@ async function fetchTripsBatch(tripIds){
   }
 }
 
-
 function pairAMTrains(inSvc,outOfService){
   const pairs=[], used=new Set();
   inSvc.forEach(inT=>{
@@ -426,7 +418,6 @@ function pairAMTrains(inSvc,outOfService){
   return pairs;
 }
 
-
 function renderFromCache(c){
   if(!c) return;
   c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.popupContent,v.color,v.typeKey,v.tripId,{
@@ -437,7 +428,6 @@ function renderFromCache(c){
   setLastUpdateTs(ts);
   updateVehicleCount();
 }
-
 
 async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false }){
   const ignoreBackoff = !!opts.ignoreBackoff;
@@ -463,7 +453,6 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       return;
     }
 
-
     backoff.realtime.ms = Math.floor(backoff.realtime.ms/2);
     if(backoff.realtime.ms < 4000) backoff.realtime.ms = 0;
     backoff.realtime.until = 0;
@@ -488,7 +477,6 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         speedKmh=(isTrain||isFerry||isAM)?v.vehicle.position.speed*3.6:v.vehicle.position.speed;
         speedStr=isFerry?`${speedKmh.toFixed(1)} km/h (${(v.vehicle.position.speed*1.94384).toFixed(1)} kn)`:`${speedKmh.toFixed(1)} km/h`;
       }
-
 
       let occupancy="N/A";
       const occProto = v.vehicle?.occupancy_status ?? v.vehicle?.occupancyStatus ?? v.vehicle?.occupancy?.status;
@@ -525,11 +513,21 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         }
       }
 
-      // bus model matching
-      let busType=vehicleMarkers[vehicleId]?.busType||"";
-      const wasBus=vehicleMarkers[vehicleId]?.currentType==="bus", isBusNow=typeKey==="bus";
-      const needType=(isBusNow && !busType) || (isBusNow && !wasBus) || (!vehicleMarkers[vehicleId] && isBusNow);
-      if(needType && operator){ const model=getBusType(operator,vehicleNumber); if(model) busType=model; }
+      let busType = vehicleMarkers[vehicleId]?.busType || "";
+      const wasBus   = vehicleMarkers[vehicleId]?.currentType === "bus";
+      const isBusNow = typeKey === "bus";
+      const hasPlate = !!licensePlate && licensePlate !== "N/A";
+      const wantTypeForOut = (typeKey === "out" && hasPlate && !isTrain && !isFerry && !isAM);
+      const needType =
+        (isBusNow && !busType) ||
+        (isBusNow && !wasBus)  ||
+        (!vehicleMarkers[vehicleId] && isBusNow) ||
+        (wantTypeForOut && !busType);
+      if (needType && operator) {
+        const model = getBusType(operator, vehicleNumber);
+        if (model) busType = model;
+      }
+   
 
       const popup=buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine);
 
@@ -570,13 +568,12 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         const vehPx = map.latLngToLayerPoint(ll);
         const dx = Math.abs(centerPx.x - vehPx.x);
         const dy = Math.abs(centerPx.y - vehPx.y);
-        if (dx > 6 || dy > 6) { // small deadzone to reduce jitter
+        if (dx > 6 || dy > 6) {
           map.panTo(ll, { animate: true });
         }
       } catch {}
     }
 
-   
     const nowTs = Date.now();
     localStorage.setItem("realtimeSnapshot",JSON.stringify(cachedState));
     setDebug(`Realtime update complete at ${new Date(nowTs).toLocaleTimeString()}`);
@@ -619,7 +616,6 @@ window.addEventListener("pagehide",()=>{ pauseUpdatesNow(); });
 window.addEventListener("focus",()=>{ resumeUpdatesNow(); });
 window.addEventListener("blur",()=>{ schedulePauseAfterHide(); });
 
-
 async function init(){
   const rj=await safeFetch(routesUrl); if(rj&&rj._rateLimited) applyRateLimitBackoff(rj.retryAfterMs,"routes");
   if(rj?.data){ rj.data.forEach(r=>{const a=r.attributes||r; routes[r.id]={route_type:a.route_type,route_short_name:a.route_short_name,route_long_name:a.route_long_name,route_color:a.route_color,agency_id:a.agency_id};}); }
@@ -647,6 +643,3 @@ async function init(){
   }, initialJitter);
 }
 init();
-
-
-
