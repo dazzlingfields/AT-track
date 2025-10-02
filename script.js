@@ -1,4 +1,4 @@
-// v4.63 Realtime Vehicle Tracking
+//script
 const proxyBaseUrl = "https://atrealtime.vercel.app";
 const realtimeUrl  = `${proxyBaseUrl}/api/realtime`;
 const routesUrl    = `${proxyBaseUrl}/api/routes`;
@@ -19,16 +19,16 @@ L.control.layers(baseMaps,null).addTo(map);
 
 const vehicleLayers={bus:L.layerGroup().addTo(map),train:L.layerGroup().addTo(map),ferry:L.layerGroup().addTo(map),out:L.layerGroup().addTo(map)};
 
-const vehicleMarkers={};              // id -> Leaflet marker
-const tripCache={};                   // trip_id -> {trip_id, route_id, trip_headsign, bikes_allowed}
+const vehicleMarkers={};              
+const tripCache={};                   
 let routes={}, busTypes={}, busTypeIndex={};
-const vehicleIndexByFleet=new Map();  // "AM123" etc -> marker
-const routeIndex=new Map();           // route short key -> Set(markers)
+const vehicleIndexByFleet=new Map();  
+const routeIndex=new Map();         
 const debugBox=document.getElementById("debug");
 const mobileUpdateEl=document.getElementById("mobile-last-update");
 
-let pinnedPopup=null;                 // marker object currently pinned
-let pinnedFollow=false;               // when true, keep pinnedPopup centered as it moves
+let pinnedPopup=null;           
+let pinnedFollow=false;            
 
 map.on("click",()=>{
   if(pinnedPopup){ pinnedPopup.closePopup(); pinnedPopup=null; pinnedFollow=false; }
@@ -92,7 +92,7 @@ function buildBusTypeIndex(json){const idx={}; if(!json||typeof json!=="object")
 function getBusType(op,num){const ix=busTypeIndex[op]; return ix?(ix[num]||""):"";}
 function trainColorForRoute(s){ if(!s) return vehicleColors.train; if(s.includes("STH"))return trainLineColors.STH; if(s.includes("WEST"))return trainLineColors.WEST; if(s.includes("EAST"))return trainLineColors.EAST; if(s.includes("ONE"))return trainLineColors.ONE; return vehicleColors.train; }
 
-// Popup builder
+
 function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine){
   return `<div style="font-size:0.9em;line-height:1.3;">
       <b>Route:</b> ${routeName}<br>
@@ -106,7 +106,7 @@ function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,spee
     </div>`;
 }
 
-// Add or update a marker
+
 function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
   const isMobile=window.innerWidth<=600;
   const baseRadius=isMobile?6:5;
@@ -121,7 +121,7 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
     if(m._baseRadius==null) m._baseRadius=baseRadius;
     Object.assign(m,fields);
 
-    // ensure correct layer after type change
+
     Object.values(vehicleLayers).forEach(l=>l.removeLayer(m));
     (vehicleLayers[type]||vehicleLayers.out).addLayer(m);
   }else{
@@ -161,7 +161,7 @@ function updateVehicleCount(){
   document.head.appendChild(style);
 })();
 
-// keep the search stack below the controls panel on mobile
+
 function updateControlsHeight() {
   const el = document.getElementById("controls");
   if (!el) return;
@@ -352,7 +352,7 @@ const SearchControl=L.Control.extend({
       }
       sugg.innerHTML=html.join("");
 
-      // pointerup is reliable on touch for not collapsing early
+  
       sugg.querySelectorAll(".suggestion-item").forEach(el=>{
         el.addEventListener("pointerup",(ev)=>{
           ev.preventDefault(); ev.stopPropagation();
@@ -378,7 +378,7 @@ const SearchControl=L.Control.extend({
 });
 map.addControl(new SearchControl());
 
-// Trips fetch with incremental caching
+
 async function fetchTripsBatch(tripIds){
   const idsToFetch=tripIds.filter(t=>t && !tripCache[t]); if(!idsToFetch.length) return;
   for(const ids of chunk([...new Set(idsToFetch)],100)){
@@ -389,7 +389,7 @@ async function fetchTripsBatch(tripIds){
         const a=t.attributes;
         if(a){ tripCache[a.trip_id]={trip_id:a.trip_id,trip_headsign:a.trip_headsign||"N/A",route_id:a.route_id,bikes_allowed:a.bikes_allowed}; }
       });
-      // refresh popup content for markers that now have trip info
+  
       ids.forEach(tid=>{
         const trip=tripCache[tid]; if(!trip) return;
         Object.values(vehicleMarkers).forEach(m=>{
@@ -405,7 +405,7 @@ async function fetchTripsBatch(tripIds){
   }
 }
 
-// Pair AM trains for 6 car display
+
 function pairAMTrains(inSvc,outOfService){
   const pairs=[], used=new Set();
   inSvc.forEach(inT=>{
@@ -426,7 +426,7 @@ function pairAMTrains(inSvc,outOfService){
   return pairs;
 }
 
-// Render from localStorage snapshot
+
 function renderFromCache(c){
   if(!c) return;
   c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.popupContent,v.color,v.typeKey,v.tripId,{
@@ -438,7 +438,7 @@ function renderFromCache(c){
   updateVehicleCount();
 }
 
-// Main realtime fetch
+
 async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false }){
   const ignoreBackoff = !!opts.ignoreBackoff;
   const now = Date.now();
@@ -463,7 +463,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       return;
     }
 
-    // relax realtime backoff on success
+
     backoff.realtime.ms = Math.floor(backoff.realtime.ms/2);
     if(backoff.realtime.ms < 4000) backoff.realtime.ms = 0;
     backoff.realtime.until = 0;
@@ -489,7 +489,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         speedStr=isFerry?`${speedKmh.toFixed(1)} km/h (${(v.vehicle.position.speed*1.94384).toFixed(1)} kn)`:`${speedKmh.toFixed(1)} km/h`;
       }
 
-      // occupancy robust parsing
+
       let occupancy="N/A";
       const occProto = v.vehicle?.occupancy_status ?? v.vehicle?.occupancyStatus ?? v.vehicle?.occupancy?.status;
       if(occProto!==undefined && occProto!==null){
@@ -525,7 +525,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         }
       }
 
-      // bus model
+      // bus model matching
       let busType=vehicleMarkers[vehicleId]?.busType||"";
       const wasBus=vehicleMarkers[vehicleId]?.currentType==="bus", isBusNow=typeKey==="bus";
       const needType=(isBusNow && !busType) || (isBusNow && !wasBus) || (!vehicleMarkers[vehicleId] && isBusNow);
@@ -554,7 +554,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     pairAMTrains(inServiceAM,outOfServiceAM);
 
-    // remove markers not present now
+    // remove old markers
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
         if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
@@ -562,7 +562,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       }
     });
 
-    // If a vehicle is pinned and follow mode is on, keep it centered
+    // follow vehicles
     if (pinnedPopup && pinnedFollow) {
       try {
         const ll = pinnedPopup.getLatLng();
@@ -576,7 +576,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       } catch {}
     }
 
-    // status + mobile time
+   
     const nowTs = Date.now();
     localStorage.setItem("realtimeSnapshot",JSON.stringify(cachedState));
     setDebug(`Realtime update complete at ${new Date(nowTs).toLocaleTimeString()}`);
@@ -619,7 +619,7 @@ window.addEventListener("pagehide",()=>{ pauseUpdatesNow(); });
 window.addEventListener("focus",()=>{ resumeUpdatesNow(); });
 window.addEventListener("blur",()=>{ schedulePauseAfterHide(); });
 
-// init
+
 async function init(){
   const rj=await safeFetch(routesUrl); if(rj&&rj._rateLimited) applyRateLimitBackoff(rj.retryAfterMs,"routes");
   if(rj?.data){ rj.data.forEach(r=>{const a=r.attributes||r; routes[r.id]={route_type:a.route_type,route_short_name:a.route_short_name,route_long_name:a.route_long_name,route_color:a.route_color,agency_id:a.agency_id};}); }
@@ -647,4 +647,5 @@ async function init(){
   }, initialJitter);
 }
 init();
+
 
