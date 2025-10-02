@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>AT Realtime Map</title>
+  <link rel="icon" type="image/x-icon" href="train.png" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"/>
+
+  <style>
+    :root{
+  --panel-bg: rgba(255,255,255,0.82);
+  --panel-border: rgba(60,60,67,0.18);
+  --elev-1: 0 6px 16px rgba(0,0,0,0.12);
+  --elev-2: 0 12px 28px rgba(0,0,0,0.18);
+  --text-strong: #1c1c1e;
+  --text-subtle: #6e6e73;
+  --accent: #0a84ff;
+  --accent-weak: rgba(10,132,255,0.12);
+  --r-xl: 20px;
+  --r-lg: 14px;
+  --r-md: 10px;
+  --gap-1: 6px;
+  --gap-2: 10px;
+  --gap-3: 14px;
+  --gap-4: 16px;
+  --glass-blur: 12px;
+  --panel-backdrop: saturate(180%) blur(var(--glass-blur));
+  --ring: 0 0 0 2px rgba(10,132,255,0.45);
+  --controls-height: 0px; /* set by JS to place the search below #controls */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root{
+    --panel-bg: rgba(28,28,30,0.74);
+    --panel-border: rgba(255,255,255,0.14);
+    --elev-1: 0 8px 20px rgba(0,0,0,0.5);
+    --elev-2: 0 16px 36px rgba(0,0,0,0.6);
+    --text-strong: #f5f5f7;
+    --text-subtle: #a1a1a6;
+    --accent: #0a84ff;
+    --accent-weak: rgba(10,132,255,0.18);
+    --ring: 0 0 0 2px rgba(10,132,255,0.55);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+
+html, body {
+  margin: 0; padding: 0; width: 100%;
+  overflow-x: hidden;
+  color: var(--text-strong);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+#map { height: 100vh; width: 100vw; }
+
+h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px; }
+
+/* Controls panel */
+#controls {
+  position: absolute; top: 12px; left: 12px; z-index: 1200;
+  background: var(--panel-bg);
+  backdrop-filter: var(--panel-backdrop);
+  -webkit-backdrop-filter: var(--panel-backdrop);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-xl);
+  box-shadow: var(--elev-1);
+  padding: 14px 16px;
+  max-width: 280px;
+  display: grid;
+  gap: var(--gap-3);
+  transition: box-shadow 140ms ease, transform 140ms ease;
+}
+#controls:focus-within { box-shadow: var(--elev-2); transform: translateY(-0.5px); }
+
+.control-group { margin: 0; }
+.control-group h4 { font-size: 18px; margin-bottom: 6px; }
+
+#filters { display: grid; gap: 8px; }
+#filters label {
+  display: grid; grid-template-columns: 18px 1fr; align-items: center; column-gap: 10px;
+  font-size: 14px; color: var(--text-strong); cursor: pointer; user-select: none;
+  padding: 6px 8px; border-radius: var(--r-md);
+  transition: background-color 120ms ease;
+}
+#filters label:hover { background: var(--accent-weak); }
+#filters input[type="checkbox"] {
+  width: 16px; height: 16px; margin: 0;
+  accent-color: var(--accent);
+}
+
+#debug, #vehicle-count {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; color: var(--text-subtle); line-height: 1.35;
+}
+
+/* Leaflet popups */
+.leaflet-popup-content { font-size: 14px; line-height: 1.28; color: var(--text-strong); }
+.leaflet-popup-content b { color: var(--text-strong); }
+.leaflet-popup-content-wrapper, .leaflet-popup-tip {
+  background: var(--panel-bg);
+  backdrop-filter: var(--panel-backdrop);
+  -webkit-backdrop-filter: var(--panel-backdrop);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--elev-1);
+}
+
+/* Search control wrapper sits beneath #controls, in the left stack */
+.leaflet-control.search-wrapper{
+  z-index: 1300; /* sit above #controls container */
+}
+.leaflet-top.leaflet-left .leaflet-control.search-wrapper{
+  margin-left: max(12px, env(safe-area-inset-left));
+  margin-top: calc(var(--controls-height, 0px) + 12px);
+  margin-right: 0;
+}
+
+/* Search control base */
+.leaflet-control.search-control {
+  position: relative;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--elev-1);
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px;
+  transition: box-shadow 120ms ease, transform 120ms ease;
+}
+.leaflet-control.search-control:focus-within { box-shadow: var(--elev-2); transform: translateY(-0.5px); }
+
+.search-icon-btn {
+  width: 30px; height: 30px;
+  border: 1px solid var(--panel-border);
+  border-radius: 9px; background: rgba(255,255,255,0.9);
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+  transition: transform 80ms ease, box-shadow 120ms ease, background-color 120ms ease;
+}
+@media (prefers-color-scheme: dark) {
+  .search-icon-btn { background: rgba(44,44,46,0.9); }
+}
+.search-icon-btn:active { transform: scale(0.98); }
+.search-icon-btn svg { width: 16px; height: 16px; display: block; }
+
+.search-input {
+  flex: 1 1 auto;
+  max-width: 0; opacity: 0; overflow: hidden;
+  border: 1px solid var(--panel-border);
+  background: rgba(255,255,255,0.9);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 14px;
+  outline: none;
+  transition: max-width 160ms ease, opacity 140ms ease, box-shadow 120ms ease;
+}
+@media (prefers-color-scheme: dark) {
+  .search-input { background: rgba(44,44,46,0.92); color: var(--text-strong); }
+}
+.search-input::placeholder { color: var(--text-subtle); }
+.search-input:focus-visible { box-shadow: var(--ring); }
+
+/* Desktop expand */
+.search-control.expanded .search-input { max-width: 320px; opacity: 1; }
+.search-cancel {
+  display: none;
+  height: 30px; padding: 0 10px;
+  border-radius: 9px; border: 1px solid var(--panel-border);
+  background: transparent; color: var(--accent);
+  font-size: 14px; cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease, transform 80ms ease;
+}
+.search-cancel:active { transform: scale(0.98); }
+.search-control.expanded .search-cancel {
+  display: inline-flex; align-items: center; justify-content: center;
+}
+
+/* Suggestions */
+.search-suggestions {
+  position: absolute; top: calc(100% + 6px); left: 0; right: auto;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--elev-2);
+  max-height: 260px;
+  overflow: auto;
+  display: none;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  z-index: 1400;
+  max-width: 320px;
+}
+.search-control.expanded .search-suggestions { display: block; }
+
+.suggestion-section {
+  padding: 8px 10px 6px 10px;
+  font-size: 12px; color: var(--text-subtle);
+  position: sticky; top: 0;
+  background: inherit; backdrop-filter: var(--panel-backdrop);
+}
+.suggestion-item {
+  padding: 10px 14px;
+  font-size: 14px; cursor: pointer;
+  display: grid; grid-template-columns: 1fr auto; align-items: center;
+  gap: 10px;
+  transition: background-color 100ms ease;
+}
+.suggestion-item + .suggestion-item { border-top: 1px solid var(--panel-border); }
+.suggestion-item:hover, .suggestion-item:active { background: var(--accent-weak); }
+.suggestion-meta { color: var(--text-subtle); font-size: 12px; }
+
+.vehicle-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 8px; border-radius: 999px;
+  background: rgba(0,0,0,0.06);
+  color: var(--text-strong); font-size: 12px; font-weight: 600;
+}
+@media (prefers-color-scheme: dark) {
+  .vehicle-chip { background: rgba(255,255,255,0.08); }
+}
+
+/* Mobile rules */
+@media (max-width: 600px) {
+  #controls{
+    top: max(10px, env(safe-area-inset-top));
+    left: max(10px, env(safe-area-inset-left));
+    right: auto; bottom: auto;
+    width: 140px;
+    border-radius: 14px;
+    padding: 8px 9px;
+    gap: 8px;
+    box-shadow: var(--elev-2);
+  }
+  .control-group h4{ font-size: 14px; margin-bottom: 4px; }
+  #filters{ gap: 6px; grid-template-columns: 1fr; }
+  #filters label{ padding: 6px 8px; font-size: 12px; column-gap: 8px; border-radius: 10px; }
+  #filters input[type="checkbox"]{ width: 16px; height: 16px; }
+
+  .leaflet-popup-content{ font-size: 13.5px; line-height: 1.35; }
+
+  /* collapsed by default on phones */
+  .search-input{ max-width: 0; opacity: 0; }
+  .search-control.expanded .search-input{
+    max-width: min(50vw, 340px);
+    opacity: 1;
+    font-size: 16px;
+    padding: 10px 12px;
+  }
+
+  /* cancel button visible only when expanded */
+  .search-cancel { display: none; }
+  .search-control.expanded .search-cancel{
+    display: inline-flex;
+    align-items: center; justify-content: center;
+    width: 28px; height: 28px; padding: 0; margin-left: 4px;
+    border-radius: 10px; border: 1px solid var(--panel-border);
+    background: transparent; font-size: 0;
+  }
+  .search-control.expanded .search-cancel::before{
+    content: "✕"; font-size: 16px; line-height: 1; color: var(--text-strong);
+  }
+  @media (prefers-color-scheme: dark) {
+    .search-control.expanded .search-cancel::before { color: #fff; }
+  }
+
+  .search-control .search-suggestions{
+    left: 0; right: auto;
+    max-width: min(50vw, 340px);
+    max-height: min(48vh, 320px);
+  }
+
+  /* hide debug on phones */
+  #debug, #vehicle-count { display: none !important; }
+  #vehicle-count::before { display: none !important; content: none; }
+
+  /* show last update badge on phones */
+  #mobile-last-update{ display: block; }
+}
+
+/* Extra small phones */
+@media (max-width: 360px){
+  #controls{ width: 135px; padding: 8px 9px; border-radius: 12px; top: calc(12px + 4px); }
+  #filters label{ font-size: 12px; padding: 6px 7px; }
+  .control-group h4{ font-size: 13px; }
+  .search-control.expanded .search-input{ max-width: min(52vw, 300px); }
+  .search-control .search-suggestions{ max-width: min(52vw, 300px); max-height: min(44vh, 280px); }
+}
+
+/* Mobile last update badge */
+#mobile-last-update{
+  position: fixed;
+  left: 10px;
+  bottom: calc(10px + env(safe-area-inset-bottom));
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1;
+  color: #1c1c1e;
+  background: rgba(255,255,255,0.85);
+  border: 1px solid rgba(60,60,67,0.18);
+  border-radius: 10px;
+  padding: 6px 8px;
+  box-shadow: 0 6px 16px rgba(0,0,0,0.12);
+  z-index: 1200;
+  pointer-events: none;
+  display: none; /* shown via mobile media query */
+}
+@media (prefers-color-scheme: dark){
+  #mobile-last-update{
+    color:#f5f5f7;
+    background: rgba(28,28,30,0.74);
+    border-color: rgba(255,255,255,0.14);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+  }
+}
+
+/* Focus ring normalization */
+:where(button,[role="button"],input,.search-icon-btn,.search-cancel):focus-visible {
+  outline: none; box-shadow: var(--ring);
+}
+
+  </style>
+</head>
+
+<body>
+  <div id="controls">
+    <div class="control-group">
+      <h4>Vehicle Display</h4>
+      <div id="filters">
+        <label><input type="checkbox" data-layer="bus" checked> Buses</label>
+        <label><input type="checkbox" data-layer="train" checked> Trains</label>
+        <label><input type="checkbox" data-layer="ferry" checked> Ferries</label>
+        <label><input type="checkbox" data-layer="out" checked> Out of Service</label>
+      </div>
+    </div>
+    <div id="debug">Realtime status...</div>
+    <div id="vehicle-count">Vehicles: 0 | Last refresh: N/A</div>
+  </div>
+
+  <div id="map"></div>
+  
+  <div id="mobile-last-update">Last update: —</div>
+  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
+
+
+
+
