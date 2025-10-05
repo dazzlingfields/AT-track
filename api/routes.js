@@ -6,7 +6,7 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
 
   const UPSTREAM_URL = "https://api.at.govt.nz/gtfs/v3/routes";
-  const TTL_MS = 30 * 60 * 1000;       // 30 minutes fresh
+  const TTL_MS = 45 * 60 * 1000;       // 30 minutes fresh
   const STALE_FALLBACK_MS = 6 * 60 * 60 * 1000; // up to 6 hours stale on failures
 
   const now = Date.now();
