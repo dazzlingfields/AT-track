@@ -5,8 +5,8 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // Serve the same snapshot for a short window to keep all clients in sync
-  const TTL_MS = 6000;                   // shared snapshot lifetime
+  // Serve the same snapshot for a short window to keep all users in sync
+  const TTL_MS = 9000;                   // shared snapshot lifetime 9s
   const STALE_FALLBACK_MAX_MS = 120000;  // serve stale up to 2 min on errors
   const UPSTREAM_URL = "https://api.at.govt.nz/realtime/legacy";
 
