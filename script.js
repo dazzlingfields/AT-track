@@ -44,7 +44,7 @@ const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8"
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 
 
-const MIN_POLL_MS=12000, MAX_POLL_MS=18000;
+const MIN_POLL_MS=15000, MAX_POLL_MS=27000;
 function basePollDelay(){return MIN_POLL_MS+Math.floor(Math.random()*(MAX_POLL_MS-MIN_POLL_MS+1));}
 
 
@@ -643,3 +643,4 @@ async function init(){
   }, initialJitter);
 }
 init();
+
