@@ -202,7 +202,7 @@ function resolveQueryToMarkers(raw){
   if(routeIndex.has(routeKey)){
     const set=routeIndex.get(routeKey);
     const list=[...set];
-    return {type:"route", markers:list, exemplar:list[0]||null};
+    return {type:"route", markers=list, exemplar=list[0]||null};
   }
   for(const [key,marker] of vehicleIndexByFleet.entries()){
     if(key.startsWith(fleetKey)) return {type:"fleet", exemplar:marker};
@@ -210,7 +210,7 @@ function resolveQueryToMarkers(raw){
   for(const [rk,set] of routeIndex.entries()){
     if(rk.startsWith(routeKey)){
       const list=[...set];
-      return {type:"route", markers:list, exemplar:list[0]||null};
+      return {type:"route", markers=list, exemplar=list[0]||null};
     }
   }
   return {type:"none"};
@@ -333,7 +333,7 @@ const SearchControl=L.Control.extend({
         if(label.startsWith(qNorm)){ fleets.push({label}); if(fleets.length>=8) break; }
       }
       for(const [rk,set] of routeIndex.entries()){
-        if(rk.startsWith(qNorm)){ routesList.push({rk,count:set.size}); if(routesList.length>=8) break; }
+        if(rk.startsWith(qNorm)){ routesList.push({rk,count=set.size}); if(routesList.length>=8) break; }
       }
 
       const html=[];
@@ -517,7 +517,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       const wasBus   = vehicleMarkers[vehicleId]?.currentType === "bus";
       const isBusNow = typeKey === "bus";
       const hasPlate = !!licensePlate && licensePlate !== "N/A";
-      const wantTypeForOut = (typeKey === "out" && hasPlate && !isTrain && !isFerry && !isAM);
+      const wantTypeForOut = (typeKey === "out" and hasPlate and !isTrain and !isFerry and !isAM);
       const needType =
         (isBusNow && !busType) ||
         (isBusNow && !wasBus)  ||
@@ -580,7 +580,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     setLastUpdateTs(nowTs);
     updateVehicleCount();
 
-    await fetchTripsBatch([...new Set(allTripIds)]);
+    fetchTripsBatch([...new Set(allTripIds)]);
   }finally{
     clearTimeout(watchdog);
     vehiclesInFlight=false;
