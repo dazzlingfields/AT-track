@@ -206,7 +206,8 @@ function resolveQueryToMarkers(raw){
   for(const [rk,set] of routeIndex.entries()){
     if(rk.startsWith(routeKey)){
       const list=[...set];
-      return {type:"route", markers=list, exemplar=list[0]||null};
+      return { type: "route", markers: list, exemplar: (list && list.length ? list[0] : null) };
+
     }
   }
   return {type:"none"};
@@ -634,4 +635,5 @@ async function init(){
   }, initialJitter);
 }
 init();
+
 
