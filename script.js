@@ -1,4 +1,4 @@
-
+//script
 const proxyBaseUrl = "https://atrealtime.vercel.app";
 const realtimeUrl  = `${proxyBaseUrl}/api/realtime`;
 const routesUrl    = `${proxyBaseUrl}/api/routes`;
@@ -19,21 +19,22 @@ L.control.layers(baseMaps,null).addTo(map);
 
 const vehicleLayers={bus:L.layerGroup().addTo(map),train:L.layerGroup().addTo(map),ferry:L.layerGroup().addTo(map),out:L.layerGroup().addTo(map)};
 
-const vehicleMarkers={};
-const tripCache={};
+const vehicleMarkers={};              
+const tripCache={};                   
 let routes={}, busTypes={}, busTypeIndex={};
-const vehicleIndexByFleet=new Map();
-const routeIndex=new Map();
+const vehicleIndexByFleet=new Map();  
+const routeIndex=new Map();         
 const debugBox=document.getElementById("debug");
 const mobileUpdateEl=document.getElementById("mobile-last-update");
 
-let pinnedPopup=null;
-let pinnedFollow=false;
+let pinnedPopup=null;           
+let pinnedFollow=false;            
 
 map.on("click",()=>{
   if(pinnedPopup){ pinnedPopup.closePopup(); pinnedPopup=null; pinnedFollow=false; }
   clearRouteHighlights();
 });
+
 
 map.on("dragstart", ()=> { pinnedFollow=false; });
 map.on("popupclose", ()=> { pinnedFollow=false; });
@@ -42,8 +43,10 @@ const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"
 const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8"};
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 
+
 const MIN_POLL_MS=15000, MAX_POLL_MS=27000;
 function basePollDelay(){return MIN_POLL_MS+Math.floor(Math.random()*(MAX_POLL_MS-MIN_POLL_MS+1));}
+
 
 const BACKOFF_START_MS=15000, BACKOFF_MAX_MS=120000;
 const backoff = {
@@ -62,6 +65,7 @@ function applyRateLimitBackoff(retryAfterMs, who){
 
 let vehiclesAbort, vehiclesInFlight=false, pollTimeoutId=null, pageVisible=!document.hidden;
 let hidePauseTimerId=null; const HIDE_PAUSE_DELAY_MS=10000;
+
 
 function setDebug(msg){ if(debugBox) debugBox.textContent=msg; }
 function setLastUpdateTs(ts){
@@ -103,8 +107,7 @@ function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,spee
 function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
   const isMobile=window.innerWidth<=600;
   const baseRadius=isMobile?6:5;
-  const popupOpts={maxWidth: isMobile?220:260, className:"vehicle-popup"};
-
+  const popupOpts={maxWidth:isMobile?220:260,className:"vehicle-popup"};
 
   if(vehicleMarkers[id]){
     const m=vehicleMarkers[id];
@@ -147,6 +150,7 @@ function updateVehicleCount(){
   const el=document.getElementById("vehicle-count"); if(el) el.textContent=`Buses: ${busCount}, Trains: ${trainCount}, Ferries: ${ferryCount}`;
 }
 
+// extra style
 (function injectExtraStyle(){
   const style=document.createElement("style");
   style.textContent=`.veh-highlight{stroke:#333;stroke-width:3;}`;
@@ -198,7 +202,7 @@ function resolveQueryToMarkers(raw){
   if(routeIndex.has(routeKey)){
     const set=routeIndex.get(routeKey);
     const list=[...set];
-    return {type:"route", markers=list, exemplar=list[0]||null};
+    return {type:"route", markers:list, exemplar:list[0]||null};
   }
   for(const [key,marker] of vehicleIndexByFleet.entries()){
     if(key.startsWith(fleetKey)) return {type:"fleet", exemplar:marker};
@@ -206,14 +210,14 @@ function resolveQueryToMarkers(raw){
   for(const [rk,set] of routeIndex.entries()){
     if(rk.startsWith(routeKey)){
       const list=[...set];
-      return { type: "route", markers: list, exemplar: (list && list.length ? list[0] : null) };
-
+      return {type:"route", markers:list, exemplar:list[0]||null};
     }
   }
   return {type:"none"};
 }
 function isMobileScreen(){ return window.innerWidth <= 600; }
 
+// Search control 
 const SearchControl=L.Control.extend({
   options:{position:"topleft"},
   onAdd:function(){
@@ -236,6 +240,7 @@ const SearchControl=L.Control.extend({
     L.DomEvent.disableScrollPropagation(wrapper);
     div.classList.remove("expanded");
 
+    // open popup after map moves into view
     function openAndPin(m) {
       if (!m) return;
       const ll = m.getLatLng();
@@ -328,7 +333,7 @@ const SearchControl=L.Control.extend({
         if(label.startsWith(qNorm)){ fleets.push({label}); if(fleets.length>=8) break; }
       }
       for(const [rk,set] of routeIndex.entries()){
-        if(rk.startsWith(qNorm)){ routesList.push({rk,count=set.size}); if(routesList.length>=8) break; }
+        if(rk.startsWith(qNorm)){ routesList.push({rk,count:set.size}); if(routesList.length>=8) break; }
       }
 
       const html=[];
@@ -522,6 +527,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         const model = getBusType(operator, vehicleNumber);
         if (model) busType = model;
       }
+   
 
       const popup=buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine);
 
@@ -546,6 +552,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     pairAMTrains(inServiceAM,outOfServiceAM);
 
+    // remove old markers
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
         if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
@@ -553,6 +560,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       }
     });
 
+    // follow vehicles
     if (pinnedPopup && pinnedFollow) {
       try {
         const ll = pinnedPopup.getLatLng();
@@ -572,7 +580,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     setLastUpdateTs(nowTs);
     updateVehicleCount();
 
-    fetchTripsBatch([...new Set(allTripIds)]);
+    await fetchTripsBatch([...new Set(allTripIds)]);
   }finally{
     clearTimeout(watchdog);
     vehiclesInFlight=false;
@@ -635,5 +643,3 @@ async function init(){
   }, initialJitter);
 }
 init();
-
-
