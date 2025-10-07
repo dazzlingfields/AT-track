@@ -24,6 +24,7 @@ const tripCache={};
 let routes={}, busTypes={}, busTypeIndex={};
 const vehicleIndexByFleet=new Map();  
 const routeIndex=new Map();         
+const oosIndexByFleet=new Map();
 const debugBox=document.getElementById("debug");
 const mobileUpdateEl=document.getElementById("mobile-last-update");
 
@@ -150,7 +151,6 @@ function updateVehicleCount(){
   const el=document.getElementById("vehicle-count"); if(el) el.textContent=`Buses: ${busCount}, Trains: ${trainCount}, Ferries: ${ferryCount}`;
 }
 
-// extra style
 (function injectExtraStyle(){
   const style=document.createElement("style");
   style.textContent=`.veh-highlight{stroke:#333;stroke-width:3;}`;
@@ -174,6 +174,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
 function normalizeFleetLabel(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
 function normalizeRouteKey(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
+function onlyDigits(s){return (s||"").replace(/\D/g,"");}
 function clearRouteHighlights(){
   Object.values(vehicleMarkers).forEach(m=>{
     if(m._isRouteHighlighted){
@@ -195,8 +196,12 @@ function resolveQueryToMarkers(raw){
   const q=(raw||"").trim();
   if(!q) return {type:"none"};
   const fleetKey=normalizeFleetLabel(q);
+  const digitKey=onlyDigits(q);
   if(vehicleIndexByFleet.has(fleetKey)){
     return {type:"fleet", exemplar: vehicleIndexByFleet.get(fleetKey)};
+  }
+  if(oosIndexByFleet.has(fleetKey)){
+    return {type:"fleet", exemplar: oosIndexByFleet.get(fleetKey)};
   }
   const routeKey=normalizeRouteKey(q);
   if(routeIndex.has(routeKey)){
@@ -206,6 +211,17 @@ function resolveQueryToMarkers(raw){
   }
   for(const [key,marker] of vehicleIndexByFleet.entries()){
     if(key.startsWith(fleetKey)) return {type:"fleet", exemplar:marker};
+  }
+  for(const [key,marker] of oosIndexByFleet.entries()){
+    if(key.startsWith(fleetKey)) return {type:"fleet", exemplar:marker};
+  }
+  if(digitKey){
+    for(const [key,marker] of vehicleIndexByFleet.entries()){
+      if(onlyDigits(key)===digitKey) return {type:"fleet", exemplar:marker};
+    }
+    for(const [key,marker] of oosIndexByFleet.entries()){
+      if(onlyDigits(key)===digitKey) return {type:"fleet", exemplar:marker};
+    }
   }
   for(const [rk,set] of routeIndex.entries()){
     if(rk.startsWith(routeKey)){
@@ -240,7 +256,6 @@ const SearchControl=L.Control.extend({
     L.DomEvent.disableScrollPropagation(wrapper);
     div.classList.remove("expanded");
 
-    // open popup after map moves into view
     function openAndPin(m) {
       if (!m) return;
       const ll = m.getLatLng();
@@ -328,9 +343,14 @@ const SearchControl=L.Control.extend({
       sugg.style.display="block";
       const qNorm=q.replace(/\s+/g,"").toUpperCase();
 
-      const fleets=[], routesList=[];
+      const fleets=[], routesList=[], seen=new Set();
       for(const [label] of vehicleIndexByFleet.entries()){
-        if(label.startsWith(qNorm)){ fleets.push({label}); if(fleets.length>=8) break; }
+        if(label.startsWith(qNorm) && !seen.has(label)){ fleets.push({label}); seen.add(label); if(fleets.length>=8) break; }
+      }
+      if(fleets.length<8){
+        for(const [label] of oosIndexByFleet.entries()){
+          if(label.startsWith(qNorm) && !seen.has(label)){ fleets.push({label}); seen.add(label); if(fleets.length>=8) break; }
+        }
       }
       for(const [rk,set] of routeIndex.entries()){
         if(rk.startsWith(qNorm)){ routesList.push({rk,count:set.size}); if(routesList.length>=8) break; }
@@ -353,7 +373,7 @@ const SearchControl=L.Control.extend({
           const kind=el.getAttribute("data-kind");
           const id=el.getAttribute("data-id");
           if(kind==="fleet"){
-            const m=vehicleIndexByFleet.get(id);
+            const m=vehicleIndexByFleet.get(id) || oosIndexByFleet.get(id);
             if(m){ if(blurTimer){ clearTimeout(blurTimer); blurTimer=null; } openAndPin(m); clearRouteHighlights(); collapse({ preservePopup: true }); }
             else{ collapse({ preservePopup: !!pinnedPopup }); }
           }else if(kind==="route"){
@@ -459,7 +479,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     const vehicles=json?.response?.entity||json?.entity||[];
     const newIds=new Set(), inServiceAM=[], outOfServiceAM=[], allTripIds=[], cachedState=[];
-    vehicleIndexByFleet.clear(); routeIndex.clear();
+    vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear();
 
     vehicles.forEach(v=>{
       const vehicleId=v.vehicle?.vehicle?.id; if(!v.vehicle||!v.vehicle.position||!vehicleId) return; newIds.add(vehicleId);
@@ -516,18 +536,14 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       let busType = vehicleMarkers[vehicleId]?.busType || "";
       const wasBus   = vehicleMarkers[vehicleId]?.currentType === "bus";
       const isBusNow = typeKey === "bus";
-      const hasPlate = !!licensePlate && licensePlate !== "N/A";
-      const wantTypeForOut = (typeKey === "out" && hasPlate && !isTrain && !isFerry && !isAM);
       const needType =
         (isBusNow && !busType) ||
         (isBusNow && !wasBus)  ||
-        (!vehicleMarkers[vehicleId] && isBusNow) ||
-        (wantTypeForOut && !busType);
+        (!vehicleMarkers[vehicleId] && isBusNow);
       if (needType && operator) {
         const model = getBusType(operator, vehicleNumber);
         if (model) busType = model;
       }
-   
 
       const popup=buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine);
 
@@ -540,7 +556,11 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,occupancy,bikesLine
       });
 
-      if(vehicleLabel && typeKey!=="out") vehicleIndexByFleet.set(normalizeFleetLabel(vehicleLabel),vehicleMarkers[vehicleId]);
+      if(vehicleLabel){
+        const norm=normalizeFleetLabel(vehicleLabel);
+        if(typeKey!=="out") vehicleIndexByFleet.set(norm,vehicleMarkers[vehicleId]);
+        else oosIndexByFleet.set(norm,vehicleMarkers[vehicleId]);
+      }
       if(routes[routeId]?.route_short_name && typeKey!=="out"){
         const rk=normalizeRouteKey(routes[routeId].route_short_name);
         if(!routeIndex.has(rk)) routeIndex.set(rk,new Set());
@@ -552,7 +572,6 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     pairAMTrains(inServiceAM,outOfServiceAM);
 
-    // remove old markers
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
         if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
@@ -560,7 +579,6 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       }
     });
 
-    // follow vehicles
     if (pinnedPopup && pinnedFollow) {
       try {
         const ll = pinnedPopup.getLatLng();
