@@ -451,25 +451,59 @@ function pairAMTrains(inSvc,outOfService){
   });
   return pairs;
 }
-
-/* ---------------- CRL Tunnel Estimator (Britomart ↔ Maungawhau) ---------------- */
+/* ---------------- CRL Tunnel Estimator (Britomart ↔ Maungawhau) — L-safe init ---------------- */
 let __enableTunnelEstimation = true;   // default ON
 function setTunnelEstimationEnabled(v){ __enableTunnelEstimation = !!v; setDebug(`Tunnel estimation ${__enableTunnelEstimation?"enabled":"disabled"}`); }
 window.setTunnelEstimationEnabled = setTunnelEstimationEnabled;
 
 const CRLTunnelEstimator = (function(){
-  // --- Helper math (small-area approximations are OK here) ---
+  // Use plain objects so the module doesn't require Leaflet at parse time
   const DEG2RAD = Math.PI/180;
-  const METERS_PER_DEG_LAT = 111320; // ~ constant
+  const METERS_PER_DEG_LAT = 111320;
+  const JITTER = 0.00002;
+  const TRACK_HALF_SEP_M = 3.0;              // ~6 m track spacing
+  const MAX_TUNNEL_V_MPS = 70/3.6;           // 70 km/h ceiling
+  const SLOW_R1 = 500,  V1 = 35/3.6;         // 35 km/h within 500 m
+  const SLOW_R2 = 120,  V2 = 12/3.6;         // 12 km/h within 120 m
+  const MAX_SECONDS = 240;
+
+  // Tiny, conservative portal polygons (plain arrays of {lat,lng})
+  const portalBritomart = [
+    {lat:-36.84495,lng:174.76790},
+    {lat:-36.84435,lng:174.76920},
+    {lat:-36.84535,lng:174.76980},
+    {lat:-36.84595,lng:174.76845}
+  ];
+  const portalMaungawhau = [
+    {lat:-36.87535,lng:174.75220},
+    {lat:-36.87475,lng:174.75410},
+    {lat:-36.87380,lng:174.75360},
+    {lat:-36.87435,lng:174.75170}
+  ];
+
+  // Approx CRL centerline (plain points)
+  const routeDownPts = [
+    {lat:-36.87490,lng:174.75350}, // Maungawhau portal
+    {lat:-36.86860,lng:174.75860}, // Karanga-a-Hape
+    {lat:-36.85100,lng:174.76300}, // Te Waihorotiu (Aotea)
+    {lat:-36.84520,lng:174.76830}  // Waitematā throat
+  ];
+  const routeUpPts = routeDownPts.slice().reverse();
+
+  const stationsDown = ["Maungawhau","Karanga-a-Hape","Te Waihorotiu","Waitematā"];
+  const stationsUp   = ["Waitematā","Te Waihorotiu","Karanga-a-Hape","Maungawhau"];
+
+  // ---------- math helpers (no Leaflet needed) ----------
   function metersPerDegLng(lat){ return 111320 * Math.cos(lat*DEG2RAD); }
   function toMeters(a,b){
     const mx = (b.lng - a.lng) * metersPerDegLng((a.lat+b.lat)/2);
     const my = (b.lat - a.lat) * METERS_PER_DEG_LAT;
     return Math.hypot(mx,my);
   }
-  function interp(a,b,t){ return L.latLng(a.lat + (b.lat-a.lat)*t, a.lng + (b.lng-a.lng)*t); }
+  function interp(a,b,t){ return { lat: a.lat + (b.lat-a.lat)*t, lng: a.lng + (b.lng-a.lng)*t }; }
   function projectOnSegment(p,a,b){
-    const vx = (b.lng - a.lng) * metersPerDegLng((a.lat+b.lat)/2);
+    const mLng = metersPerDegLng((a.lat+b.lat)/2);
+    const vx = (b.lng - a.lng) * mLng;
     const vy = (b.lat - a.lat) * METERS_PER_DEG_LAT;
     const wx = (p.lng - a.lng) * metersPerDegLng((a.lat+p.lat)/2);
     const wy = (p.lat - a.lat) * METERS_PER_DEG_LAT;
@@ -478,36 +512,19 @@ const CRLTunnelEstimator = (function(){
     if (t < 0) t = 0; else if (t > 1) t = 1;
     return { t, point: interp(a,b,t) };
   }
-  function offsetLatLng(base, dirLatLng, offsetMeters){
-    // dirLatLng is the next point along the route; create a normal (left) and shift by offset
-    const lat = base.lat, lng = base.lng;
-    const dx = (dirLatLng.lng - base.lng) * metersPerDegLng(lat);
-    const dy = (dirLatLng.lat - base.lat) * METERS_PER_DEG_LAT;
+  function offsetLatLng(base, dirPt, offsetMeters){
+    const mLng = metersPerDegLng(base.lat);
+    const dx = (dirPt.lng - base.lng) * mLng;
+    const dy = (dirPt.lat - base.lat) * METERS_PER_DEG_LAT;
     const len = Math.hypot(dx,dy) || 1e-9;
-    // left-normal (−dy, +dx)
-    const nx = -dy/len, ny = dx/len;
-    const dLng = (nx * offsetMeters) / metersPerDegLng(lat);
-    const dLat = (ny * offsetMeters) / METERS_PER_DEG_LAT;
-    return L.latLng(lat + dLat, lng + dLng);
+    const nx = -dy/len, ny = dx/len; // left normal
+    return {
+      lat: base.lat + (ny*offsetMeters)/METERS_PER_DEG_LAT,
+      lng: base.lng + (nx*offsetMeters)/mLng
+    };
   }
-
-  // --- Portals (rough polygons). Keep tiny and conservative to avoid false positives. ---
-  const portalBritomart = L.polygon([
-    [-36.84495,174.76790],
-    [-36.84435,174.76920],
-    [-36.84535,174.76980],
-    [-36.84595,174.76845]
-  ]).getLatLngs()[0];
-
-  const portalMaungawhau = L.polygon([
-    [-36.87535,174.75220],
-    [-36.87475,174.75410],
-    [-36.87380,174.75360],
-    [-36.87435,174.75170]
-  ]).getLatLngs()[0];
-
-  function pointInPoly(latlng, poly){
-    const x = latlng.lng, y = latlng.lat;
+  function pointInPoly(p, poly){
+    const x = p.lng, y = p.lat;
     let inside = false;
     for (let i=0,j=poly.length-1;i<poly.length;j=i++){
       const xi=poly[i].lng, yi=poly[i].lat;
@@ -517,32 +534,6 @@ const CRLTunnelEstimator = (function(){
     }
     return inside;
   }
-  function isNearAnyPortal(ll){
-    try{
-      const p = L.latLng(ll);
-      return pointInPoly(p, portalBritomart) || pointInPoly(p, portalMaungawhau);
-    }catch{ return false; }
-  }
-  function whichPortal(ll){
-    const p = L.latLng(ll);
-    if(pointInPoly(p, portalBritomart)) return "BRITOMART";
-    if(pointInPoly(p, portalMaungawhau)) return "MAUNGAWHAU";
-    return null;
-  }
-
-  // --- CRL route centerline (approx) from Maungawhau → Karanga-a-Hape → Te Waihorotiu → Waitematā ---
-  // NOTE: These are light approximations; refine if you have surveyed polylines.
-  const routeDown = [ // "Down": Maungawhau -> City
-    L.latLng(-36.87490,174.75350), // Maungawhau portal area
-    L.latLng(-36.86860,174.75860), // Karanga-a-Hape (K Rd) area
-    L.latLng(-36.85100,174.76300), // Te Waihorotiu (Aotea) area
-    L.latLng(-36.84520,174.76830)  // Waitematā (Britomart) throat
-  ];
-  const routeUp = [...routeDown].slice().reverse(); // "Up": City -> Maungawhau
-
-  // Stations along each direction: cumulative s (meters) computed after preprocessing.
-  const stationsDown = ["Maungawhau","Karanga-a-Hape","Te Waihorotiu","Waitematā"];
-  const stationsUp   = ["Waitematā","Te Waihorotiu","Karanga-a-Hape","Maungawhau"];
 
   function preprocessRoute(pts){
     const segs = [];
@@ -555,8 +546,8 @@ const CRLTunnelEstimator = (function(){
     }
     return { pts, segs, cum, length: cum[cum.length-1] };
   }
-  const R_DOWN = preprocessRoute(routeDown);
-  const R_UP   = preprocessRoute(routeUp);
+  const R_DOWN = preprocessRoute(routeDownPts);
+  const R_UP   = preprocessRoute(routeUpPts);
 
   function nearestOnRoute(route, p){
     let best = { s:0, ll:route.pts[0], idx:0, t:0, d:Infinity };
@@ -569,16 +560,15 @@ const CRLTunnelEstimator = (function(){
         best = { s: route.cum[i] + proj.t*d, ll, idx:i, t:proj.t, d:dist };
       }
     }
-    return best; // s = cumulative meters along route
+    return best;
   }
   function pointAtS(route, s){
     if(s <= 0) return route.pts[0];
     if(s >= route.length) return route.pts[route.pts.length-1];
-    // locate segment
     let i = 0;
     while(i < route.segs.length && s > route.cum[i+1]) i++;
     const seg = route.segs[i];
-    const local = (s - route.cum[i]) / seg.d;
+    const local = (s - route.cum[i]) / (seg.d || 1);
     return interp(seg.a, seg.b, local);
   }
   function dirAtS(route, s){
@@ -588,21 +578,12 @@ const CRLTunnelEstimator = (function(){
     while(i < route.segs.length && s > route.cum[i+1]) i++;
     const seg = route.segs[i];
     const local = (s - route.cum[i]) / (seg.d || 1);
-    const eps = (local < 0.5) ? 1e-3 : -1e-3; // bias towards segment direction
+    const eps = (local < 0.5) ? 1e-3 : -1e-3;
     return interp(seg.a, seg.b, Math.min(1, Math.max(0, local+eps)));
   }
 
-  // track spacing & speeds
-  const TRACK_HALF_SEP_M = 3.0;         // ~6 m between centerlines
-  const MAX_TUNNEL_V_MPS = 70/3.6;      // 70 km/h max
-  const JITTER = 0.00002;
-
-  // Slow zones near stations (radius meters → target speed m/s)
-  const SLOW_R1 = 500,  V1 = 35/3.6;   // ~35 km/h within 500 m
-  const SLOW_R2 = 120,  V2 = 12/3.6;   // ~12 km/h within 120 m
-
   function buildStationProfile(route, names){
-    const sList = route.cum; // vertices cumulative
+    const sList = route.cum;
     return names.map((name, i) => ({ name, s: sList[i] || 0 }));
   }
   const PROF_DOWN = buildStationProfile(R_DOWN, stationsDown);
@@ -621,33 +602,54 @@ const CRLTunnelEstimator = (function(){
 
   const ghosts = new Map(); // id -> { marker, route, profile, s, v, startedTs, lastTickTs, side }
 
+  function normalizeLL(ll){
+    // Accept Leaflet LatLng or plain object
+    if (!ll) return null;
+    if (typeof ll.lat === "number" && typeof ll.lng === "number") return {lat: ll.lat, lng: ll.lng};
+    if (Array.isArray(ll) && ll.length>=2) return {lat: +ll[0], lng: +ll[1]};
+    return null;
+  }
+
+  function isNearAnyPortal(ll){
+    try{
+      const p = normalizeLL(ll);
+      if(!p) return false;
+      return pointInPoly(p, portalBritomart) || pointInPoly(p, portalMaungawhau);
+    }catch{ return false; }
+  }
+  function whichPortal(ll){
+    const p = normalizeLL(ll);
+    if(!p) return null;
+    if(pointInPoly(p, portalBritomart)) return "BRITOMART";
+    if(pointInPoly(p, portalMaungawhau)) return "MAUNGAWHAU";
+    return null;
+  }
+
   function adoptMarker(m){
-    const now = Date.now();
-    const ll = m.getLatLng();
+    const llLeaflet = m.getLatLng?.();
+    const ll = normalizeLL(llLeaflet);
     const entry = whichPortal(ll);
     if(!entry) return;
 
-    // Pick direction/route
     const useDown = entry === "MAUNGAWHAU";
     const route = useDown ? R_DOWN : R_UP;
     const profile = useDown ? PROF_DOWN : PROF_UP;
 
-    // Initial speed try parse from speedStr; clamp to tunnel max
+    // Initial speed from popup text if available; clamp
     const speedKmh = Number((m.speedStr||"").split(" ")[0]);
     let v = (isFinite(speedKmh) ? speedKmh/3.6 : 0);
-    if(!isFinite(v) || v < 1) v = 12/3.6; // default crawl if unknown
+    if(!isFinite(v) || v < 1) v = 12/3.6;
     v = Math.min(v, MAX_TUNNEL_V_MPS);
 
-    // Project onto route to get starting s
     const near = nearestOnRoute(route, ll);
     let s = near.s;
 
-    // Side selection: use heading sign; fallback to even/odd fleet label
-    let side = +1; // +1 = left of centerline, -1 = right
+    // Side guess
+    let side = +1;
     try{
-      const a = m._prevLL || ll;
-      const dy = (ll.lat - a.lat) * Math.PI/180;
-      const dx = (ll.lng - a.lng) * Math.PI/180 * Math.cos((a.lat+ll.lat)*Math.PI/360);
+      const a = normalizeLL(m._prevLL) || ll;
+      const dy = (ll.lat - a.lat) * DEG2RAD;
+      const dx = (ll.lng - a.lng) * DEG2RAD * Math.cos((a.lat+ll.lat)*0.5*DEG2RAD);
       const heading = Math.atan2(dx, dy);
       side = useDown ? (heading>=0 ? +1 : -1) : (heading>=0 ? -1 : +1);
     }catch{
@@ -655,10 +657,10 @@ const CRLTunnelEstimator = (function(){
       side = (num % 2 === 0) ? +1 : -1;
     }
 
-    // Ghost styling
+    // Light "ghost" styling (tolerate if not SVG)
     try{
-      m.setStyle({opacity:1, fillOpacity:0.55, weight:1});
-      L.DomUtil.addClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
+      m.setStyle?.({opacity:1, fillOpacity:0.55, weight:1});
+      if (window.L && L.DomUtil) L.DomUtil.addClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
     }catch{}
     m._isGhost = true;
 
@@ -666,20 +668,18 @@ const CRLTunnelEstimator = (function(){
       marker: m,
       route, profile,
       s, v,
-      startedTs: now,
-      lastTickTs: now,
+      startedTs: Date.now(),
+      lastTickTs: Date.now(),
       side
     });
   }
 
   function dropGhost(m){
     try{
-      L.DomUtil.removeClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
+      if (window.L && L.DomUtil) L.DomUtil.removeClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
     }catch{}
     m._isGhost = false;
   }
-
-  const MAX_SECONDS = 240; // allow up to 4 min across full alignment
 
   function tick(){
     if(!ghosts.size || !__enableTunnelEstimation) return;
@@ -688,38 +688,30 @@ const CRLTunnelEstimator = (function(){
       const dt = Math.max(0, (now - g.lastTickTs)/1000);
       const tTotal = (now - g.startedTs)/1000;
 
-      // exit conditions
       if(tTotal > MAX_SECONDS){
         dropGhost(g.marker);
         ghosts.delete(key);
         return;
       }
 
-      // Target speed profile along the route
       const vT = targetSpeedMps(g.route, g.s, g.profile);
-
-      // Simple accel/decel model toward vT
-      const ACC = 0.5;     // m/s²
-      const DEC = 0.7;     // m/s²
+      const ACC = 0.5, DEC = 0.7;
       if(g.v < vT) g.v = Math.min(vT, g.v + ACC*dt);
       else         g.v = Math.max(vT, g.v - DEC*dt);
 
-      // advance along route
       g.s += Math.max(0, g.v * dt);
 
-      // clamp & finish when we hit the end
       if(g.s >= g.route.length){
         g.s = g.route.length;
         const p = pointAtS(g.route, g.s);
         const dir = dirAtS(g.route, g.s);
         const trackPt = offsetLatLng(p, dir, g.side * TRACK_HALF_SEP_M);
-        try{ g.marker.setLatLng(trackPt); }catch{}
+        try{ g.marker.setLatLng([trackPt.lat, trackPt.lng]); }catch{}
         dropGhost(g.marker);
         ghosts.delete(key);
         return;
       }
 
-      // render along route with lateral track offset
       const p = pointAtS(g.route, g.s);
       const dir = dirAtS(g.route, g.s);
       const trackPt = offsetLatLng(p, dir, g.side * TRACK_HALF_SEP_M);
@@ -751,6 +743,7 @@ const CRLTunnelEstimator = (function(){
   };
 })();
 /* ---------------- End CRL Tunnel Estimator ---------------- */
+
 
 function renderFromCache(c){
   if(!c) return;
@@ -998,3 +991,4 @@ async function init(){
   }, initialJitter);
 }
 init();
+
