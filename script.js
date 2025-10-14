@@ -367,7 +367,8 @@ const SearchControl=L.Control.extend({
         }
       }
       for(const [rk,set] of routeIndex.entries()){
-        if(rk.startsWith(qNorm)){ routesList.push({rk,count=set.size}); if(routesList.length>=8) break; }
+     if (rk.startsWith(qNorm)) { routesList.push({ rk: rk, count: set.size }); if (routesList.length>=8) break; }
+
       }
 
       const html=[];
@@ -1021,3 +1022,4 @@ async function init(){
   }, initialJitter);
 }
 init();
+
