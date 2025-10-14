@@ -1,374 +1,1000 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>AT Realtime Map</title>
-  <link rel="icon" type="image/x-icon" href="train.png" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"/>
+//script
+const proxyBaseUrl = "https://atrealtime.vercel.app";
+const realtimeUrl  = `${proxyBaseUrl}/api/realtime`;
+const routesUrl    = `${proxyBaseUrl}/api/routes`;
+const tripsUrl     = `${proxyBaseUrl}/api/trips`;
+const busTypesUrl  = "busTypes.json";
 
-  <style>
-    :root{
-  --panel-bg: rgba(255,255,255,0.82);
-  --panel-border: rgba(60,60,67,0.18);
-  --elev-1: 0 6px 16px rgba(0,0,0,0.12);
-  --elev-2: 0 12px 28px rgba(0,0,0,0.18);
-  --text-strong: #1c1c1e;
-  --text-subtle: #6e6e73;
-  --accent: #0a84ff;
-  --accent-weak: rgba(10,132,255,0.12);
-  --r-xl: 20px;
-  --r-lg: 14px;
-  --r-md: 10px;
-  --gap-1: 6px;
-  --gap-2: 10px;
-  --gap-3: 14px;
-  --gap-4: 16px;
-  --glass-blur: 12px;
-  --panel-backdrop: saturate(180%) blur(var(--glass-blur));
-  --ring: 0 0 0 2px rgba(10,132,255,0.45);
-  --controls-height: 0px; /* set by JS to place the search below #controls */
-}
+const light = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",{attribution:"© OpenStreetMap contributors © CARTO",subdomains:"abcd",maxZoom:20});
+const dark  = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{attribution:"© OpenStreetMap contributors © CARTO",subdomains:"abcd",maxZoom:20});
+const osm   = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:"© OpenStreetMap contributors"});
+const satellite  = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{attribution:"Tiles © Esri"});
+const esriImagery= L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{attribution:"Tiles © Esri, Maxar, Earthstar Geographics",maxZoom:20});
+const esriLabels = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",{attribution:"Labels © Esri",maxZoom:20});
+const esriHybrid = L.layerGroup([esriImagery, esriLabels]);
 
-@media (prefers-color-scheme: dark) {
-  :root{
-    --panel-bg: rgba(28,28,30,0.74);
-    --panel-border: rgba(255,255,255,0.14);
-    --elev-1: 0 8px 20px rgba(0,0,0,0.5);
-    --elev-2: 0 16px 36px rgba(0,0,0,0.6);
-    --text-strong: #f5f5f7;
-    --text-subtle: #a1a1a6;
-    --accent: #0a84ff;
-    --accent-weak: rgba(10,132,255,0.18);
-    --ring: 0 0 0 2px rgba(10,132,255,0.55);
-  }
-}
+const map = L.map("map",{center:[-36.8485,174.7633],zoom:12,layers:[light],zoomControl:false});
+const baseMaps = {"Light":light,"Dark":dark,"OSM":osm,"Satellite":satellite,"Esri Hybrid":esriHybrid};
+L.control.layers(baseMaps,null).addTo(map);
 
-@media (prefers-reduced-motion: reduce) {
-  * { animation: none !important; transition: none !important; }
-}
+const vehicleLayers={bus:L.layerGroup().addTo(map),train:L.layerGroup().addTo(map),ferry:L.layerGroup().addTo(map),out:L.layerGroup().addTo(map)};
 
-html, body {
-  margin: 0; padding: 0; width: 100%;
-  overflow-x: hidden;
-  color: var(--text-strong);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-rendering: optimizeLegibility;
-}
-#map { height: 100vh; width: 100vw; }
+const vehicleMarkers={};              
+const tripCache={};                   
+let routes={}, busTypes={}, busTypeIndex={};
+const vehicleIndexByFleet=new Map();  
+const routeIndex=new Map();         
+const oosIndexByFleet=new Map();
+const debugBox=document.getElementById("debug");
+const mobileUpdateEl=document.getElementById("mobile-last-update");
 
-h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px; }
+let pinnedPopup=null;           
+let pinnedFollow=false;            
 
-/* Controls panel */
-#controls {
-  position: absolute; top: 12px; left: 12px; z-index: 1200;
-  background: var(--panel-bg);
-  backdrop-filter: var(--panel-backdrop);
-  -webkit-backdrop-filter: var(--panel-backdrop);
-  border: 1px solid var(--panel-border);
-  border-radius: var(--r-xl);
-  box-shadow: var(--elev-1);
-  padding: 14px 16px;
-  max-width: 280px;
-  display: grid;
-  gap: var(--gap-3);
-  transition: box-shadow 140ms ease, transform 140ms ease;
-}
-#controls:focus-within { box-shadow: var(--elev-2); transform: translateY(-0.5px); }
+map.on("click",()=>{
+  if(pinnedPopup){ pinnedPopup.closePopup(); pinnedPopup=null; pinnedFollow=false; }
+  clearRouteHighlights();
+});
 
-.control-group { margin: 0; }
-.control-group h4 { font-size: 18px; margin-bottom: 6px; }
+map.on("dragstart", ()=> { pinnedFollow=false; });
+map.on("popupclose", ()=> { pinnedFollow=false; });
 
-#filters { display: grid; gap: 8px; }
-#filters label {
-  display: grid; grid-template-columns: 18px 1fr; align-items: center; column-gap: 10px;
-  font-size: 14px; color: var(--text-strong); cursor: pointer; user-select: none;
-  padding: 6px 8px; border-radius: var(--r-md);
-  transition: background-color 120ms ease;
-}
-#filters label:hover { background: var(--accent-weak); }
-#filters input[type="checkbox"] {
-  width: 16px; height: 16px; margin: 0;
-  accent-color: var(--accent);
+const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"};
+const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8"};
+const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
+
+const MIN_POLL_MS=15000, MAX_POLL_MS=27000;
+function basePollDelay(){return MIN_POLL_MS+Math.floor(Math.random()*(MAX_POLL_MS-MIN_POLL_MS+1));}
+
+const BACKOFF_START_MS=15000, BACKOFF_MAX_MS=120000;
+const backoff = {
+  realtime: { ms:0, until:0 },
+  routes:   { ms:0, until:0 },
+  trips:    { ms:0, until:0 },
+};
+function applyRateLimitBackoff(retryAfterMs, who){
+  const b = backoff[who] || backoff.realtime;
+  let retry = retryAfterMs ? Math.max(0, retryAfterMs)
+                           : (b.ms ? Math.min(BACKOFF_MAX_MS, b.ms*2) : BACKOFF_START_MS);
+  if (who === "realtime") retry = Math.min(retry, 15000);
+  b.ms = retry; b.until = Date.now()+retry;
+  setDebug(`Rate limited by ${who}. Backing off ${Math.round(retry/1000)} s`);
 }
 
-/* NEW: Tunnel toggle layout reuses filter styles */
-#tunnel-toggle { display: grid; gap: 8px; }
-#tunnel-toggle label {
-  display: grid; grid-template-columns: 18px 1fr; align-items: center; column-gap: 10px;
-  font-size: 14px; color: var(--text-strong); cursor: pointer; user-select: none;
-  padding: 6px 8px; border-radius: var(--r-md);
-  transition: background-color 120ms ease;
-}
-#tunnel-toggle label:hover { background: var(--accent-weak); }
-#tunnel-toggle input[type="checkbox"]{
-  width: 16px; height: 16px; margin: 0;
-  accent-color: var(--accent);
+let vehiclesAbort, vehiclesInFlight=false, pollTimeoutId=null, pageVisible=!document.hidden;
+let hidePauseTimerId=null; const HIDE_PAUSE_DELAY_MS=10000;
+
+function setDebug(msg){ if(debugBox) debugBox.textContent=msg; }
+function setLastUpdateTs(ts){
+  if (!mobileUpdateEl) return;
+  const t = new Date(ts);
+  const hh = String(t.getHours()).padStart(2,"0");
+  const mm = String(t.getMinutes()).padStart(2,"0");
+  const ss = String(t.getSeconds()).padStart(2,"0");
+  mobileUpdateEl.textContent = `Last update: ${hh}:${mm}:${ss}`;
 }
 
-#debug, #vehicle-count {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px; color: var(--text-subtle); line-height: 1.35;
+function parseRetryAfterMs(v){ if(!v) return 0; const s=Number(v); if(!isNaN(s)) return Math.max(0,Math.floor(s*1000)); const t=Date.parse(v); return isNaN(t)?0:Math.max(0,t-Date.now()); }
+async function safeFetch(url,opts={}){
+  try{
+    const res=await fetch(url,{cache:"no-store",...opts});
+    if(res.status===429){const retryAfterMs=parseRetryAfterMs(res.headers.get("Retry-After")); return {_rateLimited:true,retryAfterMs};}
+    if(!res.ok){let body=""; try{body=await res.text();}catch{} throw new Error(`${res.status} ${res.statusText}${body?` | ${body.slice(0,200)}`:""}`);}
+    return await res.json();
+  }catch(err){console.error("Fetch error:",err); setDebug(`Fetch error: ${err.message}`); return null;}
+}
+function chunk(a,n){const o=[]; for(let i=0;i<a.length;i+=n)o.push(a.slice(i,i+n)); return o;}
+function buildBusTypeIndex(json){const idx={}; if(!json||typeof json!=="object") return idx; for(const model of Object.keys(json)){const ops=json[model]||{}; for(const op of Object.keys(ops)){const nums=ops[op]||[]; if(!idx[op]) idx[op]={}; for(const n of nums) idx[op][n]=model;}} return idx;}
+function getBusType(op,num){const ix=busTypeIndex[op]; return ix?(ix[num]||""):"";}
+function trainColorForRoute(s){ if(!s) return vehicleColors.train; if(s.includes("STH"))return trainLineColors.STH; if(s.includes("WEST"))return trainLineColors.WEST; if(s.includes("EAST"))return trainLineColors.EAST; if(s.includes("ONE"))return trainLineColors.ONE; return vehicleColors.train; }
+
+function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine){
+  return `<div style="font-size:0.9em;line-height:1.3;">
+      <b>Route:</b> ${routeName}<br>
+      <b>Destination:</b> ${destination}<br>
+      <b>Vehicle:</b> ${vehicleLabel}<br>
+      ${busType?`<b>Bus model:</b> ${busType}<br>`:""}
+      <b>Number plate:</b> ${licensePlate}<br>
+      <b>Speed:</b> ${speedStr}<br>
+      <b>Occupancy:</b> ${occupancy}
+      ${bikesLine}
+    </div>`;
 }
 
-/* Leaflet popups */
-.leaflet-popup-content { font-size: 14px; line-height: 1.28; color: var(--text-strong); }
-.leaflet-popup-content b { color: var(--text-strong); }
-.leaflet-popup-content-wrapper, .leaflet-popup-tip {
-  background: var(--panel-bg);
-  backdrop-filter: var(--panel-backdrop);
-  -webkit-backdrop-filter: var(--panel-backdrop);
-  border: 1px solid var(--panel-border);
-  border-radius: var(--r-lg);
-  box-shadow: var(--elev-1);
-}
+function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
+  const isMobile=window.innerWidth<=600;
+  const baseRadius=isMobile?6:5;
+  const popupOpts={maxWidth:isMobile?220:260,className:"vehicle-popup"};
 
-/* Search control wrapper sits beneath #controls, in the left stack */
-.leaflet-control.search-wrapper{
-  z-index: 1300; /* sit above #controls container */
-}
-.leaflet-top.leaflet-left .leaflet-control.search-wrapper{
-  margin-left: max(12px, env(safe-area-inset-left));
-  margin-top: calc(var(--controls-height, 0px) + 12px);
-  margin-right: 0;
-}
+  if(vehicleMarkers[id]){
+    const m=vehicleMarkers[id];
+    // store last for heading calc
+    try{ m._prevLL = m.getLatLng(); }catch{}
+    m.setLatLng([lat,lon]);
+    m._lastTs = Date.now();
+    m.setPopupContent(popupContent);
+    m.setStyle({fillColor:color});
+    m.tripId=tripId;
+    if(m._baseRadius==null) m._baseRadius=baseRadius;
+    Object.assign(m,fields);
 
-/* Search control base */
-.leaflet-control.search-control {
-  position: relative;
-  background: var(--panel-bg);
-  border: 1px solid var(--panel-border);
-  border-radius: var(--r-lg);
-  box-shadow: var(--elev-1);
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px;
-  transition: box-shadow 120ms ease, transform 120ms ease;
-}
-.leaflet-control.search-control:focus-within { box-shadow: var(--elev-2); transform: translateY(-0.5px); }
+    Object.values(vehicleLayers).forEach(l=>l.removeLayer(m));
+    (vehicleLayers[type]||vehicleLayers.out).addLayer(m);
+    m._isGhost = false; // if it reappeared, make sure ghost flag is off
+  }else{
+    const marker=L.circleMarker([lat,lon],{radius:baseRadius,fillColor:color,color:"#000",weight:1,opacity:1,fillOpacity:0.9});
+    marker._baseRadius=baseRadius;
+    (vehicleLayers[type]||vehicleLayers.out).addLayer(marker);
+    marker.bindPopup(popupContent,popupOpts);
 
-.search-icon-btn {
-  width: 30px; height: 30px;
-  border: 1px solid var(--panel-border);
-  border-radius: 9px; background: rgba(255,255,255,0.9);
-  display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
-  transition: transform 80ms ease, box-shadow 120ms ease, background-color 120ms ease;
-}
-@media (prefers-color-scheme: dark) {
-  .search-icon-btn { background: rgba(44,44,46,0.9); }
-}
-.search-icon-btn:active { transform: scale(0.98); }
-.search-icon-btn svg { width: 16px; height: 16px; display: block; }
+    if(!marker._eventsBound){
+      marker.on("mouseover",function(){ if(pinnedPopup!==this) this.openPopup(); });
+      marker.on("mouseout", function(){ if(pinnedPopup!==this) this.closePopup(); });
+      marker.on("click",    function(e){
+        if(pinnedPopup&&pinnedPopup!==this) pinnedPopup.closePopup();
+        pinnedPopup=this; pinnedFollow=true;
+        this.openPopup();
+        e?.originalEvent?.stopPropagation?.();
+      });
+      marker._eventsBound=true;
+    }
 
-.search-input {
-  flex: 1 1 auto;
-  max-width: 0; opacity: 0; overflow: hidden;
-  border: 1px solid var(--panel-border);
-  background: rgba(255,255,255,0.9);
-  border-radius: 10px;
-  padding: 8px 10px;
-  font-size: 14px;
-  outline: none;
-  transition: max-width 160ms ease, opacity 140ms ease, box-shadow 120ms ease;
-}
-@media (prefers-color-scheme: dark) {
-  .search-input { background: rgba(44,44,46,0.92); color: var(--text-strong); }
-}
-.search-input::placeholder { color: var(--text-subtle); }
-.search-input:focus-visible { box-shadow: var(--ring); }
-
-/* Desktop expand */
-.search-control.expanded .search-input { max-width: 320px; opacity: 1; }
-.search-cancel {
-  display: none;
-  height: 30px; padding: 0 10px;
-  border-radius: 9px; border: 1px solid var(--panel-border);
-  background: transparent; color: var(--accent);
-  font-size: 14px; cursor: pointer;
-  transition: background-color 120ms ease, color 120ms ease, transform 80ms ease;
-}
-.search-cancel:active { transform: scale(0.98); }
-.search-control.expanded .search-cancel {
-  display: inline-flex; align-items: center; justify-content: center;
-}
-
-/* Suggestions */
-.search-suggestions {
-  position: absolute; top: calc(100% + 6px); left: 0; right: auto;
-  background: var(--panel-bg);
-  border: 1px solid var(--panel-border);
-  border-radius: var(--r-lg);
-  box-shadow: var(--elev-2);
-  max-height: 260px;
-  overflow: auto;
-  display: none;
-  overscroll-behavior: contain;
-  -webkit-overflow-scrolling: touch;
-  z-index: 1400;
-  max-width: 320px;
-}
-.search-control.expanded .search-suggestions { display: block; }
-
-.suggestion-section {
-  padding: 8px 10px 6px 10px;
-  font-size: 12px; color: var(--text-subtle);
-  position: sticky; top: 0;
-  background: inherit; backdrop-filter: var(--panel-backdrop);
-}
-.suggestion-item {
-  padding: 10px 14px;
-  font-size: 14px; cursor: pointer;
-  display: grid; grid-template-columns: 1fr auto; align-items: center;
-  gap: 10px;
-  transition: background-color 100ms ease;
-}
-.suggestion-item + .suggestion-item { border-top: 1px solid var(--panel-border); }
-.suggestion-item:hover, .suggestion-item:active { background: var(--accent-weak); }
-.suggestion-meta { color: var(--text-subtle); font-size: 12px; }
-
-.vehicle-chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 8px; border-radius: 999px;
-  background: rgba(0,0,0,0.06);
-  color: var(--text-strong); font-size: 12px; font-weight: 600;
-}
-@media (prefers-color-scheme: dark) {
-  .vehicle-chip { background: rgba(255,255,255,0.08); }
-}
-
-/* Mobile rules */
-@media (max-width: 600px) {
-  #controls{
-    top: max(10px, env(safe-area-inset-top));
-    left: max(10px, env(safe-area-inset-left));
-    right: auto; bottom: auto;
-    width: 140px;
-    border-radius: 14px;
-    padding: 8px 9px;
-    gap: 8px;
-    box-shadow: var(--elev-2);
-  }
-  .control-group h4{ font-size: 14px; margin-bottom: 4px; }
-  #filters{ gap: 6px; grid-template-columns: 1fr; }
-  #filters label{ padding: 6px 8px; font-size: 12px; column-gap: 8px; border-radius: 10px; }
-  #filters input[type="checkbox"]{ width: 16px; height: 16px; }
-
-  .leaflet-popup-content{ font-size: 13.5px; line-height: 1.35; }
-
-  /* collapsed by default on phones */
-  .search-input{ max-width: 0; opacity: 0; }
-  .search-control.expanded .search-input{
-    max-width: min(50vw, 340px);
-    opacity: 1;
-    font-size: 16px;
-    padding: 10px 12px;
+    marker.tripId=tripId;
+    marker._lastTs = Date.now();
+    Object.assign(marker,fields);
+    vehicleMarkers[id]=marker;
   }
 
-  /* cancel button visible only when expanded */
-  .search-cancel { display: none; }
-  .search-control.expanded .search-cancel{
-    display: inline-flex;
-    align-items: center; justify-content: center;
-    width: 28px; height: 28px; padding: 0; margin-left: 4px;
-    border-radius: 10px; border: 1px solid var(--panel-border);
-    background: transparent; font-size: 0;
-  }
-  .search-control.expanded .search-cancel::before{
-    content: "✕"; font-size: 16px; line-height: 1; color: var(--text-strong);
-  }
-  @media (prefers-color-scheme: dark) {
-    .search-control.expanded .search-cancel::before { color: #fff; }
-  }
-
-  .search-control .search-suggestions{
-    left: 0; right: auto;
-    max-width: min(50vw, 340px);
-    max-height: min(48vh, 320px);
-  }
-
-  /* hide debug on phones */
-  #debug, #vehicle-count { display: none !important; }
-  #vehicle-count::before { display: none !important; content: none; }
-
-  /* show last update badge on phones */
-  #mobile-last-update{ display: block; }
+  // compute a crude heading (radians) for later dead-reckoning
+  try{
+    const m = vehicleMarkers[id];
+    if(m && m._prevLL){
+      const a = m._prevLL, b = m.getLatLng();
+      const dy = (b.lat - a.lat) * Math.PI/180;
+      const dx = (b.lng - a.lng) * Math.PI/180 * Math.cos((a.lat+b.lat)*Math.PI/360);
+      m._headingRad = Math.atan2(dx, dy); // map y=lat, x=lng
+    }
+  }catch{}
+}
+function updateVehicleCount(){
+  const busCount=Object.values(vehicleMarkers).filter(m=>vehicleLayers.bus.hasLayer(m)).length;
+  const trainCount=Object.values(vehicleMarkers).filter(m=>vehicleLayers.train.hasLayer(m)).length;
+  const ferryCount=Object.values(vehicleMarkers).filter(m=>vehicleLayers.ferry.hasLayer(m)).length;
+  const el=document.getElementById("vehicle-count"); if(el) el.textContent=`Buses: ${busCount}, Trains: ${trainCount}, Ferries: ${ferryCount}`;
 }
 
-/* Extra small phones */
-@media (max-width: 360px){
-  #controls{ width: 135px; padding: 8px 9px; border-radius: 12px; top: calc(12px + 4px); }
-  #filters label{ font-size: 12px; padding: 6px 7px; }
-  .control-group h4{ font-size: 13px; }
-  .search-control.expanded .search-input{ max-width: min(52vw, 300px); }
-  .search-control .search-suggestions{ max-width: min(52vw, 300px); max-height: min(44vh, 280px); }
+(function injectExtraStyle(){
+  const style=document.createElement("style");
+  style.textContent=`.veh-highlight{stroke:#333;stroke-width:3;}
+  .veh-ghost{animation:pulse 2s ease-in-out infinite; opacity:0.6}
+  @keyframes pulse{0%{opacity:.35}50%{opacity:.8}100%{opacity:.35}}`;
+  document.head.appendChild(style);
+})();
+
+function updateControlsHeight() {
+  const el = document.getElementById("controls");
+  if (!el) return;
+  const h = Math.ceil(el.getBoundingClientRect().height);
+  document.documentElement.style.setProperty("--controls-height", h + "px");
+}
+window.addEventListener("resize", updateControlsHeight);
+window.addEventListener("orientationchange", updateControlsHeight);
+window.addEventListener("load", updateControlsHeight);
+const __controlsRO = new ResizeObserver(updateControlsHeight);
+document.addEventListener("DOMContentLoaded", () => {
+  const el = document.getElementById("controls");
+  if (el) __controlsRO.observe(el);
+});
+
+function normalizeFleetLabel(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
+function normalizeRouteKey(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
+function onlyDigits(s){return (s||"").replace(/\D/g,"");}
+function clearRouteHighlights(){
+  Object.values(vehicleMarkers).forEach(m=>{
+    if(m._isRouteHighlighted){
+      try{ if(typeof m.setRadius==="function" && m._baseRadius!=null) m.setRadius(m._baseRadius); m.setStyle({weight:1}); }catch{}
+      m._isRouteHighlighted=false;
+    }
+  });
+}
+function highlightMarkers(markers){
+  clearRouteHighlights();
+  const bounds=[];
+  markers.forEach(m=>{
+    try{ if(typeof m.setRadius==="function" && m._baseRadius!=null) m.setRadius(m._baseRadius+2); m.setStyle({weight:3}); m._isRouteHighlighted=true; bounds.push(m.getLatLng()); }catch{}
+  });
+  if(bounds.length>0) map.fitBounds(L.latLngBounds(bounds),{padding:[40,40]});
 }
 
-/* Mobile last update badge */
-#mobile-last-update{
-  position: fixed;
-  left: 10px;
-  bottom: calc(10px + env(safe-area-inset-bottom));
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
-  line-height: 1;
-  color: #1c1c1e;
-  background: rgba(255,255,255,0.85);
-  border: 1px solid rgba(60,60,67,0.18);
-  border-radius: 10px;
-  padding: 6px 8px;
-  box-shadow: 0 6px 16px rgba(0,0,0,0.12);
-  z-index: 1200;
-  pointer-events: none;
-  display: none; /* shown via mobile media query */
-}
-@media (prefers-color-scheme: dark){
-  #mobile-last-update{
-    color:#f5f5f7;
-    background: rgba(28,28,30,0.74);
-    border-color: rgba(255,255,255,0.14);
-    box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+function resolveQueryToMarkers(raw){
+  const q=(raw||"").trim();
+  if(!q) return {type:"none"};
+  const fleetKey=normalizeFleetLabel(q);
+  const digitKey=onlyDigits(q);
+  if(vehicleIndexByFleet.has(fleetKey)){
+    return {type:"fleet", exemplar: vehicleIndexByFleet.get(fleetKey)};
   }
+  if(oosIndexByFleet.has(fleetKey)){
+    return {type:"fleet", exemplar: oosIndexByFleet.get(fleetKey)};
+  }
+  const routeKey=normalizeRouteKey(q);
+  if(routeIndex.has(routeKey)){
+    const set=routeIndex.get(routeKey);
+    const list=[...set];
+    return {type:"route", markers:list, exemplar:list[0]||null};
+  }
+  for(const [key,marker] of vehicleIndexByFleet.entries()){
+    if(key.startsWith(fleetKey)) return {type:"fleet", exemplar:marker};
+  }
+  for(const [key,marker] of oosIndexByFleet.entries()){
+    if(key.startsWith(fleetKey)) return {type:"fleet", exemplar:marker};
+  }
+  if(digitKey){
+    for(const [key,marker] of vehicleIndexByFleet.entries()){
+      if(onlyDigits(key)===digitKey) return {type:"fleet", exemplar:marker};
+    }
+    for(const [key,marker] of oosIndexByFleet.entries()){
+      if(onlyDigits(key)===digitKey) return {type:"fleet", exemplar:marker};
+    }
+  }
+  for(const [rk,set] of routeIndex.entries()){
+    if(rk.startsWith(routeKey)){
+      const list=[...set];
+      return {type:"route", markers=list, exemplar:list[0]||null};
+    }
+  }
+  return {type:"none"};
 }
+function isMobileScreen(){ return window.innerWidth <= 600; }
 
-/* Focus ring normalization */
-:where(button,[role="button"],input,.search-icon-btn,.search-cancel):focus-visible {
-  outline: none; box-shadow: var(--ring);
-}
+// Search control 
+const SearchControl=L.Control.extend({
+  options:{position:"topleft"},
+  onAdd:function(){
+    const wrapper=L.DomUtil.create("div","leaflet-control search-wrapper");
+    const div=L.DomUtil.create("div","leaflet-control search-control",wrapper);
 
-  </style>
-</head>
+    const btn=L.DomUtil.create("button","search-icon-btn",div);
+    btn.type="button"; btn.title="Search";
+    btn.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`;
 
-<body>
-  <div id="controls">
-    <div class="control-group">
-      <h4>Vehicle Display</h4>
-      <div id="filters">
-        <label><input type="checkbox" data-layer="bus" checked> Buses</label>
-        <label><input type="checkbox" data-layer="train" checked> Trains</label>
-        <label><input type="checkbox" data-layer="ferry" checked> Ferries</label>
-        <label><input type="checkbox" data-layer="out" checked> Out of Service</label>
-      </div>
-    </div>
+    const input=L.DomUtil.create("input","search-input",div);
+    input.type="text"; input.placeholder="search here"; input.setAttribute("enterkeyhint","search");
 
-    <div class="control-group" id="tunnel-toggle">
-      <h4>Train Tunnel Estimation</h4>
-      <label>
-        <input type="checkbox" id="toggle-tunnel" checked>
-        Enable Britomart tunnel estimation
-      </label>
-    </div>
+    const cancel=L.DomUtil.create("button","search-cancel",div);
+    cancel.type="button"; cancel.textContent="Cancel";
 
-    <div id="debug">Realtime status...</div>
-    <div id="vehicle-count">Vehicles: 0 | Last refresh: N/A</div>
-  </div>
+    const sugg=L.DomUtil.create("div","search-suggestions",div);
 
-  <div id="map"></div>
+    L.DomEvent.disableClickPropagation(wrapper);
+    L.DomEvent.disableScrollPropagation(wrapper);
+    div.classList.remove("expanded");
+
+    function openAndPin(m) {
+      if (!m) return;
+      const ll = m.getLatLng();
+      const targetZoom = Math.max(map.getZoom(), 14);
+
+      if (pinnedPopup && pinnedPopup !== m) pinnedPopup.closePopup();
+      pinnedPopup = m;
+      pinnedFollow = true;
+
+      const needMove =
+        map.getZoom() < targetZoom ||
+        !map.getBounds().pad(-0.25).contains(ll);
+
+      const doOpen = () => {
+        try {
+          m.openPopup();
+          m.bringToFront?.();
+          setTimeout(() => { try { m.bringToFront?.(); } catch {} }, 0);
+        } catch {}
+      };
+
+      if (needMove) {
+        let done = false;
+        const once = () => { if (done) return; done = true; map.off("moveend", once); doOpen(); };
+        map.once("moveend", once);
+        map.setView(ll, targetZoom, { animate: true });
+        setTimeout(once, 600);
+      } else {
+        doOpen();
+      }
+    }
+
+    function expand(){ div.classList.add("expanded"); input.focus({ preventScroll:true }); renderSuggestions(input.value); }
+    function collapse(opts = { preservePopup: false }) {
+      div.classList.remove("expanded"); input.value = ""; sugg.innerHTML = ""; clearRouteHighlights();
+      if (!opts.preservePopup && pinnedPopup) { pinnedPopup.closePopup(); pinnedPopup = null; pinnedFollow=false; }
+    }
+
+    btn.addEventListener("click", ()=> { if(div.classList.contains("expanded")) collapse({ preservePopup: !!pinnedPopup }); else expand(); });
+    cancel.addEventListener("click", ()=> collapse({ preservePopup: !!pinnedPopup }));
+
+    let blurTimer=null;
+    input.addEventListener("blur", ()=>{ if(!div.classList.contains("expanded")) return; blurTimer=setTimeout(()=>{ if(div.classList.contains("expanded")) collapse({ preservePopup: !!pinnedPopup }); }, 250); });
+    input.addEventListener("focus", ()=> { if(blurTimer){ clearTimeout(blurTimer); blurTimer=null; } });
+
+    let debounceId=null;
+    input.addEventListener("input",()=>{ if(debounceId) clearTimeout(debounceId); debounceId=setTimeout(()=>renderSuggestions(input.value),140); });
+
+    input.addEventListener("keydown",e=>{
+      if(e.key==="Enter"){
+        e.preventDefault();
+        const res=resolveQueryToMarkers(input.value);
+        if(res.type==="fleet" && res.exemplar){
+          if(blurTimer){ clearTimeout(blurTimer); blurTimer=null; }
+          openAndPin(res.exemplar); clearRouteHighlights(); collapse({ preservePopup: true });
+        }else if(res.type==="route"){
+          highlightMarkers(res.markers);
+          if(res.exemplar){ if(blurTimer){ clearTimeout(blurTimer); blurTimer=null; } openAndPin(res.exemplar); }
+          collapse({ preservePopup: true });
+        }else{
+          clearRouteHighlights(); collapse({ preservePopup: !!pinnedPopup });
+        }
+      }else if(e.key==="Escape"){
+        e.preventDefault(); collapse({ preservePopup: !!pinnedPopup });
+      }
+    });
+
+    function onDocDown(ev){
+      if(!div.classList.contains("expanded")) return;
+      if(!wrapper.contains(ev.target)){
+        if(isMobileScreen()){
+          setTimeout(()=>{ if(!wrapper.contains(document.activeElement)) collapse({ preservePopup: !!pinnedPopup }); },120);
+        }else{
+          collapse({ preservePopup: !!pinnedPopup });
+        }
+      }
+    }
+    document.addEventListener("mousedown",onDocDown,{passive:true});
+    document.addEventListener("touchstart",onDocDown,{passive:true});
+
+    function renderSuggestions(raw){
+      const q=(raw||"").trim();
+      if(!div.classList.contains("expanded")) return;
+      if(!q){ sugg.innerHTML=""; sugg.style.display="none"; return; }
+      sugg.style.display="block";
+      const qNorm=q.replace(/\s+/g,"").toUpperCase();
+
+      const fleets=[], routesList=[], seen=new Set();
+      for(const [label] of vehicleIndexByFleet.entries()){
+        if(label.startsWith(qNorm) && !seen.has(label)){ fleets.push({label}); seen.add(label); if(fleets.length>=8) break; }
+      }
+      if(fleets.length<8){
+        for(const [label] of oosIndexByFleet.entries()){
+          if(label.startsWith(qNorm) && !seen.has(label)){ fleets.push({label}); seen.add(label); if(fleets.length>=8) break; }
+        }
+      }
+      for(const [rk,set] of routeIndex.entries()){
+        if(rk.startsWith(qNorm)){ routesList.push({rk,count=set.size}); if(routesList.length>=8) break; }
+      }
+
+      const html=[];
+      if(fleets.length){
+        html.push(`<div class="suggestion-section">Fleets</div>`);
+        fleets.forEach(it=>html.push(`<div class="suggestion-item" data-kind="fleet" data-id="${it.label}"><span>${it.label}</span><span class="suggestion-meta">vehicle</span></div>`));
+      }
+      if(routesList.length){
+        html.push(`<div class="suggestion-section">Routes</div>`);
+        routesList.forEach(it=>html.push(`<div class="suggestion-item" data-kind="route" data-id="${it.rk}"><span>${it.rk}</span><span class="suggestion-meta">${it.count} vehicle${it.count===1?"":"s"}</span></div>`));
+      }
+      sugg.innerHTML=html.join("");
+
+      sugg.querySelectorAll(".suggestion-item").forEach(el=>{
+        el.addEventListener("pointerup",(ev)=>{
+          ev.preventDefault(); ev.stopPropagation();
+          const kind=el.getAttribute("data-kind");
+          const id=el.getAttribute("data-id");
+          if(kind==="fleet"){
+            const m=vehicleIndexByFleet.get(id) || oosIndexByFleet.get(id);
+            if(m){ if(blurTimer){ clearTimeout(blurTimer); blurTimer=null; } openAndPin(m); clearRouteHighlights(); collapse({ preservePopup: true }); }
+            else{ collapse({ preservePopup: !!pinnedPopup }); }
+          }else if(kind==="route"){
+            const set=routeIndex.get(id);
+            if(set&&set.size){ const list=[...set]; highlightMarkers(list); if(blurTimer){ clearTimeout(blurTimer); blurTimer=null; } openAndPin(list[0]); collapse({ preservePopup: true }); }
+            else{ collapse({ preservePopup: !!pinnedPopup }); }
+          }else{
+            collapse({ preservePopup: !!pinnedPopup });
+          }
+        },{passive:false});
+      });
+    }
+
+    return wrapper;
+  }
+});
+map.addControl(new SearchControl());
+
+async function fetchTripsBatch(tripIds){
+  const idsToFetch=tripIds.filter(t=>t && !tripCache[t]); if(!idsToFetch.length) return;
+  for(const ids of chunk([...new Set(idsToFetch)],100)){
+    const tripJson=await safeFetch(`${tripsUrl}?ids=${ids.join(",")}`);
+    if(!tripJson || tripJson._rateLimited){ if(tripJson&&tripJson._rateLimited) applyRateLimitBackoff(tripJson.retryAfterMs,"trips"); continue; }
+    if(tripJson?.data?.length>0){
+      tripJson.data.forEach(t=>{
+        const a=t.attributes;
+        if(a){ tripCache[a.trip_id]={trip_id:a.trip_id,trip_headsign:a.trip_headsign||"N/A",route_id:a.route_id,bikes_allowed:a.bikes_allowed}; }
+      });
   
-  <div id="mobile-last-update">Last update: —</div>
-  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
-  <script src="script.js"></script>
+      ids.forEach(tid=>{
+        const trip=tripCache[tid]; if(!trip) return;
+        Object.values(vehicleMarkers).forEach(m=>{
+          if(m.tripId===tid){
+            const r=routes[trip.route_id]||{};
+            const base=buildPopup(r.route_short_name||r.route_long_name||"Unknown",trip.trip_headsign||r.route_long_name||"Unknown",m.vehicleLabel||"N/A",m.busType||"",m.licensePlate||"N/A",m.speedStr||"",m.occupancy||"",m.bikesLine||"");
+            const pair=m.pairedTo?`<br><b>Paired to:</b> ${m.pairedTo} (6-car)`:``;
+            m.setPopupContent(base+pair);
+          }
+        });
+      });
+    }
+  }
+}
 
-</body>
-</html>
+function pairAMTrains(inSvc,outOfService){
+  const pairs=[], used=new Set();
+  inSvc.forEach(inT=>{
+    let best=null, bestDist=Infinity;
+    outOfService.forEach(o=>{
+      if(used.has(o.vehicleId)) return;
+      const dx=inT.lat-o.lat, dy=inT.lon-o.lon, dist=Math.sqrt(dx*dx+dy*dy)*111000;
+      if(dist<=200 && Math.abs(inT.speedKmh-o.speedKmh)<=15){ if(dist<bestDist){bestDist=dist; best=o;} }
+    });
+    if(best){ used.add(best.vehicleId); pairs.push({inTrain:inT,outTrain:best}); }
+  });
+  pairs.forEach(p=>{
+    const inColor=p.inTrain.color||vehicleColors.train;
+    const outM=vehicleMarkers[p.outTrain.vehicleId], inM=vehicleMarkers[p.inTrain.vehicleId];
+    if(outM){ outM.setStyle({fillColor:inColor}); const c=outM.getPopup()?.getContent()||""; outM.getPopup().setContent(c+`<br><b>Paired to:</b> ${p.inTrain.vehicleLabel} (6-car)`); outM.pairedTo=p.inTrain.vehicleLabel; }
+    if(inM) inM.pairedTo=p.outTrain.vehicleLabel;
+  });
+  return pairs;
+}
+
+/* ---------------- CRL Tunnel Estimator (Britomart ↔ Maungawhau) ---------------- */
+let __enableTunnelEstimation = true;   // default ON
+function setTunnelEstimationEnabled(v){ __enableTunnelEstimation = !!v; setDebug(`Tunnel estimation ${__enableTunnelEstimation?"enabled":"disabled"}`); }
+window.setTunnelEstimationEnabled = setTunnelEstimationEnabled;
+
+const CRLTunnelEstimator = (function(){
+  // --- Helper math (small-area approximations are OK here) ---
+  const DEG2RAD = Math.PI/180;
+  const METERS_PER_DEG_LAT = 111320; // ~ constant
+  function metersPerDegLng(lat){ return 111320 * Math.cos(lat*DEG2RAD); }
+  function toMeters(a,b){
+    const mx = (b.lng - a.lng) * metersPerDegLng((a.lat+b.lat)/2);
+    const my = (b.lat - a.lat) * METERS_PER_DEG_LAT;
+    return Math.hypot(mx,my);
+  }
+  function interp(a,b,t){ return L.latLng(a.lat + (b.lat-a.lat)*t, a.lng + (b.lng-a.lng)*t); }
+  function projectOnSegment(p,a,b){
+    const vx = (b.lng - a.lng) * metersPerDegLng((a.lat+b.lat)/2);
+    const vy = (b.lat - a.lat) * METERS_PER_DEG_LAT;
+    const wx = (p.lng - a.lng) * metersPerDegLng((a.lat+p.lat)/2);
+    const wy = (p.lat - a.lat) * METERS_PER_DEG_LAT;
+    const denom = (vx*vx + vy*vy) || 1e-12;
+    let t = (vx*wx + vy*wy)/denom;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    return { t, point: interp(a,b,t) };
+  }
+  function offsetLatLng(base, dirLatLng, offsetMeters){
+    // dirLatLng is the next point along the route; create a normal (left) and shift by offset
+    const lat = base.lat, lng = base.lng;
+    const dx = (dirLatLng.lng - base.lng) * metersPerDegLng(lat);
+    const dy = (dirLatLng.lat - base.lat) * METERS_PER_DEG_LAT;
+    const len = Math.hypot(dx,dy) || 1e-9;
+    // left-normal (−dy, +dx)
+    const nx = -dy/len, ny = dx/len;
+    const dLng = (nx * offsetMeters) / metersPerDegLng(lat);
+    const dLat = (ny * offsetMeters) / METERS_PER_DEG_LAT;
+    return L.latLng(lat + dLat, lng + dLng);
+  }
+
+  // --- Portals (rough polygons). Keep tiny and conservative to avoid false positives. ---
+  const portalBritomart = L.polygon([
+    [-36.84495,174.76790],
+    [-36.84435,174.76920],
+    [-36.84535,174.76980],
+    [-36.84595,174.76845]
+  ]).getLatLngs()[0];
+
+  const portalMaungawhau = L.polygon([
+    [-36.87535,174.75220],
+    [-36.87475,174.75410],
+    [-36.87380,174.75360],
+    [-36.87435,174.75170]
+  ]).getLatLngs()[0];
+
+  function pointInPoly(latlng, poly){
+    const x = latlng.lng, y = latlng.lat;
+    let inside = false;
+    for (let i=0,j=poly.length-1;i<poly.length;j=i++){
+      const xi=poly[i].lng, yi=poly[i].lat;
+      const xj=poly[j].lng, yj=poly[j].lat;
+      const intersect = ((yi>y)!==(yj>y)) && (x < (xj - xi)*(y - yi)/(yj - yi + 1e-12) + xi);
+      if(intersect) inside = !inside;
+    }
+    return inside;
+  }
+  function isNearAnyPortal(ll){
+    try{
+      const p = L.latLng(ll);
+      return pointInPoly(p, portalBritomart) || pointInPoly(p, portalMaungawhau);
+    }catch{ return false; }
+  }
+  function whichPortal(ll){
+    const p = L.latLng(ll);
+    if(pointInPoly(p, portalBritomart)) return "BRITOMART";
+    if(pointInPoly(p, portalMaungawhau)) return "MAUNGAWHAU";
+    return null;
+  }
+
+  // --- CRL route centerline (approx) from Maungawhau → Karanga-a-Hape → Te Waihorotiu → Waitematā ---
+  // NOTE: These are light approximations; refine if you have surveyed polylines.
+  const routeDown = [ // "Down": Maungawhau -> City
+    L.latLng(-36.87490,174.75350), // Maungawhau portal area
+    L.latLng(-36.86860,174.75860), // Karanga-a-Hape (K Rd) area
+    L.latLng(-36.85100,174.76300), // Te Waihorotiu (Aotea) area
+    L.latLng(-36.84520,174.76830)  // Waitematā (Britomart) throat
+  ];
+  const routeUp = [...routeDown].slice().reverse(); // "Up": City -> Maungawhau
+
+  // Stations along each direction: cumulative s (meters) computed after preprocessing.
+  const stationsDown = ["Maungawhau","Karanga-a-Hape","Te Waihorotiu","Waitematā"];
+  const stationsUp   = ["Waitematā","Te Waihorotiu","Karanga-a-Hape","Maungawhau"];
+
+  function preprocessRoute(pts){
+    const segs = [];
+    const cum = [0];
+    for(let i=0;i<pts.length-1;i++){
+      const a=pts[i], b=pts[i+1];
+      const d = toMeters(a,b);
+      segs.push({a,b,d});
+      cum.push(cum[cum.length-1]+d);
+    }
+    return { pts, segs, cum, length: cum[cum.length-1] };
+  }
+  const R_DOWN = preprocessRoute(routeDown);
+  const R_UP   = preprocessRoute(routeUp);
+
+  function nearestOnRoute(route, p){
+    let best = { s:0, ll:route.pts[0], idx:0, t:0, d:Infinity };
+    for(let i=0;i<route.segs.length;i++){
+      const {a,b,d} = route.segs[i];
+      const proj = projectOnSegment(p, a, b);
+      const ll = proj.point;
+      const dist = toMeters(p, ll);
+      if(dist < best.d){
+        best = { s: route.cum[i] + proj.t*d, ll, idx:i, t:proj.t, d:dist };
+      }
+    }
+    return best; // s = cumulative meters along route
+  }
+  function pointAtS(route, s){
+    if(s <= 0) return route.pts[0];
+    if(s >= route.length) return route.pts[route.pts.length-1];
+    // locate segment
+    let i = 0;
+    while(i < route.segs.length && s > route.cum[i+1]) i++;
+    const seg = route.segs[i];
+    const local = (s - route.cum[i]) / seg.d;
+    return interp(seg.a, seg.b, local);
+  }
+  function dirAtS(route, s){
+    if(s <= 0) return route.segs[0].b;
+    if(s >= route.length) return route.segs[route.segs.length-1].b;
+    let i = 0;
+    while(i < route.segs.length && s > route.cum[i+1]) i++;
+    const seg = route.segs[i];
+    const local = (s - route.cum[i]) / (seg.d || 1);
+    const eps = (local < 0.5) ? 1e-3 : -1e-3; // bias towards segment direction
+    return interp(seg.a, seg.b, Math.min(1, Math.max(0, local+eps)));
+  }
+
+  // track spacing & speeds
+  const TRACK_HALF_SEP_M = 3.0;         // ~6 m between centerlines
+  const MAX_TUNNEL_V_MPS = 70/3.6;      // 70 km/h max
+  const JITTER = 0.00002;
+
+  // Slow zones near stations (radius meters → target speed m/s)
+  const SLOW_R1 = 500,  V1 = 35/3.6;   // ~35 km/h within 500 m
+  const SLOW_R2 = 120,  V2 = 12/3.6;   // ~12 km/h within 120 m
+
+  function buildStationProfile(route, names){
+    const sList = route.cum; // vertices cumulative
+    return names.map((name, i) => ({ name, s: sList[i] || 0 }));
+  }
+  const PROF_DOWN = buildStationProfile(R_DOWN, stationsDown);
+  const PROF_UP   = buildStationProfile(R_UP,   stationsUp);
+
+  function targetSpeedMps(route, s, profile){
+    let minDist = Infinity;
+    for(const st of profile){
+      const d = Math.abs(st.s - s);
+      if(d < minDist) minDist = d;
+    }
+    if(minDist <= SLOW_R2) return V2;
+    if(minDist <= SLOW_R1) return V1;
+    return MAX_TUNNEL_V_MPS;
+  }
+
+  const ghosts = new Map(); // id -> { marker, route, profile, s, v, startedTs, lastTickTs, side }
+
+  function adoptMarker(m){
+    const now = Date.now();
+    const ll = m.getLatLng();
+    const entry = whichPortal(ll);
+    if(!entry) return;
+
+    // Pick direction/route
+    const useDown = entry === "MAUNGAWHAU";
+    const route = useDown ? R_DOWN : R_UP;
+    const profile = useDown ? PROF_DOWN : PROF_UP;
+
+    // Initial speed try parse from speedStr; clamp to tunnel max
+    const speedKmh = Number((m.speedStr||"").split(" ")[0]);
+    let v = (isFinite(speedKmh) ? speedKmh/3.6 : 0);
+    if(!isFinite(v) || v < 1) v = 12/3.6; // default crawl if unknown
+    v = Math.min(v, MAX_TUNNEL_V_MPS);
+
+    // Project onto route to get starting s
+    const near = nearestOnRoute(route, ll);
+    let s = near.s;
+
+    // Side selection: use heading sign; fallback to even/odd fleet label
+    let side = +1; // +1 = left of centerline, -1 = right
+    try{
+      const a = m._prevLL || ll;
+      const dy = (ll.lat - a.lat) * Math.PI/180;
+      const dx = (ll.lng - a.lng) * Math.PI/180 * Math.cos((a.lat+ll.lat)*Math.PI/360);
+      const heading = Math.atan2(dx, dy);
+      side = useDown ? (heading>=0 ? +1 : -1) : (heading>=0 ? -1 : +1);
+    }catch{
+      const num = parseInt((m.vehicleLabel||"").replace(/\D/g,"")||"0",10);
+      side = (num % 2 === 0) ? +1 : -1;
+    }
+
+    // Ghost styling
+    try{
+      m.setStyle({opacity:1, fillOpacity:0.55, weight:1});
+      L.DomUtil.addClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
+    }catch{}
+    m._isGhost = true;
+
+    ghosts.set(m._leaflet_id || m, {
+      marker: m,
+      route, profile,
+      s, v,
+      startedTs: now,
+      lastTickTs: now,
+      side
+    });
+  }
+
+  function dropGhost(m){
+    try{
+      L.DomUtil.removeClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
+    }catch{}
+    m._isGhost = false;
+  }
+
+  const MAX_SECONDS = 240; // allow up to 4 min across full alignment
+
+  function tick(){
+    if(!ghosts.size || !__enableTunnelEstimation) return;
+    const now = Date.now();
+    ghosts.forEach((g,key)=>{
+      const dt = Math.max(0, (now - g.lastTickTs)/1000);
+      const tTotal = (now - g.startedTs)/1000;
+
+      // exit conditions
+      if(tTotal > MAX_SECONDS){
+        dropGhost(g.marker);
+        ghosts.delete(key);
+        return;
+      }
+
+      // Target speed profile along the route
+      const vT = targetSpeedMps(g.route, g.s, g.profile);
+
+      // Simple accel/decel model toward vT
+      const ACC = 0.5;     // m/s²
+      const DEC = 0.7;     // m/s²
+      if(g.v < vT) g.v = Math.min(vT, g.v + ACC*dt);
+      else         g.v = Math.max(vT, g.v - DEC*dt);
+
+      // advance along route
+      g.s += Math.max(0, g.v * dt);
+
+      // clamp & finish when we hit the end
+      if(g.s >= g.route.length){
+        g.s = g.route.length;
+        const p = pointAtS(g.route, g.s);
+        const dir = dirAtS(g.route, g.s);
+        const trackPt = offsetLatLng(p, dir, g.side * TRACK_HALF_SEP_M);
+        try{ g.marker.setLatLng(trackPt); }catch{}
+        dropGhost(g.marker);
+        ghosts.delete(key);
+        return;
+      }
+
+      // render along route with lateral track offset
+      const p = pointAtS(g.route, g.s);
+      const dir = dirAtS(g.route, g.s);
+      const trackPt = offsetLatLng(p, dir, g.side * TRACK_HALF_SEP_M);
+      try{
+        const jitterLat = (Math.random()-0.5)*JITTER;
+        const jitterLng = (Math.random()-0.5)*JITTER;
+        g.marker.setLatLng([trackPt.lat + jitterLat, trackPt.lng + jitterLng]);
+      }catch{}
+      g.lastTickTs = now;
+    });
+  }
+
+  setInterval(()=>{ tick(); }, 1000);
+
+  function cleanupIfReappeared(){
+    ghosts.forEach((g,key)=>{
+      const m = g.marker;
+      if(m && m._lastTs && Date.now() - m._lastTs < MAX_POLL_MS + 2000){
+        dropGhost(m);
+        ghosts.delete(key);
+      }
+    });
+  }
+
+  return {
+    isNearAnyPortal,
+    adoptMarker,
+    cleanupIfReappeared
+  };
+})();
+/* ---------------- End CRL Tunnel Estimator ---------------- */
+
+function renderFromCache(c){
+  if(!c) return;
+  c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.popupContent,v.color,v.typeKey,v.tripId,{
+    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||""
+  }));
+  const ts = c[0]?.ts || Date.now();
+  setDebug(`Showing cached data (last update: ${new Date(ts).toLocaleTimeString()})`);
+  setLastUpdateTs(ts);
+  updateVehicleCount();
+}
+
+async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false }){
+  const ignoreBackoff = !!opts.ignoreBackoff;
+  const now = Date.now();
+  const realtimeBlocked = (!ignoreBackoff && backoff.realtime.until && now < backoff.realtime.until);
+  if(!pageVisible || vehiclesInFlight || realtimeBlocked) return;
+  vehiclesInFlight=true;
+
+  const watchdogMs = 10000;
+  let watchdog;
+  try{
+    vehiclesAbort?.abort?.();
+    vehiclesAbort=new AbortController();
+    watchdog = setTimeout(()=>{ try{ vehiclesAbort.abort(); }catch{} }, watchdogMs);
+
+    const json=await safeFetch(realtimeUrl,{signal:vehiclesAbort.signal});
+    if(!json) return;
+    if(json._rateLimited){
+      applyRateLimitBackoff(json.retryAfterMs,"realtime");
+      if (!opts.__retryOnce) {
+        setTimeout(()=>{ fetchVehicles({ ignoreBackoff:true, __retryOnce:true }); }, Math.min(json.retryAfterMs || 3000, 5000));
+      }
+      return;
+    }
+
+    backoff.realtime.ms = Math.floor(backoff.realtime.ms/2);
+    if(backoff.realtime.ms < 4000) backoff.realtime.ms = 0;
+    backoff.realtime.until = 0;
+
+    const vehicles=json?.response?.entity||json?.entity||[];
+    const newIds=new Set(), inServiceAM=[], outOfServiceAM=[], allTripIds=[], cachedState=[];
+    vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear();
+
+    vehicles.forEach(v=>{
+      const vehicleId=v.vehicle?.vehicle?.id; if(!v.vehicle||!v.vehicle.position||!vehicleId) return; newIds.add(vehicleId);
+      const lat=v.vehicle.position.latitude, lon=v.vehicle.position.longitude;
+      const vehicleLabel=v.vehicle.vehicle?.label||"N/A", licensePlate=v.vehicle.vehicle?.license_plate||"N/A";
+      const operator=v.vehicle.vehicle?.operator_id||(vehicleLabel.match(/^[A-Za-z]+/)?.[0]??"");
+      const vehicleNumber=(()=>{const d=Number(vehicleLabel.replace(/\D/g,"")); return !isNaN(d)&&d>0?d:(Number(vehicleLabel)||Number(vehicleLabel.slice(2))||0);})();
+
+      const routeId=v.vehicle?.trip?.route_id, tripId=v.vehicle?.trip?.trip_id;
+      const rType=routes[routeId]?.route_type;
+      const isTrain=rType===2, isFerry=rType===4, isAM=vehicleLabel.startsWith("AM");
+
+      let speedKmh=null, speedStr="N/A";
+      if(v.vehicle.position.speed!==undefined){
+        speedKmh=(isTrain||isFerry||isAM)?v.vehicle.position.speed*3.6:v.vehicle.position.speed;
+        speedStr=isFerry?`${speedKmh.toFixed(1)} km/h (${(v.vehicle.position.speed*1.94384).toFixed(1)} kn)`:`${speedKmh.toFixed(1)} km/h`;
+      }
+
+      let occupancy="N/A";
+      const occProto = v.vehicle?.occupancy_status ?? v.vehicle?.occupancyStatus ?? v.vehicle?.occupancy?.status;
+      if(occProto!==undefined && occProto!==null){
+        if (typeof occProto === "number" && occProto>=0 && occProto<=6) {
+          occupancy = occupancyLabels[occProto];
+        } else if (typeof occProto === "string") {
+          const key = occProto.trim().toUpperCase();
+          const map = {
+            "EMPTY":0,"MANY_SEATS_AVAILABLE":1,"FEW_SEATS_AVAILABLE":2,"STANDING_ROOM_ONLY":3,"LIMITED_STANDING_ROOM":4,"FULL":5,"NOT_ACCEPTING_PASSENGERS":6
+          };
+          if (map[key] !== undefined) occupancy = occupancyLabels[map[key]];
+        }
+      }
+
+      let typeKey="out", color=vehicleColors.out, routeName="Out of service", destination="Unknown";
+      if(routeId && tripId && routes[routeId]){
+        const r=routes[routeId]; routeName=r.route_short_name||r.route_long_name||"Unknown";
+        switch(r.route_type){case 2:typeKey="train";color=trainColorForRoute(r.route_short_name);break; case 3:typeKey="bus";color=vehicleColors.bus;break; case 4:typeKey="ferry";color=vehicleColors.ferry;break;}
+      }
+      if(routes[routeId]?.route_type===3){typeKey="bus"; color=vehicleColors.bus;}
+      if(tripId) allTripIds.push(tripId);
+
+      if(tripId && tripCache[tripId]?.trip_headsign) destination=tripCache[tripId].trip_headsign;
+      else if(routes[routeId]) destination=routes[routeId].route_long_name||routes[routeId].route_short_name||"Unknown";
+
+      let bikesLine="";
+      const t=tripId?tripCache[tripId]:null;
+      if(t?.bikes_allowed!==undefined){
+        if(typeKey==="bus" && t.bikes_allowed===2) bikesLine=`<br><b>Bikes allowed:</b> Yes`;
+        if(typeKey==="train"){
+          if(t.bikes_allowed===2) bikesLine=`<br><b>Bikes allowed:</b> Yes`;
+          else if(t.bikes_allowed===1) bikesLine=`<br><b>Bikes allowed:</b> Some`;
+        }
+      }
+
+      let busType = vehicleMarkers[vehicleId]?.busType || "";
+      const wasBus   = vehicleMarkers[vehicleId]?.currentType === "bus";
+      const isBusNow = typeKey === "bus";
+      const needType =
+        (isBusNow && !busType) ||
+        (isBusNow && !wasBus)  ||
+        (!vehicleMarkers[vehicleId] && isBusNow);
+      if (needType && operator) {
+        const model = getBusType(operator, vehicleNumber);
+        if (model) busType = model;
+      }
+
+      const popup=buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine);
+
+      if(vehicleLabel.startsWith("AM")){
+        if(typeKey==="train") inServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel,color});
+        else outOfServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel});
+      }
+
+      addOrUpdateMarker(vehicleId,lat,lon,popup,color,typeKey,tripId,{
+        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,occupancy,bikesLine
+      });
+
+      if(vehicleLabel){
+        const norm=normalizeFleetLabel(vehicleLabel);
+        if(typeKey!=="out") vehicleIndexByFleet.set(norm,vehicleMarkers[vehicleId]);
+        else oosIndexByFleet.set(norm,vehicleMarkers[vehicleId]);
+      }
+      if(routes[routeId]?.route_short_name && typeKey!=="out"){
+        const rk=normalizeRouteKey(routes[routeId].route_short_name);
+        if(!routeIndex.has(rk)) routeIndex.set(rk,new Set());
+        routeIndex.get(rk).add(vehicleMarkers[vehicleId]);
+      }
+
+      cachedState.push({vehicleId,lat,lon,popupContent:popup,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,occupancy,bikesLine});
+    });
+
+    pairAMTrains(inServiceAM,outOfServiceAM);
+
+    // --- modified cleanup: adopt trains near either CRL portal instead of removing ---
+    Object.keys(vehicleMarkers).forEach(id=>{
+      if(!newIds.has(id)){
+        const m = vehicleMarkers[id];
+        if(
+          __enableTunnelEstimation &&
+          m &&
+          m.currentType === "train" &&
+          CRLTunnelEstimator.isNearAnyPortal(m.getLatLng())
+        ){
+          CRLTunnelEstimator.adoptMarker(m);
+          // keep marker; estimator will animate it along tunnels
+        }else if(
+          __enableTunnelEstimation &&
+          m &&
+          m.currentType === "out" &&
+          CRLTunnelEstimator.isNearAnyPortal(m.getLatLng())
+        ){
+          // treat out-of-service trains the same when they vanish at portals
+          CRLTunnelEstimator.adoptMarker(m);
+        }else{
+          if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
+          map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id];
+        }
+      }
+    });
+
+    // tidy up any ghosts whose trains reappeared
+    CRLTunnelEstimator.cleanupIfReappeared();
+
+    if (pinnedPopup && pinnedFollow) {
+      try {
+        const ll = pinnedPopup.getLatLng();
+        const centerPx = map.latLngToLayerPoint(map.getCenter());
+        const vehPx = map.latLngToLayerPoint(ll);
+        const dx = Math.abs(centerPx.x - vehPx.x);
+        const dy = Math.abs(centerPx.y - vehPx.y);
+        if (dx > 6 || dy > 6) {
+          map.panTo(ll, { animate: true });
+        }
+      } catch {}
+    }
+
+    const nowTs = Date.now();
+    localStorage.setItem("realtimeSnapshot",JSON.stringify(cachedState));
+    setDebug(`Realtime update complete at ${new Date(nowTs).toLocaleTimeString()}`);
+    setLastUpdateTs(nowTs);
+    updateVehicleCount();
+
+    await fetchTripsBatch([...new Set(allTripIds)]);
+  }finally{
+    clearTimeout(watchdog);
+    vehiclesInFlight=false;
+  }
+}
+
+function scheduleNextFetch(){
+  if(pollTimeoutId){ clearTimeout(pollTimeoutId); pollTimeoutId=null; }
+  if(!pageVisible) return;
+  const base = basePollDelay();
+  const now = Date.now();
+  const waitRealtime = backoff.realtime.until > now ? (backoff.realtime.until - now) : 0;
+  const delay = Math.max(base, waitRealtime);
+  pollTimeoutId=setTimeout(async()=>{ if(!pageVisible) return; await fetchVehicles(); scheduleNextFetch(); },delay);
+}
+function pauseUpdatesNow(){ pageVisible=false; if(pollTimeoutId){clearTimeout(pollTimeoutId); pollTimeoutId=null;} vehiclesAbort?.abort?.(); setDebug("Paused updates: tab not visible"); }
+function schedulePauseAfterHide(){ if(hidePauseTimerId) return; hidePauseTimerId=setTimeout(()=>{ hidePauseTimerId=null; if(document.hidden) pauseUpdatesNow(); },HIDE_PAUSE_DELAY_MS); }
+function cancelScheduledPause(){ if(hidePauseTimerId){clearTimeout(hidePauseTimerId); hidePauseTimerId=null;} }
+async function resumeUpdatesNow(){
+  cancelScheduledPause();
+  const wasHidden=!pageVisible;
+  pageVisible=true;
+  if(wasHidden){
+    setDebug("Tab visible. Refreshing...");
+    await fetchVehicles({ ignoreBackoff: true });
+  }
+  scheduleNextFetch();
+}
+
+document.addEventListener("visibilitychange",()=>{ if(document.hidden) pauseUpdatesNow(); else resumeUpdatesNow(); });
+window.addEventListener("pageshow",()=>{ resumeUpdatesNow(); });
+window.addEventListener("pagehide",()=>{ pauseUpdatesNow(); });
+window.addEventListener("focus",()=>{ resumeUpdatesNow(); });
+window.addEventListener("blur",()=>{ schedulePauseAfterHide(); });
+
+async function init(){
+  const rj=await safeFetch(routesUrl); if(rj&&rj._rateLimited) applyRateLimitBackoff(rj.retryAfterMs,"routes");
+  if(rj?.data){ rj.data.forEach(r=>{const a=r.attributes||r; routes[r.id]={route_type:a.route_type,route_short_name:a.route_short_name,route_long_name:a.route_long_name,route_color:a.route_color,agency_id:a.agency_id};}); }
+
+  const bj=await safeFetch(busTypesUrl);
+  if(bj && !bj._rateLimited){ busTypes=bj; busTypeIndex=buildBusTypeIndex(bj); }
+
+  const cached=localStorage.getItem("realtimeSnapshot");
+  if(cached){ try{ const snap=JSON.parse(cached); renderFromCache(snap); }catch{} }
+
+  document.querySelectorAll('#filters input[type="checkbox"]').forEach(cb=>{
+    cb.addEventListener("change",e=>{
+      const layer=e.target.getAttribute("data-layer");
+      if(vehicleLayers[layer]){ if(e.target.checked) map.addLayer(vehicleLayers[layer]); else map.removeLayer(vehicleLayers[layer]); }
+      updateControlsHeight();
+    });
+  });
+
+  updateControlsHeight();
+
+  const initialJitter = 500 + Math.random()*2500;
+  setTimeout(async () => {
+    await fetchVehicles({ ignoreBackoff: true });
+    scheduleNextFetch();
+  }, initialJitter);
+}
+init();
