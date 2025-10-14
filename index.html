@@ -27,7 +27,7 @@
   --glass-blur: 12px;
   --panel-backdrop: saturate(180%) blur(var(--glass-blur));
   --ring: 0 0 0 2px rgba(10,132,255,0.45);
-  --controls-height: 0px; /* set by JS to place the search below #controls */
+  --controls-height: 0px; 
 }
 
 @media (prefers-color-scheme: dark) {
@@ -70,7 +70,7 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
   border: 1px solid var(--panel-border);
   border-radius: var(--r-xl);
   box-shadow: var(--elev-1);
-  padding: 14px 16px;
+  padding: 10px 11px;
   max-width: 280px;
   display: grid;
   gap: var(--gap-3);
@@ -352,7 +352,6 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
     </div>
 
     <div class="control-group" id="tunnel-toggle">
-      <p>-----</p>
       <label>
         <input type="checkbox" id="toggle-tunnel" checked>
         tunnel estimation
@@ -372,5 +371,6 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
 </body>
 </html>
+
 
 
