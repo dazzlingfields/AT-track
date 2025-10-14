@@ -451,113 +451,107 @@ function pairAMTrains(inSvc,outOfService){
   });
   return pairs;
 }
-/* ---------------- CRL Tunnel Estimator (Britomart ↔ Maungawhau) — L-safe init ---------------- */
+/* ---------------- CRL Tunnel Estimator---------------- */
 let __enableTunnelEstimation = true;   // default ON
-function setTunnelEstimationEnabled(v){ __enableTunnelEstimation = !!v; setDebug(`Tunnel estimation ${__enableTunnelEstimation?"enabled":"disabled"}`); }
+function setTunnelEstimationEnabled(v){ __enableTunnelEstimation = !!v; setDebug("Tunnel estimation " + (__enableTunnelEstimation ? "enabled" : "disabled")); }
 window.setTunnelEstimationEnabled = setTunnelEstimationEnabled;
 
-const CRLTunnelEstimator = (function(){
-  // Use plain objects so the module doesn't require Leaflet at parse time
-  const DEG2RAD = Math.PI/180;
-  const METERS_PER_DEG_LAT = 111320;
-  const JITTER = 0.00002;
-  const TRACK_HALF_SEP_M = 3.0;              // ~6 m track spacing
-  const MAX_TUNNEL_V_MPS = 70/3.6;           // 70 km/h ceiling
-  const SLOW_R1 = 500,  V1 = 35/3.6;         // 35 km/h within 500 m
-  const SLOW_R2 = 120,  V2 = 12/3.6;         // 12 km/h within 120 m
-  const MAX_SECONDS = 240;
+var CRLTunnelEstimator = (function(){
+  var DEG2RAD = Math.PI/180;
+  var METERS_PER_DEG_LAT = 111320;
+  var JITTER = 0.00002;
+  var TRACK_HALF_SEP_M = 3.0;
+  var MAX_TUNNEL_V_MPS = 70/3.6;
+  var SLOW_R1 = 500,  V1 = 35/3.6;
+  var SLOW_R2 = 120,  V2 = 12/3.6;
+  var MAX_SECONDS = 240;
 
-  // Tiny, conservative portal polygons (plain arrays of {lat,lng})
-  const portalBritomart = [
+  var portalBritomart = [
     {lat:-36.84495,lng:174.76790},
     {lat:-36.84435,lng:174.76920},
     {lat:-36.84535,lng:174.76980},
     {lat:-36.84595,lng:174.76845}
   ];
-  const portalMaungawhau = [
+  var portalMaungawhau = [
     {lat:-36.87535,lng:174.75220},
     {lat:-36.87475,lng:174.75410},
     {lat:-36.87380,lng:174.75360},
     {lat:-36.87435,lng:174.75170}
   ];
 
-  // Approx CRL centerline (plain points)
-  const routeDownPts = [
-    {lat:-36.87490,lng:174.75350}, // Maungawhau portal
-    {lat:-36.86860,lng:174.75860}, // Karanga-a-Hape
-    {lat:-36.85100,lng:174.76300}, // Te Waihorotiu (Aotea)
-    {lat:-36.84520,lng:174.76830}  // Waitematā throat
+  var routeDownPts = [
+    {lat:-36.87490,lng:174.75350},
+    {lat:-36.86860,lng:174.75860},
+    {lat:-36.85100,lng:174.76300},
+    {lat:-36.84520,lng:174.76830}
   ];
-  const routeUpPts = routeDownPts.slice().reverse();
+  var routeUpPts = routeDownPts.slice().reverse();
 
-  const stationsDown = ["Maungawhau","Karanga-a-Hape","Te Waihorotiu","Waitematā"];
-  const stationsUp   = ["Waitematā","Te Waihorotiu","Karanga-a-Hape","Maungawhau"];
+  var stationsDown = ["Maungawhau","Karanga-a-Hape","Te Waihorotiu","Waitematā"];
+  var stationsUp   = ["Waitematā","Te Waihorotiu","Karanga-a-Hape","Maungawhau"];
 
-  // ---------- math helpers (no Leaflet needed) ----------
   function metersPerDegLng(lat){ return 111320 * Math.cos(lat*DEG2RAD); }
   function toMeters(a,b){
-    const mx = (b.lng - a.lng) * metersPerDegLng((a.lat+b.lat)/2);
-    const my = (b.lat - a.lat) * METERS_PER_DEG_LAT;
-    return Math.hypot(mx,my);
+    var mx = (b.lng - a.lng) * metersPerDegLng((a.lat+b.lat)/2);
+    var my = (b.lat - a.lat) * METERS_PER_DEG_LAT;
+    return Math.hypot ? Math.hypot(mx,my) : Math.sqrt(mx*mx + my*my);
   }
   function interp(a,b,t){ return { lat: a.lat + (b.lat-a.lat)*t, lng: a.lng + (b.lng-a.lng)*t }; }
   function projectOnSegment(p,a,b){
-    const mLng = metersPerDegLng((a.lat+b.lat)/2);
-    const vx = (b.lng - a.lng) * mLng;
-    const vy = (b.lat - a.lat) * METERS_PER_DEG_LAT;
-    const wx = (p.lng - a.lng) * metersPerDegLng((a.lat+p.lat)/2);
-    const wy = (p.lat - a.lat) * METERS_PER_DEG_LAT;
-    const denom = (vx*vx + vy*vy) || 1e-12;
-    let t = (vx*wx + vy*wy)/denom;
+    var mLng = metersPerDegLng((a.lat+b.lat)/2);
+    var vx = (b.lng - a.lng) * mLng;
+    var vy = (b.lat - a.lat) * METERS_PER_DEG_LAT;
+    var wx = (p.lng - a.lng) * metersPerDegLng((a.lat+p.lat)/2);
+    var wy = (p.lat - a.lat) * METERS_PER_DEG_LAT;
+    var denom = (vx*vx + vy*vy) || 1e-12;
+    var t = (vx*wx + vy*wy)/denom;
     if (t < 0) t = 0; else if (t > 1) t = 1;
-    return { t, point: interp(a,b,t) };
+    return { t: t, point: interp(a,b,t) };
   }
   function offsetLatLng(base, dirPt, offsetMeters){
-    const mLng = metersPerDegLng(base.lat);
-    const dx = (dirPt.lng - base.lng) * mLng;
-    const dy = (dirPt.lat - base.lat) * METERS_PER_DEG_LAT;
-    const len = Math.hypot(dx,dy) || 1e-9;
-    const nx = -dy/len, ny = dx/len; // left normal
+    var mLng = metersPerDegLng(base.lat);
+    var dx = (dirPt.lng - base.lng) * mLng;
+    var dy = (dirPt.lat - base.lat) * METERS_PER_DEG_LAT;
+    var len = Math.sqrt(dx*dx + dy*dy) || 1e-9;
+    var nx = -dy/len, ny = dx/len; // left normal
     return {
       lat: base.lat + (ny*offsetMeters)/METERS_PER_DEG_LAT,
       lng: base.lng + (nx*offsetMeters)/mLng
     };
   }
   function pointInPoly(p, poly){
-    const x = p.lng, y = p.lat;
-    let inside = false;
-    for (let i=0,j=poly.length-1;i<poly.length;j=i++){
-      const xi=poly[i].lng, yi=poly[i].lat;
-      const xj=poly[j].lng, yj=poly[j].lat;
-      const intersect = ((yi>y)!==(yj>y)) && (x < (xj - xi)*(y - yi)/(yj - yi + 1e-12) + xi);
+    var x = p.lng, y = p.lat, inside = false;
+    for (var i=0,j=poly.length-1;i<poly.length;j=i++){
+      var xi=poly[i].lng, yi=poly[i].lat;
+      var xj=poly[j].lng, yj=poly[j].lat;
+      var intersect = ((yi>y)!==(yj>y)) && (x < (xj - xi)*(y - yi)/(yj - yi + 1e-12) + xi);
       if(intersect) inside = !inside;
     }
     return inside;
   }
 
   function preprocessRoute(pts){
-    const segs = [];
-    const cum = [0];
-    for(let i=0;i<pts.length-1;i++){
-      const a=pts[i], b=pts[i+1];
-      const d = toMeters(a,b);
-      segs.push({a,b,d});
+    var segs = [], cum = [0];
+    for(var i=0;i<pts.length-1;i++){
+      var a=pts[i], b=pts[i+1];
+      var d = toMeters(a,b);
+      segs.push({a:a,b:b,d:d});
       cum.push(cum[cum.length-1]+d);
     }
-    return { pts, segs, cum, length: cum[cum.length-1] };
+    return { pts: pts, segs: segs, cum: cum, length: cum[cum.length-1] };
   }
-  const R_DOWN = preprocessRoute(routeDownPts);
-  const R_UP   = preprocessRoute(routeUpPts);
+  var R_DOWN = preprocessRoute(routeDownPts);
+  var R_UP   = preprocessRoute(routeUpPts);
 
   function nearestOnRoute(route, p){
-    let best = { s:0, ll:route.pts[0], idx:0, t:0, d:Infinity };
-    for(let i=0;i<route.segs.length;i++){
-      const {a,b,d} = route.segs[i];
-      const proj = projectOnSegment(p, a, b);
-      const ll = proj.point;
-      const dist = toMeters(p, ll);
+    var best = { s:0, ll:route.pts[0], idx:0, t:0, d:Infinity };
+    for(var i=0;i<route.segs.length;i++){
+      var seg = route.segs[i];
+      var proj = projectOnSegment(p, seg.a, seg.b);
+      var ll = proj.point;
+      var dist = toMeters(p, ll);
       if(dist < best.d){
-        best = { s: route.cum[i] + proj.t*d, ll, idx:i, t:proj.t, d:dist };
+        best = { s: route.cum[i] + proj.t*seg.d, ll: ll, idx: i, t: proj.t, d: dist };
       }
     }
     return best;
@@ -565,34 +559,38 @@ const CRLTunnelEstimator = (function(){
   function pointAtS(route, s){
     if(s <= 0) return route.pts[0];
     if(s >= route.length) return route.pts[route.pts.length-1];
-    let i = 0;
+    var i = 0;
     while(i < route.segs.length && s > route.cum[i+1]) i++;
-    const seg = route.segs[i];
-    const local = (s - route.cum[i]) / (seg.d || 1);
+    var seg = route.segs[i];
+    var local = (s - route.cum[i]) / (seg.d || 1);
     return interp(seg.a, seg.b, local);
   }
   function dirAtS(route, s){
     if(s <= 0) return route.segs[0].b;
     if(s >= route.length) return route.segs[route.segs.length-1].b;
-    let i = 0;
+    var i = 0;
     while(i < route.segs.length && s > route.cum[i+1]) i++;
-    const seg = route.segs[i];
-    const local = (s - route.cum[i]) / (seg.d || 1);
-    const eps = (local < 0.5) ? 1e-3 : -1e-3;
+    var seg = route.segs[i];
+    var local = (s - route.cum[i]) / (seg.d || 1);
+    var eps = (local < 0.5) ? 1e-3 : -1e-3;
     return interp(seg.a, seg.b, Math.min(1, Math.max(0, local+eps)));
   }
 
   function buildStationProfile(route, names){
-    const sList = route.cum;
-    return names.map((name, i) => ({ name, s: sList[i] || 0 }));
+    var sList = route.cum;
+    var out = [];
+    for (var i=0; i<names.length; i++){
+      out.push({ name: names[i], s: sList[i] || 0 });
+    }
+    return out;
   }
-  const PROF_DOWN = buildStationProfile(R_DOWN, stationsDown);
-  const PROF_UP   = buildStationProfile(R_UP,   stationsUp);
+  var PROF_DOWN = buildStationProfile(R_DOWN, stationsDown);
+  var PROF_UP   = buildStationProfile(R_UP,   stationsUp);
 
   function targetSpeedMps(route, s, profile){
-    let minDist = Infinity;
-    for(const st of profile){
-      const d = Math.abs(st.s - s);
+    var minDist = Infinity;
+    for(var i=0;i<profile.length;i++){
+      var d = Math.abs(profile[i].s - s);
       if(d < minDist) minDist = d;
     }
     if(minDist <= SLOW_R2) return V2;
@@ -600,10 +598,9 @@ const CRLTunnelEstimator = (function(){
     return MAX_TUNNEL_V_MPS;
   }
 
-  const ghosts = new Map(); // id -> { marker, route, profile, s, v, startedTs, lastTickTs, side }
+  var ghosts = new Map(); // id -> { marker, route, profile, s, v, startedTs, lastTickTs, side }
 
   function normalizeLL(ll){
-    // Accept Leaflet LatLng or plain object
     if (!ll) return null;
     if (typeof ll.lat === "number" && typeof ll.lng === "number") return {lat: ll.lat, lng: ll.lng};
     if (Array.isArray(ll) && ll.length>=2) return {lat: +ll[0], lng: +ll[1]};
@@ -612,13 +609,13 @@ const CRLTunnelEstimator = (function(){
 
   function isNearAnyPortal(ll){
     try{
-      const p = normalizeLL(ll);
+      var p = normalizeLL(ll);
       if(!p) return false;
       return pointInPoly(p, portalBritomart) || pointInPoly(p, portalMaungawhau);
-    }catch{ return false; }
+    }catch(e){ return false; }
   }
   function whichPortal(ll){
-    const p = normalizeLL(ll);
+    var p = normalizeLL(ll);
     if(!p) return null;
     if(pointInPoly(p, portalBritomart)) return "BRITOMART";
     if(pointInPoly(p, portalMaungawhau)) return "MAUNGAWHAU";
@@ -626,67 +623,66 @@ const CRLTunnelEstimator = (function(){
   }
 
   function adoptMarker(m){
-    const llLeaflet = m.getLatLng?.();
-    const ll = normalizeLL(llLeaflet);
-    const entry = whichPortal(ll);
+    var llLeaflet = m.getLatLng && m.getLatLng();
+    var ll = normalizeLL(llLeaflet);
+    var entry = whichPortal(ll);
     if(!entry) return;
 
-    const useDown = entry === "MAUNGAWHAU";
-    const route = useDown ? R_DOWN : R_UP;
-    const profile = useDown ? PROF_DOWN : PROF_UP;
+    var useDown = entry === "MAUNGAWHAU";
+    var route = useDown ? R_DOWN : R_UP;
+    var profile = useDown ? PROF_DOWN : PROF_UP;
 
-    // Initial speed from popup text if available; clamp
-    const speedKmh = Number((m.speedStr||"").split(" ")[0]);
-    let v = (isFinite(speedKmh) ? speedKmh/3.6 : 0);
+    var speedKmh = Number((m.speedStr||"").split(" ")[0]);
+    var v = (isFinite(speedKmh) ? speedKmh/3.6 : 0);
     if(!isFinite(v) || v < 1) v = 12/3.6;
     v = Math.min(v, MAX_TUNNEL_V_MPS);
 
-    const near = nearestOnRoute(route, ll);
-    let s = near.s;
+    var near = nearestOnRoute(route, ll);
+    var s = near.s;
 
-    // Side guess
-    let side = +1;
+    var side = +1;
     try{
-      const a = normalizeLL(m._prevLL) || ll;
-      const dy = (ll.lat - a.lat) * DEG2RAD;
-      const dx = (ll.lng - a.lng) * DEG2RAD * Math.cos((a.lat+ll.lat)*0.5*DEG2RAD);
-      const heading = Math.atan2(dx, dy);
+      var a = normalizeLL(m._prevLL) || ll;
+      var dy = (ll.lat - a.lat) * DEG2RAD;
+      var dx = (ll.lng - a.lng) * DEG2RAD * Math.cos((a.lat+ll.lat)*0.5*DEG2RAD);
+      var heading = Math.atan2(dx, dy);
       side = useDown ? (heading>=0 ? +1 : -1) : (heading>=0 ? -1 : +1);
-    }catch{
-      const num = parseInt((m.vehicleLabel||"").replace(/\D/g,"")||"0",10);
+    }catch(e){
+      var num = parseInt((m.vehicleLabel||"").replace(/\D/g,"")||"0",10);
       side = (num % 2 === 0) ? +1 : -1;
     }
 
-    // Light "ghost" styling (tolerate if not SVG)
     try{
-      m.setStyle?.({opacity:1, fillOpacity:0.55, weight:1});
-      if (window.L && L.DomUtil) L.DomUtil.addClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
-    }catch{}
+      m.setStyle && m.setStyle({opacity:1, fillOpacity:0.55, weight:1});
+      if (window.L && L.DomUtil) L.DomUtil.addClass(m._path || (m._renderer&&m._renderer._container) || m._container || m._path, "veh-ghost");
+    }catch(e){}
     m._isGhost = true;
 
     ghosts.set(m._leaflet_id || m, {
       marker: m,
-      route, profile,
-      s, v,
+      route: route,
+      profile: profile,
+      s: s,
+      v: v,
       startedTs: Date.now(),
       lastTickTs: Date.now(),
-      side
+      side: side
     });
   }
 
   function dropGhost(m){
     try{
-      if (window.L && L.DomUtil) L.DomUtil.removeClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
-    }catch{}
+      if (window.L && L.DomUtil) L.DomUtil.removeClass(m._path || (m._renderer&&m._renderer._container) || m._container || m._path, "veh-ghost");
+    }catch(e){}
     m._isGhost = false;
   }
 
   function tick(){
     if(!ghosts.size || !__enableTunnelEstimation) return;
-    const now = Date.now();
-    ghosts.forEach((g,key)=>{
-      const dt = Math.max(0, (now - g.lastTickTs)/1000);
-      const tTotal = (now - g.startedTs)/1000;
+    var now = Date.now();
+    ghosts.forEach(function(g,key){
+      var dt = Math.max(0, (now - g.lastTickTs)/1000);
+      var tTotal = (now - g.startedTs)/1000;
 
       if(tTotal > MAX_SECONDS){
         dropGhost(g.marker);
@@ -694,8 +690,8 @@ const CRLTunnelEstimator = (function(){
         return;
       }
 
-      const vT = targetSpeedMps(g.route, g.s, g.profile);
-      const ACC = 0.5, DEC = 0.7;
+      var vT = targetSpeedMps(g.route, g.s, g.profile);
+      var ACC = 0.5, DEC = 0.7;
       if(g.v < vT) g.v = Math.min(vT, g.v + ACC*dt);
       else         g.v = Math.max(vT, g.v - DEC*dt);
 
@@ -703,33 +699,33 @@ const CRLTunnelEstimator = (function(){
 
       if(g.s >= g.route.length){
         g.s = g.route.length;
-        const p = pointAtS(g.route, g.s);
-        const dir = dirAtS(g.route, g.s);
-        const trackPt = offsetLatLng(p, dir, g.side * TRACK_HALF_SEP_M);
-        try{ g.marker.setLatLng([trackPt.lat, trackPt.lng]); }catch{}
+        var pEnd = pointAtS(g.route, g.s);
+        var dirEnd = dirAtS(g.route, g.s);
+        var trackPtEnd = offsetLatLng(pEnd, dirEnd, g.side * TRACK_HALF_SEP_M);
+        try{ g.marker.setLatLng([trackPtEnd.lat, trackPtEnd.lng]); }catch(e){}
         dropGhost(g.marker);
         ghosts.delete(key);
         return;
       }
 
-      const p = pointAtS(g.route, g.s);
-      const dir = dirAtS(g.route, g.s);
-      const trackPt = offsetLatLng(p, dir, g.side * TRACK_HALF_SEP_M);
+      var p = pointAtS(g.route, g.s);
+      var dir = dirAtS(g.route, g.s);
+      var trackPt = offsetLatLng(p, dir, g.side * TRACK_HALF_SEP_M);
       try{
-        const jitterLat = (Math.random()-0.5)*JITTER;
-        const jitterLng = (Math.random()-0.5)*JITTER;
+        var jitterLat = (Math.random()-0.5)*JITTER;
+        var jitterLng = (Math.random()-0.5)*JITTER;
         g.marker.setLatLng([trackPt.lat + jitterLat, trackPt.lng + jitterLng]);
-      }catch{}
+      }catch(e){}
       g.lastTickTs = now;
     });
   }
 
-  setInterval(()=>{ tick(); }, 1000);
+  setInterval(function(){ tick(); }, 1000);
 
   function cleanupIfReappeared(){
-    ghosts.forEach((g,key)=>{
-      const m = g.marker;
-      if(m && m._lastTs && Date.now() - m._lastTs < MAX_POLL_MS + 2000){
+    ghosts.forEach(function(g,key){
+      var m = g.marker;
+      if(m && m._lastTs && Date.now() - m._lastTs < (typeof MAX_POLL_MS!=="undefined" ? MAX_POLL_MS : 27000) + 2000){
         dropGhost(m);
         ghosts.delete(key);
       }
@@ -737,12 +733,13 @@ const CRLTunnelEstimator = (function(){
   }
 
   return {
-    isNearAnyPortal,
-    adoptMarker,
-    cleanupIfReappeared
+    isNearAnyPortal: isNearAnyPortal,
+    adoptMarker: adoptMarker,
+    cleanupIfReappeared: cleanupIfReappeared
   };
 })();
-/* ---------------- End CRL Tunnel Estimator ---------------- */
+/* ---------------- Ends ---------------- */
+
 
 
 function renderFromCache(c){
@@ -991,4 +988,5 @@ async function init(){
   }, initialJitter);
 }
 init();
+
 
