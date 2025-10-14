@@ -36,7 +36,6 @@ map.on("click",()=>{
   clearRouteHighlights();
 });
 
-
 map.on("dragstart", ()=> { pinnedFollow=false; });
 map.on("popupclose", ()=> { pinnedFollow=false; });
 
@@ -44,10 +43,8 @@ const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"
 const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8"};
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 
-
 const MIN_POLL_MS=15000, MAX_POLL_MS=27000;
 function basePollDelay(){return MIN_POLL_MS+Math.floor(Math.random()*(MAX_POLL_MS-MIN_POLL_MS+1));}
-
 
 const BACKOFF_START_MS=15000, BACKOFF_MAX_MS=120000;
 const backoff = {
@@ -66,7 +63,6 @@ function applyRateLimitBackoff(retryAfterMs, who){
 
 let vehiclesAbort, vehiclesInFlight=false, pollTimeoutId=null, pageVisible=!document.hidden;
 let hidePauseTimerId=null; const HIDE_PAUSE_DELAY_MS=10000;
-
 
 function setDebug(msg){ if(debugBox) debugBox.textContent=msg; }
 function setLastUpdateTs(ts){
@@ -112,7 +108,10 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
 
   if(vehicleMarkers[id]){
     const m=vehicleMarkers[id];
+    // store last for heading calc
+    try{ m._prevLL = m.getLatLng(); }catch{}
     m.setLatLng([lat,lon]);
+    m._lastTs = Date.now();
     m.setPopupContent(popupContent);
     m.setStyle({fillColor:color});
     m.tripId=tripId;
@@ -121,6 +120,7 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
 
     Object.values(vehicleLayers).forEach(l=>l.removeLayer(m));
     (vehicleLayers[type]||vehicleLayers.out).addLayer(m);
+    m._isGhost = false; // if it reappeared, make sure ghost flag is off
   }else{
     const marker=L.circleMarker([lat,lon],{radius:baseRadius,fillColor:color,color:"#000",weight:1,opacity:1,fillOpacity:0.9});
     marker._baseRadius=baseRadius;
@@ -140,9 +140,21 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
     }
 
     marker.tripId=tripId;
+    marker._lastTs = Date.now();
     Object.assign(marker,fields);
     vehicleMarkers[id]=marker;
   }
+
+  // compute a crude heading (radians) for later dead-reckoning
+  try{
+    const m = vehicleMarkers[id];
+    if(m && m._prevLL){
+      const a = m._prevLL, b = m.getLatLng();
+      const dy = (b.lat - a.lat) * Math.PI/180;
+      const dx = (b.lng - a.lng) * Math.PI/180 * Math.cos((a.lat+b.lat)*Math.PI/360);
+      m._headingRad = Math.atan2(dx, dy); // map y=lat, x=lng
+    }
+  }catch{}
 }
 function updateVehicleCount(){
   const busCount=Object.values(vehicleMarkers).filter(m=>vehicleLayers.bus.hasLayer(m)).length;
@@ -153,7 +165,9 @@ function updateVehicleCount(){
 
 (function injectExtraStyle(){
   const style=document.createElement("style");
-  style.textContent=`.veh-highlight{stroke:#333;stroke-width:3;}`;
+  style.textContent=`.veh-highlight{stroke:#333;stroke-width:3;}
+  .veh-ghost{animation:pulse 2s ease-in-out infinite; opacity:0.6}
+  @keyframes pulse{0%{opacity:.35}50%{opacity:.8}100%{opacity:.35}}`;
   document.head.appendChild(style);
 })();
 
@@ -226,7 +240,7 @@ function resolveQueryToMarkers(raw){
   for(const [rk,set] of routeIndex.entries()){
     if(rk.startsWith(routeKey)){
       const list=[...set];
-      return {type:"route", markers:list, exemplar:list[0]||null};
+      return {type:"route", markers=list, exemplar:list[0]||null};
     }
   }
   return {type:"none"};
@@ -353,7 +367,7 @@ const SearchControl=L.Control.extend({
         }
       }
       for(const [rk,set] of routeIndex.entries()){
-        if(rk.startsWith(qNorm)){ routesList.push({rk,count:set.size}); if(routesList.length>=8) break; }
+        if(rk.startsWith(qNorm)){ routesList.push({rk,count=set.size}); if(routesList.length>=8) break; }
       }
 
       const html=[];
@@ -437,6 +451,306 @@ function pairAMTrains(inSvc,outOfService){
   });
   return pairs;
 }
+
+/* ---------------- CRL Tunnel Estimator (Britomart ↔ Maungawhau) ---------------- */
+let __enableTunnelEstimation = true;   // default ON
+function setTunnelEstimationEnabled(v){ __enableTunnelEstimation = !!v; setDebug(`Tunnel estimation ${__enableTunnelEstimation?"enabled":"disabled"}`); }
+window.setTunnelEstimationEnabled = setTunnelEstimationEnabled;
+
+const CRLTunnelEstimator = (function(){
+  // --- Helper math (small-area approximations are OK here) ---
+  const DEG2RAD = Math.PI/180;
+  const METERS_PER_DEG_LAT = 111320; // ~ constant
+  function metersPerDegLng(lat){ return 111320 * Math.cos(lat*DEG2RAD); }
+  function toMeters(a,b){
+    const mx = (b.lng - a.lng) * metersPerDegLng((a.lat+b.lat)/2);
+    const my = (b.lat - a.lat) * METERS_PER_DEG_LAT;
+    return Math.hypot(mx,my);
+  }
+  function interp(a,b,t){ return L.latLng(a.lat + (b.lat-a.lat)*t, a.lng + (b.lng-a.lng)*t); }
+  function projectOnSegment(p,a,b){
+    const vx = (b.lng - a.lng) * metersPerDegLng((a.lat+b.lat)/2);
+    const vy = (b.lat - a.lat) * METERS_PER_DEG_LAT;
+    const wx = (p.lng - a.lng) * metersPerDegLng((a.lat+p.lat)/2);
+    const wy = (p.lat - a.lat) * METERS_PER_DEG_LAT;
+    const denom = (vx*vx + vy*vy) || 1e-12;
+    let t = (vx*wx + vy*wy)/denom;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    return { t, point: interp(a,b,t) };
+  }
+  function offsetLatLng(base, dirLatLng, offsetMeters){
+    // dirLatLng is the next point along the route; create a normal (left) and shift by offset
+    const lat = base.lat, lng = base.lng;
+    const dx = (dirLatLng.lng - base.lng) * metersPerDegLng(lat);
+    const dy = (dirLatLng.lat - base.lat) * METERS_PER_DEG_LAT;
+    const len = Math.hypot(dx,dy) || 1e-9;
+    // left-normal (−dy, +dx)
+    const nx = -dy/len, ny = dx/len;
+    const dLng = (nx * offsetMeters) / metersPerDegLng(lat);
+    const dLat = (ny * offsetMeters) / METERS_PER_DEG_LAT;
+    return L.latLng(lat + dLat, lng + dLng);
+  }
+
+  // --- Portals (rough polygons). Keep tiny and conservative to avoid false positives. ---
+  const portalBritomart = L.polygon([
+    [-36.84495,174.76790],
+    [-36.84435,174.76920],
+    [-36.84535,174.76980],
+    [-36.84595,174.76845]
+  ]).getLatLngs()[0];
+
+  const portalMaungawhau = L.polygon([
+    [-36.87535,174.75220],
+    [-36.87475,174.75410],
+    [-36.87380,174.75360],
+    [-36.87435,174.75170]
+  ]).getLatLngs()[0];
+
+  function pointInPoly(latlng, poly){
+    const x = latlng.lng, y = latlng.lat;
+    let inside = false;
+    for (let i=0,j=poly.length-1;i<poly.length;j=i++){
+      const xi=poly[i].lng, yi=poly[i].lat;
+      const xj=poly[j].lng, yj=poly[j].lat;
+      const intersect = ((yi>y)!==(yj>y)) && (x < (xj - xi)*(y - yi)/(yj - yi + 1e-12) + xi);
+      if(intersect) inside = !inside;
+    }
+    return inside;
+  }
+  function isNearAnyPortal(ll){
+    try{
+      const p = L.latLng(ll);
+      return pointInPoly(p, portalBritomart) || pointInPoly(p, portalMaungawhau);
+    }catch{ return false; }
+  }
+  function whichPortal(ll){
+    const p = L.latLng(ll);
+    if(pointInPoly(p, portalBritomart)) return "BRITOMART";
+    if(pointInPoly(p, portalMaungawhau)) return "MAUNGAWHAU";
+    return null;
+  }
+
+  // --- CRL route centerline (approx) from Maungawhau → Karanga-a-Hape → Te Waihorotiu → Waitematā ---
+  // NOTE: These are light approximations; refine if you have surveyed polylines.
+  const routeDown = [ // "Down": Maungawhau -> City
+    L.latLng(-36.87490,174.75350), // Maungawhau portal area
+    L.latLng(-36.86860,174.75860), // Karanga-a-Hape (K Rd) area
+    L.latLng(-36.85100,174.76300), // Te Waihorotiu (Aotea) area
+    L.latLng(-36.84520,174.76830)  // Waitematā (Britomart) throat
+  ];
+  const routeUp = [...routeDown].slice().reverse(); // "Up": City -> Maungawhau
+
+  // Stations along each direction: cumulative s (meters) computed after preprocessing.
+  const stationsDown = ["Maungawhau","Karanga-a-Hape","Te Waihorotiu","Waitematā"];
+  const stationsUp   = ["Waitematā","Te Waihorotiu","Karanga-a-Hape","Maungawhau"];
+
+  function preprocessRoute(pts){
+    const segs = [];
+    const cum = [0];
+    for(let i=0;i<pts.length-1;i++){
+      const a=pts[i], b=pts[i+1];
+      const d = toMeters(a,b);
+      segs.push({a,b,d});
+      cum.push(cum[cum.length-1]+d);
+    }
+    return { pts, segs, cum, length: cum[cum.length-1] };
+  }
+  const R_DOWN = preprocessRoute(routeDown);
+  const R_UP   = preprocessRoute(routeUp);
+
+  function nearestOnRoute(route, p){
+    let best = { s:0, ll:route.pts[0], idx:0, t:0, d:Infinity };
+    for(let i=0;i<route.segs.length;i++){
+      const {a,b,d} = route.segs[i];
+      const proj = projectOnSegment(p, a, b);
+      const ll = proj.point;
+      const dist = toMeters(p, ll);
+      if(dist < best.d){
+        best = { s: route.cum[i] + proj.t*d, ll, idx:i, t:proj.t, d:dist };
+      }
+    }
+    return best; // s = cumulative meters along route
+  }
+  function pointAtS(route, s){
+    if(s <= 0) return route.pts[0];
+    if(s >= route.length) return route.pts[route.pts.length-1];
+    // locate segment
+    let i = 0;
+    while(i < route.segs.length && s > route.cum[i+1]) i++;
+    const seg = route.segs[i];
+    const local = (s - route.cum[i]) / seg.d;
+    return interp(seg.a, seg.b, local);
+  }
+  function dirAtS(route, s){
+    if(s <= 0) return route.segs[0].b;
+    if(s >= route.length) return route.segs[route.segs.length-1].b;
+    let i = 0;
+    while(i < route.segs.length && s > route.cum[i+1]) i++;
+    const seg = route.segs[i];
+    const local = (s - route.cum[i]) / (seg.d || 1);
+    const eps = (local < 0.5) ? 1e-3 : -1e-3; // bias towards segment direction
+    return interp(seg.a, seg.b, Math.min(1, Math.max(0, local+eps)));
+  }
+
+  // track spacing & speeds
+  const TRACK_HALF_SEP_M = 3.0;         // ~6 m between centerlines
+  const MAX_TUNNEL_V_MPS = 70/3.6;      // 70 km/h max
+  const JITTER = 0.00002;
+
+  // Slow zones near stations (radius meters → target speed m/s)
+  const SLOW_R1 = 500,  V1 = 35/3.6;   // ~35 km/h within 500 m
+  const SLOW_R2 = 120,  V2 = 12/3.6;   // ~12 km/h within 120 m
+
+  function buildStationProfile(route, names){
+    const sList = route.cum; // vertices cumulative
+    return names.map((name, i) => ({ name, s: sList[i] || 0 }));
+  }
+  const PROF_DOWN = buildStationProfile(R_DOWN, stationsDown);
+  const PROF_UP   = buildStationProfile(R_UP,   stationsUp);
+
+  function targetSpeedMps(route, s, profile){
+    let minDist = Infinity;
+    for(const st of profile){
+      const d = Math.abs(st.s - s);
+      if(d < minDist) minDist = d;
+    }
+    if(minDist <= SLOW_R2) return V2;
+    if(minDist <= SLOW_R1) return V1;
+    return MAX_TUNNEL_V_MPS;
+  }
+
+  const ghosts = new Map(); // id -> { marker, route, profile, s, v, startedTs, lastTickTs, side }
+
+  function adoptMarker(m){
+    const now = Date.now();
+    const ll = m.getLatLng();
+    const entry = whichPortal(ll);
+    if(!entry) return;
+
+    // Pick direction/route
+    const useDown = entry === "MAUNGAWHAU";
+    const route = useDown ? R_DOWN : R_UP;
+    const profile = useDown ? PROF_DOWN : PROF_UP;
+
+    // Initial speed try parse from speedStr; clamp to tunnel max
+    const speedKmh = Number((m.speedStr||"").split(" ")[0]);
+    let v = (isFinite(speedKmh) ? speedKmh/3.6 : 0);
+    if(!isFinite(v) || v < 1) v = 12/3.6; // default crawl if unknown
+    v = Math.min(v, MAX_TUNNEL_V_MPS);
+
+    // Project onto route to get starting s
+    const near = nearestOnRoute(route, ll);
+    let s = near.s;
+
+    // Side selection: use heading sign; fallback to even/odd fleet label
+    let side = +1; // +1 = left of centerline, -1 = right
+    try{
+      const a = m._prevLL || ll;
+      const dy = (ll.lat - a.lat) * Math.PI/180;
+      const dx = (ll.lng - a.lng) * Math.PI/180 * Math.cos((a.lat+ll.lat)*Math.PI/360);
+      const heading = Math.atan2(dx, dy);
+      side = useDown ? (heading>=0 ? +1 : -1) : (heading>=0 ? -1 : +1);
+    }catch{
+      const num = parseInt((m.vehicleLabel||"").replace(/\D/g,"")||"0",10);
+      side = (num % 2 === 0) ? +1 : -1;
+    }
+
+    // Ghost styling
+    try{
+      m.setStyle({opacity:1, fillOpacity:0.55, weight:1});
+      L.DomUtil.addClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
+    }catch{}
+    m._isGhost = true;
+
+    ghosts.set(m._leaflet_id || m, {
+      marker: m,
+      route, profile,
+      s, v,
+      startedTs: now,
+      lastTickTs: now,
+      side
+    });
+  }
+
+  function dropGhost(m){
+    try{
+      L.DomUtil.removeClass(m._path || m._renderer?._container || m._container || m._path, "veh-ghost");
+    }catch{}
+    m._isGhost = false;
+  }
+
+  const MAX_SECONDS = 240; // allow up to 4 min across full alignment
+
+  function tick(){
+    if(!ghosts.size || !__enableTunnelEstimation) return;
+    const now = Date.now();
+    ghosts.forEach((g,key)=>{
+      const dt = Math.max(0, (now - g.lastTickTs)/1000);
+      const tTotal = (now - g.startedTs)/1000;
+
+      // exit conditions
+      if(tTotal > MAX_SECONDS){
+        dropGhost(g.marker);
+        ghosts.delete(key);
+        return;
+      }
+
+      // Target speed profile along the route
+      const vT = targetSpeedMps(g.route, g.s, g.profile);
+
+      // Simple accel/decel model toward vT
+      const ACC = 0.5;     // m/s²
+      const DEC = 0.7;     // m/s²
+      if(g.v < vT) g.v = Math.min(vT, g.v + ACC*dt);
+      else         g.v = Math.max(vT, g.v - DEC*dt);
+
+      // advance along route
+      g.s += Math.max(0, g.v * dt);
+
+      // clamp & finish when we hit the end
+      if(g.s >= g.route.length){
+        g.s = g.route.length;
+        const p = pointAtS(g.route, g.s);
+        const dir = dirAtS(g.route, g.s);
+        const trackPt = offsetLatLng(p, dir, g.side * TRACK_HALF_SEP_M);
+        try{ g.marker.setLatLng(trackPt); }catch{}
+        dropGhost(g.marker);
+        ghosts.delete(key);
+        return;
+      }
+
+      // render along route with lateral track offset
+      const p = pointAtS(g.route, g.s);
+      const dir = dirAtS(g.route, g.s);
+      const trackPt = offsetLatLng(p, dir, g.side * TRACK_HALF_SEP_M);
+      try{
+        const jitterLat = (Math.random()-0.5)*JITTER;
+        const jitterLng = (Math.random()-0.5)*JITTER;
+        g.marker.setLatLng([trackPt.lat + jitterLat, trackPt.lng + jitterLng]);
+      }catch{}
+      g.lastTickTs = now;
+    });
+  }
+
+  setInterval(()=>{ tick(); }, 1000);
+
+  function cleanupIfReappeared(){
+    ghosts.forEach((g,key)=>{
+      const m = g.marker;
+      if(m && m._lastTs && Date.now() - m._lastTs < MAX_POLL_MS + 2000){
+        dropGhost(m);
+        ghosts.delete(key);
+      }
+    });
+  }
+
+  return {
+    isNearAnyPortal,
+    adoptMarker,
+    cleanupIfReappeared
+  };
+})();
+/* ---------------- End CRL Tunnel Estimator ---------------- */
 
 function renderFromCache(c){
   if(!c) return;
@@ -572,12 +886,35 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     pairAMTrains(inServiceAM,outOfServiceAM);
 
+    // --- modified cleanup: adopt trains near either CRL portal instead of removing ---
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
-        if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
-        map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id];
+        const m = vehicleMarkers[id];
+        if(
+          __enableTunnelEstimation &&
+          m &&
+          m.currentType === "train" &&
+          CRLTunnelEstimator.isNearAnyPortal(m.getLatLng())
+        ){
+          CRLTunnelEstimator.adoptMarker(m);
+          // keep marker; estimator will animate it along tunnels
+        }else if(
+          __enableTunnelEstimation &&
+          m &&
+          m.currentType === "out" &&
+          CRLTunnelEstimator.isNearAnyPortal(m.getLatLng())
+        ){
+          // treat out-of-service trains the same when they vanish at portals
+          CRLTunnelEstimator.adoptMarker(m);
+        }else{
+          if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
+          map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id];
+        }
       }
     });
+
+    // tidy up any ghosts whose trains reappeared
+    CRLTunnelEstimator.cleanupIfReappeared();
 
     if (pinnedPopup && pinnedFollow) {
       try {
