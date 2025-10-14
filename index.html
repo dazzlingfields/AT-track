@@ -94,6 +94,20 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
   accent-color: var(--accent);
 }
 
+/* NEW: Tunnel toggle layout reuses filter styles */
+#tunnel-toggle { display: grid; gap: 8px; }
+#tunnel-toggle label {
+  display: grid; grid-template-columns: 18px 1fr; align-items: center; column-gap: 10px;
+  font-size: 14px; color: var(--text-strong); cursor: pointer; user-select: none;
+  padding: 6px 8px; border-radius: var(--r-md);
+  transition: background-color 120ms ease;
+}
+#tunnel-toggle label:hover { background: var(--accent-weak); }
+#tunnel-toggle input[type="checkbox"]{
+  width: 16px; height: 16px; margin: 0;
+  accent-color: var(--accent);
+}
+
 #debug, #vehicle-count {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px; color: var(--text-subtle); line-height: 1.35;
@@ -336,6 +350,15 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
         <label><input type="checkbox" data-layer="out" checked> Out of Service</label>
       </div>
     </div>
+
+    <div class="control-group" id="tunnel-toggle">
+      <h4>Train Tunnel Estimation</h4>
+      <label>
+        <input type="checkbox" id="toggle-tunnel" checked>
+        Enable Britomart tunnel estimation
+      </label>
+    </div>
+
     <div id="debug">Realtime status...</div>
     <div id="vehicle-count">Vehicles: 0 | Last refresh: N/A</div>
   </div>
@@ -346,9 +369,6 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
   <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
   <script src="script.js"></script>
+
 </body>
 </html>
-
-
-
-
