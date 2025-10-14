@@ -240,7 +240,7 @@ function resolveQueryToMarkers(raw){
   for(const [rk,set] of routeIndex.entries()){
     if(rk.startsWith(routeKey)){
       const list=[...set];
-      return {type:"route", markers=list, exemplar:list[0]||null};
+      return {type:"route", markers:list, exemplar:list[0]||null};
     }
   }
   return {type:"none"};
@@ -851,13 +851,30 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
       const popup=buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine);
 
-      if(vehicleLabel.startsWith("AM")){
-        if(typeKey==="train") inServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel,color});
-        else outOfServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel});
+      // ---- FIX 1: explicit object for AM train buckets ----
+      if (vehicleLabel.startsWith("AM")) {
+        if (typeKey === "train") {
+          inServiceAM.push({
+            vehicleId: vehicleId,
+            lat: lat,
+            lon: lon,
+            speedKmh: speedKmh,
+            vehicleLabel: vehicleLabel,
+            color: color
+          });
+        } else {
+          outOfServiceAM.push({
+            vehicleId: vehicleId,
+            lat: lat,
+            lon: lon,
+            speedKmh: speedKmh,
+            vehicleLabel: vehicleLabel
+          });
+        }
       }
 
       addOrUpdateMarker(vehicleId,lat,lon,popup,color,typeKey,tripId,{
-        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,occupancy,bikesLine
+        currentType:typeKey,vehicleLabel:vehicleLabel,licensePlate:licensePlate,busType:busType,speedStr:speedStr,occupancy:occupancy,bikesLine:bikesLine
       });
 
       if(vehicleLabel){
@@ -871,7 +888,23 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         routeIndex.get(rk).add(vehicleMarkers[vehicleId]);
       }
 
-      cachedState.push({vehicleId,lat,lon,popupContent:popup,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,occupancy,bikesLine});
+      // ---- FIX 2: explicit object for cachedState.push ----
+      cachedState.push({
+        vehicleId: vehicleId,
+        lat: lat,
+        lon: lon,
+        popupContent: popup,
+        color: color,
+        typeKey: typeKey,
+        tripId: tripId,
+        ts: Date.now(),
+        vehicleLabel: vehicleLabel,
+        licensePlate: licensePlate,
+        busType: busType,
+        speedStr: speedStr,
+        occupancy: occupancy,
+        bikesLine: bikesLine
+      });
     });
 
     pairAMTrains(inServiceAM,outOfServiceAM);
@@ -988,5 +1021,3 @@ async function init(){
   }, initialJitter);
 }
 init();
-
-
