@@ -620,36 +620,8 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     pairAMTrains(inServiceAM,outOfServiceAM);
 
-    // --- modified cleanup: adopt trains near either CRL portal instead of removing ---
-    Object.keys(vehicleMarkers).forEach(id=>{
-      if(!newIds.has(id)){
-        const m = vehicleMarkers[id];
-        if(
-          __enableTunnelEstimation &&
-          m &&
-          m.currentType === "train" &&
-          CRLTunnelEstimator.isNearAnyPortal(m.getLatLng())
-        ){
-          CRLTunnelEstimator.adoptMarker(m);
-          // keep marker; estimator will animate it along tunnels
-        }else if(
-          __enableTunnelEstimation &&
-          m &&
-          m.currentType === "out" &&
-          CRLTunnelEstimator.isNearAnyPortal(m.getLatLng())
-        ){
-          // treat out-of-service trains the same when they vanish at portals
-          CRLTunnelEstimator.adoptMarker(m);
-        }else{
-          if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
-          map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id];
-        }
-      }
-    });
 
-    // tidy up any ghosts whose trains reappeared
-    CRLTunnelEstimator.cleanupIfReappeared();
-
+   
     if (pinnedPopup && pinnedFollow) {
       try {
         const ll = pinnedPopup.getLatLng();
@@ -732,5 +704,6 @@ async function init(){
   }, initialJitter);
 }
 init();
+
 
 
