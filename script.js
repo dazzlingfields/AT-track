@@ -36,6 +36,7 @@ map.on("click",()=>{
   clearRouteHighlights();
 });
 
+
 map.on("dragstart", ()=> { pinnedFollow=false; });
 map.on("popupclose", ()=> { pinnedFollow=false; });
 
@@ -43,8 +44,10 @@ const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"
 const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8"};
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 
+
 const MIN_POLL_MS=15000, MAX_POLL_MS=27000;
 function basePollDelay(){return MIN_POLL_MS+Math.floor(Math.random()*(MAX_POLL_MS-MIN_POLL_MS+1));}
+
 
 const BACKOFF_START_MS=15000, BACKOFF_MAX_MS=120000;
 const backoff = {
@@ -63,6 +66,7 @@ function applyRateLimitBackoff(retryAfterMs, who){
 
 let vehiclesAbort, vehiclesInFlight=false, pollTimeoutId=null, pageVisible=!document.hidden;
 let hidePauseTimerId=null; const HIDE_PAUSE_DELAY_MS=10000;
+
 
 function setDebug(msg){ if(debugBox) debugBox.textContent=msg; }
 function setLastUpdateTs(ts){
@@ -108,10 +112,7 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
 
   if(vehicleMarkers[id]){
     const m=vehicleMarkers[id];
-    // store last for heading calc
-    try{ m._prevLL = m.getLatLng(); }catch{}
     m.setLatLng([lat,lon]);
-    m._lastTs = Date.now();
     m.setPopupContent(popupContent);
     m.setStyle({fillColor:color});
     m.tripId=tripId;
@@ -120,7 +121,6 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
 
     Object.values(vehicleLayers).forEach(l=>l.removeLayer(m));
     (vehicleLayers[type]||vehicleLayers.out).addLayer(m);
-    m._isGhost = false; // if it reappeared, make sure ghost flag is off
   }else{
     const marker=L.circleMarker([lat,lon],{radius:baseRadius,fillColor:color,color:"#000",weight:1,opacity:1,fillOpacity:0.9});
     marker._baseRadius=baseRadius;
@@ -140,21 +140,9 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
     }
 
     marker.tripId=tripId;
-    marker._lastTs = Date.now();
     Object.assign(marker,fields);
     vehicleMarkers[id]=marker;
   }
-
-  // compute a crude heading (radians) for later dead-reckoning
-  try{
-    const m = vehicleMarkers[id];
-    if(m && m._prevLL){
-      const a = m._prevLL, b = m.getLatLng();
-      const dy = (b.lat - a.lat) * Math.PI/180;
-      const dx = (b.lng - a.lng) * Math.PI/180 * Math.cos((a.lat+b.lat)*Math.PI/360);
-      m._headingRad = Math.atan2(dx, dy); // map y=lat, x=lng
-    }
-  }catch{}
 }
 function updateVehicleCount(){
   const busCount=Object.values(vehicleMarkers).filter(m=>vehicleLayers.bus.hasLayer(m)).length;
@@ -165,9 +153,7 @@ function updateVehicleCount(){
 
 (function injectExtraStyle(){
   const style=document.createElement("style");
-  style.textContent=`.veh-highlight{stroke:#333;stroke-width:3;}
-  .veh-ghost{animation:pulse 2s ease-in-out infinite; opacity:0.6}
-  @keyframes pulse{0%{opacity:.35}50%{opacity:.8}100%{opacity:.35}}`;
+  style.textContent=`.veh-highlight{stroke:#333;stroke-width:3;}`;
   document.head.appendChild(style);
 })();
 
@@ -367,8 +353,7 @@ const SearchControl=L.Control.extend({
         }
       }
       for(const [rk,set] of routeIndex.entries()){
-     if (rk.startsWith(qNorm)) { routesList.push({ rk: rk, count: set.size }); if (routesList.length>=8) break; }
-
+        if(rk.startsWith(qNorm)){ routesList.push({rk,count:set.size}); if(routesList.length>=8) break; }
       }
 
       const html=[];
@@ -562,30 +547,13 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
       const popup=buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine);
 
-      // ---- FIX 1: explicit object for AM train buckets ----
-      if (vehicleLabel.startsWith("AM")) {
-        if (typeKey === "train") {
-          inServiceAM.push({
-            vehicleId: vehicleId,
-            lat: lat,
-            lon: lon,
-            speedKmh: speedKmh,
-            vehicleLabel: vehicleLabel,
-            color: color
-          });
-        } else {
-          outOfServiceAM.push({
-            vehicleId: vehicleId,
-            lat: lat,
-            lon: lon,
-            speedKmh: speedKmh,
-            vehicleLabel: vehicleLabel
-          });
-        }
+      if(vehicleLabel.startsWith("AM")){
+        if(typeKey==="train") inServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel,color});
+        else outOfServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel});
       }
 
       addOrUpdateMarker(vehicleId,lat,lon,popup,color,typeKey,tripId,{
-        currentType:typeKey,vehicleLabel:vehicleLabel,licensePlate:licensePlate,busType:busType,speedStr:speedStr,occupancy:occupancy,bikesLine:bikesLine
+        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,occupancy,bikesLine
       });
 
       if(vehicleLabel){
@@ -599,29 +567,18 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         routeIndex.get(rk).add(vehicleMarkers[vehicleId]);
       }
 
-      // ---- FIX 2: explicit object for cachedState.push ----
-      cachedState.push({
-        vehicleId: vehicleId,
-        lat: lat,
-        lon: lon,
-        popupContent: popup,
-        color: color,
-        typeKey: typeKey,
-        tripId: tripId,
-        ts: Date.now(),
-        vehicleLabel: vehicleLabel,
-        licensePlate: licensePlate,
-        busType: busType,
-        speedStr: speedStr,
-        occupancy: occupancy,
-        bikesLine: bikesLine
-      });
+      cachedState.push({vehicleId,lat,lon,popupContent:popup,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,occupancy,bikesLine});
     });
 
     pairAMTrains(inServiceAM,outOfServiceAM);
 
+    Object.keys(vehicleMarkers).forEach(id=>{
+      if(!newIds.has(id)){
+        if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
+        map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id];
+      }
+    });
 
-   
     if (pinnedPopup && pinnedFollow) {
       try {
         const ll = pinnedPopup.getLatLng();
@@ -704,6 +661,3 @@ async function init(){
   }, initialJitter);
 }
 init();
-
-
-
