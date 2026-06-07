@@ -4,6 +4,7 @@ const realtimeUrl  = `${proxyBaseUrl}/api/realtime`;
 const routesUrl    = `${proxyBaseUrl}/api/routes`;
 const tripsUrl     = `${proxyBaseUrl}/api/trips`;
 const shapesUrl    = `${proxyBaseUrl}/api/shapes`;
+const tripUpdatesUrl = `${proxyBaseUrl}/api/tripupdates`; // fallback only; see fetchVehicles
 const busTypesUrl  = "busTypes.json";
 
 const light = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",{attribution:"© OpenStreetMap contributors © CARTO",subdomains:"abcd",maxZoom:20});
@@ -57,6 +58,7 @@ const backoff = {
   routes:   { ms:0, until:0 },
   trips:    { ms:0, until:0 },
   shapes:   { ms:0, until:0 },
+  tripupdates: { ms:0, until:0 },
 };
 function applyRateLimitBackoff(retryAfterMs, who){
   const b = backoff[who] || backoff.realtime;
@@ -145,18 +147,77 @@ function buildExtraLines(ex){
   return lines.length?("<br>"+lines.join("<br>")):"";
 }
 
-function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine,extraLines){
+function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,scheduleLine,occupancy,bikesLine,extraLines){
   return `<div style="font-size:0.9em;line-height:1.3;">
       <b>Route:</b> ${routeName}<br>
       <b>Destination:</b> ${destination}<br>
       <b>Vehicle:</b> ${vehicleLabel}<br>
       ${busType?`<b>Bus model:</b> ${busType}<br>`:""}
       <b>Number plate:</b> ${licensePlate}<br>
-      <b>Speed:</b> ${speedStr}<br>
+      <b>Speed:</b> ${speedStr}${scheduleLine||""}<br>
       <b>Occupancy:</b> ${occupancy}
       ${bikesLine||""}
       ${extraLines||""}
     </div>`;
+}
+
+// ---- Schedule adherence (late / early) from GTFS-RT trip updates --------------------
+// Delay lives in trip_update entities, not in vehicle positions. AT's legacy feed is a
+// combined feed, so these usually arrive in the SAME response we already fetch (no extra
+// calls). buildDelayMap indexes them by trip_id; delayForTrip picks the most relevant
+// stop's delay; formatDelay renders a coloured "X late / early / On time" line.
+function buildDelayMap(entities){
+  const map=new Map();
+  for(const e of (entities||[])){
+    const tu=e.trip_update||e.tripUpdate; if(!tu) continue;
+    const tid=tu.trip?.trip_id ?? tu.trip?.tripId;
+    if(tid) map.set(tid, tu);
+  }
+  return map;
+}
+function delayForTrip(tu, currentStopSeq){
+  if(!tu) return null;
+  const stus=tu.stop_time_update||tu.stopTimeUpdate||[];
+  let chosen=null;
+  if(currentStopSeq!=null && stus.length){
+    let best=null;
+    for(const s of stus){
+      const seq=toNum(s.stop_sequence ?? s.stopSequence); if(seq==null) continue;
+      if(seq>=currentStopSeq && (best==null || seq<best.seq)) best={seq,s};
+    }
+    chosen=best?.s || null;
+  }
+  if(!chosen && stus.length) chosen=stus[stus.length-1];
+  let delay=null;
+  if(chosen){
+    const arr=chosen.arrival, dep=chosen.departure;
+    delay = toNum(arr?.delay); if(delay==null) delay=toNum(dep?.delay);
+  }
+  if(delay==null) delay=toNum(tu.delay); // some feeds carry a trip-level delay
+  return delay;
+}
+function formatDelay(sec){
+  if(sec==null) return "";
+  const a=Math.abs(Math.round(sec));
+  if(a<=30) return "On time";
+  const m=Math.floor(a/60), s=a%60;
+  const t = a<60 ? `${a}s` : (s?`${m}m ${s}s`:`${m}m`);
+  return sec>0 ? `${t} late` : `${t} early`;
+}
+function scheduleLineHtml(sec){
+  if(sec==null) return "";
+  const txt=formatDelay(sec);
+  const col = txt==="On time" ? "#1a8f3c" : (sec>0 ? "#d0021b" : "#0a84ff");
+  return `<br><b>Schedule:</b> <span style="color:${col}">${txt}</span>`;
+}
+
+// Fallback path: only used if the combined realtime feed carries no trip updates.
+let useSeparateTripUpdates=false;
+async function fetchTripUpdatesDelays(){
+  const json=await safeFetch(tripUpdatesUrl);
+  if(!json || json._rateLimited){ if(json&&json._rateLimited) applyRateLimitBackoff(json.retryAfterMs,"tripupdates"); return null; }
+  const ents=json?.response?.entity||json?.entity||[];
+  return buildDelayMap(ents);
 }
 
 // ===================== Motion / speed estimation + dead reckoning ====================
@@ -407,11 +468,12 @@ function drawRouteOutline(shapeId,color){
 async function showRouteOutlineFor(marker){
   if(!marker || marker.currentType==="out" || !marker.tripId){ clearRouteOutline(); return; }
   const sid=tripCache[marker.tripId]?.shape_id;
-  if(!sid){ clearRouteOutline(); return; }
+  if(!sid){ clearRouteOutline(); console.warn("[shapes] no shape_id for trip", marker.tripId); setDebug("No shape_id for this trip (check /api/trips passes shape_id)"); return; }
   if(routeOutline && routeOutline.shapeId===sid) return; // already shown
   if(!shapeCache.has(sid)) await fetchShapes([sid]);
   if(pinnedPopup!==marker) return;                       // selection changed while fetching
-  if(!shapeCache.get(sid)){ clearRouteOutline(); return; }
+  const shape=shapeCache.get(sid);
+  if(!shape){ clearRouteOutline(); console.warn("[shapes] empty/failed shape", sid, "- check /api/shapes?ids="+sid); setDebug("Route shape unavailable (open /api/shapes?ids="+sid+" to see _diag)"); return; }
   drawRouteOutline(sid, marker.options?.fillColor || vehicleColors.bus);
 }
 
@@ -757,7 +819,7 @@ async function fetchTripsBatch(tripIds){
         Object.values(vehicleMarkers).forEach(m=>{
           if(m.tripId===tid){
             const r=routes[trip.route_id]||{};
-            const base=buildPopup(r.route_short_name||r.route_long_name||"Unknown",trip.trip_headsign||r.route_long_name||"Unknown",m.vehicleLabel||"N/A",m.busType||"",m.licensePlate||"N/A",m.speedStr||"",m.occupancy||"",m.bikesLine||"");
+            const base=buildPopup(r.route_short_name||r.route_long_name||"Unknown",trip.trip_headsign||r.route_long_name||"Unknown",m.vehicleLabel||"N/A",m.busType||"",m.licensePlate||"N/A",m.speedStr||"",m.scheduleLine||"",m.occupancy||"",m.bikesLine||"");
             const pair=m.pairedTo?`<br><b>Paired to:</b> ${m.pairedTo} (6-car)`:``;
             m.setPopupContent(base+pair);
           }
@@ -790,7 +852,7 @@ function pairAMTrains(inSvc,outOfService){
 function renderFromCache(c){
   if(!c) return;
   c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.popupContent,v.color,v.typeKey,v.tripId,{
-    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||""
+    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||""
   }));
   const ts = c[0]?.ts || Date.now();
   setDebug(`Showing cached data (last update: ${new Date(ts).toLocaleTimeString()})`);
@@ -829,6 +891,16 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     const vehicles=json?.response?.entity||json?.entity||[];
     const newIds=new Set(), inServiceAM=[], outOfServiceAM=[], allTripIds=[], cachedState=[];
     vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear();
+
+    // Schedule adherence: prefer trip_update entities already in the combined feed (free).
+    // If the feed carries vehicles but no trip updates, fall back to the dedicated feed.
+    let delayMap=buildDelayMap(vehicles);
+    const hasVehicles=vehicles.some(e=>e.vehicle);
+    if(delayMap.size===0 && hasVehicles) useSeparateTripUpdates=true;
+    if(useSeparateTripUpdates){
+      const sep=await fetchTripUpdatesDelays();
+      if(sep && sep.size) delayMap=sep;
+    }
 
     vehicles.forEach(v=>{
       const vehicleId=v.vehicle?.vehicle?.id; if(!v.vehicle||!v.vehicle.position||!vehicleId) return; newIds.add(vehicleId);
@@ -949,7 +1021,12 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         if (model) busType = model;
       }
 
-      const popup=buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,occupancy,bikesLine,extraLines);
+      // Schedule adherence for in-service vehicles (uses the current stop sequence to
+      // pick the most relevant delay from the trip update).
+      const delaySec=(typeKey!=="out" && tripId) ? delayForTrip(delayMap.get(tripId), stopSeq) : null;
+      const scheduleLine=scheduleLineHtml(delaySec);
+
+      const popup=buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,scheduleLine,occupancy,bikesLine,extraLines);
 
       if(vehicleLabel.startsWith("AM")){
         if(typeKey==="train") inServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel,color});
@@ -957,7 +1034,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       }
 
       addOrUpdateMarker(vehicleId,lat,lon,popup,color,typeKey,tripId,{
-        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,occupancy,bikesLine
+        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine
       });
 
       if(vehicleLabel){
@@ -971,7 +1048,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         routeIndex.get(rk).add(vehicleMarkers[vehicleId]);
       }
 
-      cachedState.push({vehicleId,lat,lon,popupContent:popup,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,occupancy,bikesLine});
+      cachedState.push({vehicleId,lat,lon,popupContent:popup,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine});
     });
 
     pairAMTrains(inServiceAM,outOfServiceAM);
