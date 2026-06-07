@@ -277,7 +277,7 @@ function followPinnedIfNeeded(animate){
 let _drLast=0;
 function deadReckonTick(ts){
   requestAnimationFrame(deadReckonTick);
-  if(!pageVisible || prefersReducedMotion) return;
+  if(!isPageVisible() || prefersReducedMotion) return;
   if(ts-_drLast<DR_FRAME_MS) return;
   _drLast=ts;
   const now=Date.now();
@@ -643,7 +643,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
   const ignoreBackoff = !!opts.ignoreBackoff;
   const now = Date.now();
   const realtimeBlocked = (!ignoreBackoff && backoff.realtime.until && now < backoff.realtime.until);
-  if(!pageVisible || vehiclesInFlight || realtimeBlocked) return;
+  if(!isPageVisible() || vehiclesInFlight || realtimeBlocked) return;
   vehiclesInFlight=true;
 
   const watchdogMs = 10000;
@@ -829,6 +829,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     localStorage.setItem("realtimeSnapshot",JSON.stringify(cachedState));
     setDebug(`Realtime update complete at ${new Date(nowTs).toLocaleTimeString()}`);
     setLastUpdateTs(nowTs);
+    lastPollOkTs=nowTs;
     updateVehicleCount();
 
     await fetchTripsBatch([...new Set(allTripIds)]);
@@ -838,27 +839,59 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
   }
 }
 
+function isPageVisible(){ return document.visibilityState !== "hidden"; }
+
+let lastPollOkTs=0;
+const STALE_REFRESH_MS=MAX_POLL_MS*2; // visible but no good poll this long => force one
+
+// Self-perpetuating poll loop. It ALWAYS reschedules, so it can never die. The actual
+// network call is gated on LIVE visibility (not a cached flag), so it skips work while
+// hidden and resumes automatically the moment the page is shown again.
 function scheduleNextFetch(){
   if(pollTimeoutId){ clearTimeout(pollTimeoutId); pollTimeoutId=null; }
-  if(!pageVisible) return;
-  const base = basePollDelay();
-  const now = Date.now();
-  const waitRealtime = backoff.realtime.until > now ? (backoff.realtime.until - now) : 0;
-  const delay = Math.max(base, waitRealtime);
-  pollTimeoutId=setTimeout(async()=>{ if(!pageVisible) return; await fetchVehicles(); scheduleNextFetch(); },delay);
+  const base=basePollDelay();
+  const now=Date.now();
+  const waitRealtime=backoff.realtime.until>now ? (backoff.realtime.until-now) : 0;
+  const delay=Math.max(base, waitRealtime);
+  pollTimeoutId=setTimeout(async()=>{
+    pollTimeoutId=null;
+    try{ if(isPageVisible()) await fetchVehicles(); }
+    finally{ scheduleNextFetch(); } // reschedule no matter what happened
+  }, delay);
 }
-function pauseUpdatesNow(){ pageVisible=false; if(pollTimeoutId){clearTimeout(pollTimeoutId); pollTimeoutId=null;} vehiclesAbort?.abort?.(); setDebug("Paused updates: tab not visible"); }
+
+// Heartbeat safety net: independently forces a refresh if the page has been visible but
+// hasn't had a successful poll for too long. Covers any unexpected stall.
+let heartbeatId=null;
+function startHeartbeat(){
+  if(heartbeatId) return;
+  heartbeatId=setInterval(()=>{
+    if(!isPageVisible()) return;
+    const stale=!lastPollOkTs || (Date.now()-lastPollOkTs)>STALE_REFRESH_MS;
+    if(stale && !vehiclesInFlight && backoff.realtime.until<=Date.now()){
+      fetchVehicles({ ignoreBackoff:true });
+    }
+  }, 5000);
+}
+
+function pauseUpdatesNow(){
+  pageVisible=false;
+  vehiclesAbort?.abort?.();            // drop any in-flight request
+  setDebug("Paused updates: tab not visible");
+  // Intentionally NOT killing the loop; the visibility gate stops fetches while hidden.
+}
 function schedulePauseAfterHide(){ if(hidePauseTimerId) return; hidePauseTimerId=setTimeout(()=>{ hidePauseTimerId=null; if(document.hidden) pauseUpdatesNow(); },HIDE_PAUSE_DELAY_MS); }
 function cancelScheduledPause(){ if(hidePauseTimerId){clearTimeout(hidePauseTimerId); hidePauseTimerId=null;} }
 async function resumeUpdatesNow(){
   cancelScheduledPause();
   const wasHidden=!pageVisible;
   pageVisible=true;
+  if(!pollTimeoutId) scheduleNextFetch(); // ensure the loop is alive
+  startHeartbeat();
   if(wasHidden){
     setDebug("Tab visible. Refreshing...");
-    await fetchVehicles({ ignoreBackoff: true });
+    await fetchVehicles({ ignoreBackoff:true }); // immediate catch-up
   }
-  scheduleNextFetch();
 }
 
 document.addEventListener("visibilitychange",()=>{ if(document.hidden) pauseUpdatesNow(); else resumeUpdatesNow(); });
@@ -887,10 +920,14 @@ async function init(){
 
   updateControlsHeight();
 
-  const initialJitter = 500 + Math.random()*2500;
-  setTimeout(async () => {
-    await fetchVehicles({ ignoreBackoff: true });
-    scheduleNextFetch();
+  // Sync the cached flag to reality at startup, then start everything unconditionally.
+  pageVisible=isPageVisible();
+  startHeartbeat();
+
+  const initialJitter=300+Math.random()*1200;
+  setTimeout(async()=>{
+    if(isPageVisible()) await fetchVehicles({ ignoreBackoff:true });
+    scheduleNextFetch(); // start the self-perpetuating loop regardless of visibility
   }, initialJitter);
 }
 init();
