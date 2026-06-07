@@ -3,6 +3,7 @@ const proxyBaseUrl = "https://atrealtime.vercel.app";
 const realtimeUrl  = `${proxyBaseUrl}/api/realtime`;
 const routesUrl    = `${proxyBaseUrl}/api/routes`;
 const tripsUrl     = `${proxyBaseUrl}/api/trips`;
+const shapesUrl    = `${proxyBaseUrl}/api/shapes`;
 const busTypesUrl  = "busTypes.json";
 
 const light = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",{attribution:"© OpenStreetMap contributors © CARTO",subdomains:"abcd",maxZoom:20});
@@ -34,6 +35,7 @@ let pinnedFollow=false;
 map.on("click",()=>{
   if(pinnedPopup){ pinnedPopup.closePopup(); pinnedPopup=null; pinnedFollow=false; }
   clearRouteHighlights();
+  clearRouteOutline();
 });
 
 
@@ -54,6 +56,7 @@ const backoff = {
   realtime: { ms:0, until:0 },
   routes:   { ms:0, until:0 },
   trips:    { ms:0, until:0 },
+  shapes:   { ms:0, until:0 },
 };
 function applyRateLimitBackoff(retryAfterMs, who){
   const b = backoff[who] || backoff.realtime;
@@ -182,6 +185,15 @@ const DR_MAX_PROJECT_MS    = 30000;  // stop projecting >30 s past the last fix
 const DR_MIN_BEARING_DISP_M= 5;      // need >5 m of travel to trust a derived bearing
 const DR_FRAME_MS          = 120;    // ~8 fps projection cadence (battery friendly)
 
+// Route-following (snap dead reckoning to the trip's GTFS shape instead of a straight
+// bearing). Shapes are static schedule data, fetched lazily and cached hard.
+const SNAP_MAX_M           = 60;     // if a fix is >60 m off the shape, treat as off-route
+const SHAPE_FETCH_CAP      = 18;     // max NEW shapes fetched per pass (keeps calls low)
+const MIN_SHAPE_ZOOM       = 12;     // don't fetch shapes when zoomed too far out
+
+const shapeCache    = new Map(); // shapeId -> {pts:[[lat,lon],...], cum:[m...], total} | null
+const shapePending  = new Set(); // shapeIds currently being fetched
+
 function toRad(d){ return d*Math.PI/180; }
 function toDeg(r){ return r*180/Math.PI; }
 
@@ -206,11 +218,63 @@ function projectLatLon(lat,lon,bearingDeg,distM){
   return [lat+toDeg(dLat), lon+toDeg(dLon)];
 }
 
+// Build the cumulative-distance table for a raw [[lat,lon],...] shape.
+function ingestShape(id, pts){
+  if(!Array.isArray(pts) || pts.length<2){ shapeCache.set(id,null); return; }
+  const cum=[0]; let total=0;
+  for(let i=1;i<pts.length;i++){
+    total+=haversineM(pts[i-1][0],pts[i-1][1],pts[i][0],pts[i][1]);
+    cum.push(total);
+  }
+  shapeCache.set(id,{pts,cum,total});
+}
+
+// Nearest point on a shape to (lat,lon). Returns {distM, chainM, tangentDeg}.
+// Uses a local equirectangular projection (constant cosLat) so segment comparisons and
+// the resulting chainage are metric-consistent for the small spans involved.
+function snapToShape(shape, lat, lon){
+  const pts=shape.pts, cum=shape.cum;
+  const cosLat=Math.cos(toRad(lat));
+  const M=111320; // metres per degree (good enough locally)
+  const px=lon*cosLat, py=lat;
+  let bestD2=Infinity, bestChain=0, bestTan=null;
+  for(let i=0;i<pts.length-1;i++){
+    const ax=pts[i][1]*cosLat,   ay=pts[i][0];
+    const bx=pts[i+1][1]*cosLat, by=pts[i+1][0];
+    const abx=bx-ax, aby=by-ay;
+    const apx=px-ax, apy=py-ay;
+    const len2=abx*abx+aby*aby;
+    let t = len2>0 ? (apx*abx+apy*aby)/len2 : 0;
+    if(t<0) t=0; else if(t>1) t=1;
+    const cx=ax+t*abx, cy=ay+t*aby;
+    const dx=px-cx, dy=py-cy;
+    const d2=dx*dx+dy*dy;
+    if(d2<bestD2){
+      bestD2=d2;
+      bestChain=cum[i]+t*(cum[i+1]-cum[i]);
+      bestTan=bearingDegBetween(pts[i][0],pts[i][1],pts[i+1][0],pts[i+1][1]);
+    }
+  }
+  return { distM:Math.sqrt(bestD2)*M, chainM:bestChain, tangentDeg:bestTan };
+}
+
+// Map a chainage (m from shape start) back to [lat,lon].
+function chainageToLatLon(shape, d){
+  const {pts,cum,total}=shape;
+  if(d<=0) return pts[0];
+  if(d>=total) return pts[pts.length-1];
+  let lo=0, hi=cum.length-1;
+  while(lo+1<hi){ const mid=(lo+hi)>>1; if(cum[mid]<=d) lo=mid; else hi=mid; }
+  const segLen=(cum[hi]-cum[lo])||1;
+  const tt=(d-cum[lo])/segLen;
+  return [ pts[lo][0]+(pts[hi][0]-pts[lo][0])*tt, pts[lo][1]+(pts[hi][1]-pts[lo][1])*tt ];
+}
+
 // Update a vehicle's motion record each poll and return display values.
 //  fixTsMs: per-vehicle GTFS-RT timestamp in ms (0 if absent -> client time used).
 //  feedSpeedMs / feedBearingDeg: normalised feed values, may be null.
 // Returns {speedMs, bearingDeg, source} where source is "computed" | "GPS" | "".
-function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg){
+function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg,shapeId){
   const nowClient=Date.now();
   const prev=motionState.get(id);
   const effFixTs=fixTsMs||nowClient;
@@ -248,6 +312,22 @@ function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg){
   else if(feedBearingDeg!=null) bearingDeg=((feedBearingDeg%360)+360)%360;
   else if(prev && prev.bearingDeg!=null) bearingDeg=prev.bearingDeg;
 
+  // Snap onto the route shape (if we have its geometry) so projection follows the path.
+  let onRoute=false, routePos=0, routeDir=1;
+  const shape = shapeId ? shapeCache.get(shapeId) : null;
+  if(shape){
+    const snap=snapToShape(shape,lat,lon);
+    if(snap.distM<=SNAP_MAX_M){
+      onRoute=true; routePos=snap.chainM;
+      // Decide travel direction along the shape by comparing heading to the segment
+      // tangent (shapes are ordered in the trip's direction, but verify per fix).
+      if(bearingDeg!=null && snap.tangentDeg!=null){
+        const diff=Math.abs(((bearingDeg-snap.tangentDeg+540)%360)-180); // 0..180
+        routeDir = diff>90 ? -1 : 1;
+      }
+    }
+  }
+
   // Only dead-reckon vehicles that are genuinely moving, have a heading, are getting
   // fresh fixes, and when the user hasn't asked to reduce motion.
   const hasVel=(speedMs!=null && speedMs>=DR_MIN_SPEED_MS && bearingDeg!=null && !staleFix && !prefersReducedMotion);
@@ -255,7 +335,8 @@ function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg){
   motionState.set(id,{
     fixLat:lat, fixLon:lon, fixTs:effFixTs,
     trueLat:lat, trueLon:lon, anchorClientMs:nowClient,
-    speedMs, bearingDeg, source, hasVel
+    speedMs, bearingDeg, source, hasVel,
+    shapeId:shapeId||null, onRoute, routePos, routeDir
   });
 
   return {speedMs, bearingDeg, source};
@@ -288,12 +369,88 @@ function deadReckonTick(ts){
     if(elapsed<=0) return;
     if(elapsed>DR_MAX_PROJECT_MS) elapsed=DR_MAX_PROJECT_MS;
     const dist=st.speedMs*(elapsed/1000);
+
+    // Preferred: advance along the actual route shape.
+    if(st.onRoute && st.shapeId){
+      const shape=shapeCache.get(st.shapeId);
+      if(shape){
+        const [plat,plon]=chainageToLatLon(shape, st.routePos + st.routeDir*dist);
+        m.setLatLng([plat,plon]);
+        return;
+      }
+    }
+    // Fallback: straight-line bearing projection (no shape available).
     const [plat,plon]=projectLatLon(st.trueLat,st.trueLon,st.bearingDeg,dist);
     m.setLatLng([plat,plon]);
   });
   followPinnedIfNeeded(false);
 }
 if(!prefersReducedMotion) requestAnimationFrame(deadReckonTick);
+
+// ---- Route outline for the selected in-service vehicle ------------------------------
+// Dedicated pane keeps the outline beneath the vehicle markers.
+try{ map.createPane("routePane"); map.getPane("routePane").style.zIndex=350; }catch{}
+let routeOutline=null; // { shapeId, layer }
+
+function clearRouteOutline(){
+  if(routeOutline?.layer){ try{ map.removeLayer(routeOutline.layer); }catch{} }
+  routeOutline=null;
+}
+function drawRouteOutline(shapeId,color){
+  const shape=shapeCache.get(shapeId);
+  if(!shape || !shape.pts?.length){ clearRouteOutline(); return; }
+  clearRouteOutline();
+  const casing=L.polyline(shape.pts,{pane:"routePane",color:"#000",opacity:0.22,weight:8,lineJoin:"round",lineCap:"round",interactive:false});
+  const line  =L.polyline(shape.pts,{pane:"routePane",color:color||"#0a84ff",opacity:0.9,weight:4,lineJoin:"round",lineCap:"round",interactive:false});
+  routeOutline={ shapeId, layer:L.layerGroup([casing,line]).addTo(map) };
+}
+async function showRouteOutlineFor(marker){
+  if(!marker || marker.currentType==="out" || !marker.tripId){ clearRouteOutline(); return; }
+  const sid=tripCache[marker.tripId]?.shape_id;
+  if(!sid){ clearRouteOutline(); return; }
+  if(routeOutline && routeOutline.shapeId===sid) return; // already shown
+  if(!shapeCache.has(sid)) await fetchShapes([sid]);
+  if(pinnedPopup!==marker) return;                       // selection changed while fetching
+  if(!shapeCache.get(sid)){ clearRouteOutline(); return; }
+  drawRouteOutline(sid, marker.options?.fillColor || vehicleColors.bus);
+}
+
+// ---- Lazy shape fetching (deduped, viewport-limited, capped) -------------------------
+async function fetchShapes(ids){
+  const want=[...new Set(ids)].filter(id=>id && !shapeCache.has(id) && !shapePending.has(id));
+  if(!want.length) return;
+  want.forEach(id=>shapePending.add(id));
+  for(const group of chunk(want,25)){
+    const json=await safeFetch(`${shapesUrl}?ids=${group.map(encodeURIComponent).join(",")}`);
+    group.forEach(id=>shapePending.delete(id));
+    if(!json || json._rateLimited){ if(json&&json._rateLimited) applyRateLimitBackoff(json.retryAfterMs,"shapes"); continue; }
+    const shapes=json.shapes||{};
+    group.forEach(id=>ingestShape(id, shapes[id])); // null marks "tried, none" so we don't refetch
+  }
+}
+function ensureShapesForViewport(){
+  const ids=[];
+  // Selected vehicle first (so its outline/following is always ready).
+  if(pinnedPopup && pinnedPopup.currentType!=="out" && pinnedPopup.tripId){
+    const sid=tripCache[pinnedPopup.tripId]?.shape_id;
+    if(sid && !shapeCache.has(sid) && !shapePending.has(sid)) ids.push(sid);
+  }
+  if(map.getZoom()>=MIN_SHAPE_ZOOM){
+    const b=map.getBounds();
+    const seen=new Set(ids);
+    for(const id in vehicleMarkers){
+      if(ids.length>=SHAPE_FETCH_CAP) break;
+      const m=vehicleMarkers[id];
+      if(m.currentType==="out" || !m.tripId) continue;
+      if(!b.contains(m.getLatLng())) continue;
+      const sid=tripCache[m.tripId]?.shape_id;
+      if(sid && !seen.has(sid) && !shapeCache.has(sid) && !shapePending.has(sid)){ seen.add(sid); ids.push(sid); }
+    }
+  }
+  if(ids.length) fetchShapes(ids);
+}
+let _shapeViewTimer=null;
+map.on("moveend zoomend",()=>{ clearTimeout(_shapeViewTimer); _shapeViewTimer=setTimeout(ensureShapesForViewport,400); });
 
 function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
   const isMobile=window.innerWidth<=600;
@@ -324,6 +481,7 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
         if(pinnedPopup&&pinnedPopup!==this) pinnedPopup.closePopup();
         pinnedPopup=this; pinnedFollow=true;
         this.openPopup();
+        showRouteOutlineFor(this);
         e?.originalEvent?.stopPropagation?.();
       });
       marker._eventsBound=true;
@@ -454,6 +612,7 @@ const SearchControl=L.Control.extend({
       if (pinnedPopup && pinnedPopup !== m) pinnedPopup.closePopup();
       pinnedPopup = m;
       pinnedFollow = true;
+      showRouteOutlineFor(m);
 
       const needMove =
         map.getZoom() < targetZoom ||
@@ -481,7 +640,7 @@ const SearchControl=L.Control.extend({
     function expand(){ div.classList.add("expanded"); input.focus({ preventScroll:true }); renderSuggestions(input.value); }
     function collapse(opts = { preservePopup: false }) {
       div.classList.remove("expanded"); input.value = ""; sugg.innerHTML = ""; clearRouteHighlights();
-      if (!opts.preservePopup && pinnedPopup) { pinnedPopup.closePopup(); pinnedPopup = null; pinnedFollow=false; }
+      if (!opts.preservePopup && pinnedPopup) { pinnedPopup.closePopup(); pinnedPopup = null; pinnedFollow=false; clearRouteOutline(); }
     }
 
     btn.addEventListener("click", ()=> { if(div.classList.contains("expanded")) collapse({ preservePopup: !!pinnedPopup }); else expand(); });
@@ -590,7 +749,7 @@ async function fetchTripsBatch(tripIds){
     if(tripJson?.data?.length>0){
       tripJson.data.forEach(t=>{
         const a=t.attributes;
-        if(a){ tripCache[a.trip_id]={trip_id:a.trip_id,trip_headsign:a.trip_headsign||"N/A",route_id:a.route_id,bikes_allowed:a.bikes_allowed}; }
+        if(a){ tripCache[a.trip_id]={trip_id:a.trip_id,trip_headsign:a.trip_headsign||"N/A",route_id:a.route_id,bikes_allowed:a.bikes_allowed,shape_id:a.shape_id}; }
       });
   
       ids.forEach(tid=>{
@@ -694,7 +853,8 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       }
       const feedBearingDeg=toNum(v.vehicle.position.bearing ?? v.vehicle.position.heading);
 
-      const motion=updateMotion(vehicleId,lat,lon,fixTsMs,feedMs,feedBearingDeg);
+      const shapeIdForVeh=(tripId && tripCache[tripId]) ? tripCache[tripId].shape_id : null;
+      const motion=updateMotion(vehicleId,lat,lon,fixTsMs,feedMs,feedBearingDeg,shapeIdForVeh);
 
       let speedKmh=null, speedStr="N/A";
       if(motion.speedMs!=null){
@@ -818,7 +978,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
-        if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
+        if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; clearRouteOutline(); }
         map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; motionState.delete(id);
       }
     });
@@ -833,6 +993,11 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     updateVehicleCount();
 
     await fetchTripsBatch([...new Set(allTripIds)]);
+
+    // Now that shape_ids are known, fetch the shapes we can actually see, and make sure
+    // the selected vehicle's outline reflects any shape that just loaded.
+    ensureShapesForViewport();
+    if(pinnedPopup && pinnedPopup.currentType!=="out") showRouteOutlineFor(pinnedPopup);
   }finally{
     clearTimeout(watchdog);
     vehiclesInFlight=false;
