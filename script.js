@@ -156,6 +156,145 @@ function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,spee
     </div>`;
 }
 
+// ===================== Motion / speed estimation + dead reckoning ====================
+// Two goals, both achieved WITHOUT any extra API calls (they reuse the existing poll):
+//  1. Better speed. AT's position.speed is often missing, zeroed-while-moving, or
+//     stale. We instead derive ground speed from successive GTFS-RT fixes
+//     (great-circle distance / Δt using each vehicle's own timestamp), smooth it with
+//     an EMA, and fall back to the feed value only when a fix-to-fix value cannot be
+//     computed (e.g. first sighting).
+//  2. Smoother tracking. Between the 15-27 s polls each moving marker is projected
+//     forward along its velocity vector (dead reckoning) on a throttled rAF loop, so
+//     motion looks continuous at the same poll cadence. On the next real poll the
+//     marker snaps back to ground truth.
+const R_EARTH = 6371000;
+const prefersReducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+const motionState = new Map(); // vehicleId -> motion record (persists across polls)
+
+// Tuning knobs
+const SPEED_EMA_ALPHA      = 0.4;    // displayed-speed smoothing (0..1, higher = snappier)
+const DERIVE_MIN_DT_MS     = 2000;   // ignore fix gaps shorter than this (too noisy)
+const DERIVE_MAX_DT_MS     = 90000;  // gaps longer than this => treat as a fresh anchor
+const DERIVE_MAX_SPEED_MS  = 70;     // ~252 km/h; reject GPS glitches above this
+const DR_MIN_SPEED_MS      = 1.0;    // don't project below ~3.6 km/h (avoids jitter)
+const DR_MAX_PROJECT_MS    = 30000;  // stop projecting >30 s past the last fix
+const DR_MIN_BEARING_DISP_M= 5;      // need >5 m of travel to trust a derived bearing
+const DR_FRAME_MS          = 120;    // ~8 fps projection cadence (battery friendly)
+
+function toRad(d){ return d*Math.PI/180; }
+function toDeg(r){ return r*180/Math.PI; }
+
+// Great-circle distance (m).
+function haversineM(lat1,lon1,lat2,lon2){
+  const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+  const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return 2*R_EARTH*Math.asin(Math.min(1,Math.sqrt(a)));
+}
+// Initial bearing (deg, 0=N clockwise).
+function bearingDegBetween(lat1,lon1,lat2,lon2){
+  const p1=toRad(lat1), p2=toRad(lat2), dl=toRad(lon2-lon1);
+  const y=Math.sin(dl)*Math.cos(p2);
+  const x=Math.cos(p1)*Math.sin(p2)-Math.sin(p1)*Math.cos(p2)*Math.cos(dl);
+  return (toDeg(Math.atan2(y,x))+360)%360;
+}
+// Project a point forward (flat-earth approx; error is negligible under ~2 km).
+function projectLatLon(lat,lon,bearingDeg,distM){
+  const t=toRad(bearingDeg);
+  const dLat=(distM*Math.cos(t))/R_EARTH;
+  const dLon=(distM*Math.sin(t))/(R_EARTH*Math.cos(toRad(lat)));
+  return [lat+toDeg(dLat), lon+toDeg(dLon)];
+}
+
+// Update a vehicle's motion record each poll and return display values.
+//  fixTsMs: per-vehicle GTFS-RT timestamp in ms (0 if absent -> client time used).
+//  feedSpeedMs / feedBearingDeg: normalised feed values, may be null.
+// Returns {speedMs, bearingDeg, source} where source is "computed" | "GPS" | "".
+function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg){
+  const nowClient=Date.now();
+  const prev=motionState.get(id);
+  const effFixTs=fixTsMs||nowClient;
+  const staleFix=!!(prev && fixTsMs && prev.fixTs===fixTsMs); // feed gave no new fix
+
+  let derivedMs=null, derivedBearing=null;
+  if(prev && !staleFix){
+    const dt=effFixTs-prev.fixTs;
+    if(dt>=DERIVE_MIN_DT_MS && dt<=DERIVE_MAX_DT_MS){
+      const dist=haversineM(prev.fixLat,prev.fixLon,lat,lon);
+      const v=dist/(dt/1000);
+      if(v<=DERIVE_MAX_SPEED_MS){
+        derivedMs=v;
+        if(dist>=DR_MIN_BEARING_DISP_M) derivedBearing=bearingDegBetween(prev.fixLat,prev.fixLon,lat,lon);
+      }
+    }
+  }
+
+  // Prefer the fix-to-fix value (consistent, immune to feed quirks); feed is fallback.
+  let rawMs=null, source="";
+  if(derivedMs!=null){ rawMs=derivedMs; source="computed"; }
+  else if(feedSpeedMs!=null){ rawMs=feedSpeedMs; source="GPS"; }
+
+  // EMA-smooth the displayed speed; keep last value if nothing new this poll.
+  let speedMs=rawMs;
+  if(rawMs!=null){
+    speedMs=(prev && prev.speedMs!=null) ? prev.speedMs+SPEED_EMA_ALPHA*(rawMs-prev.speedMs) : rawMs;
+  }else if(prev){
+    speedMs=prev.speedMs; source=prev.source;
+  }
+
+  // Bearing for projection + heading display: derived -> feed -> previous.
+  let bearingDeg=null;
+  if(derivedBearing!=null) bearingDeg=derivedBearing;
+  else if(feedBearingDeg!=null) bearingDeg=((feedBearingDeg%360)+360)%360;
+  else if(prev && prev.bearingDeg!=null) bearingDeg=prev.bearingDeg;
+
+  // Only dead-reckon vehicles that are genuinely moving, have a heading, are getting
+  // fresh fixes, and when the user hasn't asked to reduce motion.
+  const hasVel=(speedMs!=null && speedMs>=DR_MIN_SPEED_MS && bearingDeg!=null && !staleFix && !prefersReducedMotion);
+
+  motionState.set(id,{
+    fixLat:lat, fixLon:lon, fixTs:effFixTs,
+    trueLat:lat, trueLon:lon, anchorClientMs:nowClient,
+    speedMs, bearingDeg, source, hasVel
+  });
+
+  return {speedMs, bearingDeg, source};
+}
+
+// Keep the followed vehicle roughly centred. Called from the rAF loop (animate=false
+// for per-frame nudges) and once per poll (animate=true).
+function followPinnedIfNeeded(animate){
+  if(!(pinnedPopup && pinnedFollow)) return;
+  try{
+    const ll=pinnedPopup.getLatLng();
+    const c=map.latLngToLayerPoint(map.getCenter());
+    const p=map.latLngToLayerPoint(ll);
+    if(Math.abs(c.x-p.x)>6 || Math.abs(c.y-p.y)>6) map.panTo(ll,{animate});
+  }catch{}
+}
+
+// Throttled dead-reckoning render loop.
+let _drLast=0;
+function deadReckonTick(ts){
+  requestAnimationFrame(deadReckonTick);
+  if(!pageVisible || prefersReducedMotion) return;
+  if(ts-_drLast<DR_FRAME_MS) return;
+  _drLast=ts;
+  const now=Date.now();
+  motionState.forEach((st,id)=>{
+    if(!st.hasVel) return;
+    const m=vehicleMarkers[id]; if(!m) return;
+    let elapsed=now-st.anchorClientMs;
+    if(elapsed<=0) return;
+    if(elapsed>DR_MAX_PROJECT_MS) elapsed=DR_MAX_PROJECT_MS;
+    const dist=st.speedMs*(elapsed/1000);
+    const [plat,plon]=projectLatLon(st.trueLat,st.trueLon,st.bearingDeg,dist);
+    m.setLatLng([plat,plon]);
+  });
+  followPinnedIfNeeded(false);
+}
+if(!prefersReducedMotion) requestAnimationFrame(deadReckonTick);
+
 function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
   const isMobile=window.innerWidth<=600;
   const baseRadius=isMobile?6:5;
@@ -543,10 +682,27 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       const rType=routes[routeId]?.route_type;
       const isTrain=rType===2, isFerry=rType===4, isAM=vehicleLabel.startsWith("AM");
 
+      // ---- Speed: derive from fix-to-fix motion (robust), feed value as fallback ----
+      const fixTsMs=(()=>{ const t=toNum(v.vehicle?.timestamp); return t?Math.round(t*1000):0; })();
+      // Canonical feed speed in m/s. AT reports buses already in km/h but trains/
+      // ferries/AM in m/s, so normalise the bus value by /3.6.
+      let feedMs=null;
+      const rawSpeed=v.vehicle.position.speed;
+      if(rawSpeed!==undefined && rawSpeed!==null && isFinite(rawSpeed)){
+        feedMs=(isTrain||isFerry||isAM)?Number(rawSpeed):Number(rawSpeed)/3.6;
+        if(feedMs<0) feedMs=null;
+      }
+      const feedBearingDeg=toNum(v.vehicle.position.bearing ?? v.vehicle.position.heading);
+
+      const motion=updateMotion(vehicleId,lat,lon,fixTsMs,feedMs,feedBearingDeg);
+
       let speedKmh=null, speedStr="N/A";
-      if(v.vehicle.position.speed!==undefined){
-        speedKmh=(isTrain||isFerry||isAM)?v.vehicle.position.speed*3.6:v.vehicle.position.speed;
-        speedStr=isFerry?`${speedKmh.toFixed(1)} km/h (${(v.vehicle.position.speed*1.94384).toFixed(1)} kn)`:`${speedKmh.toFixed(1)} km/h`;
+      if(motion.speedMs!=null){
+        speedKmh=motion.speedMs*3.6;
+        const srcTag=motion.source==="computed"?" (est.)":"";
+        speedStr=isFerry
+          ? `${speedKmh.toFixed(1)} km/h (${(motion.speedMs*1.94384).toFixed(1)} kn)${srcTag}`
+          : `${speedKmh.toFixed(1)} km/h${srcTag}`;
       }
 
       let occupancy="N/A";
@@ -589,9 +745,9 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       const vp=v.vehicle;
       const ex={};
 
-      // Heading / bearing (camel- or snake-case tolerated)
-      const bearingDeg=toNum(pos.bearing ?? pos.heading);
-      if(bearingDeg!==null){ ex.bearingDeg=((bearingDeg%360)+360)%360; ex.heading=bearingToCompass(bearingDeg); }
+      // Heading / bearing: use the resolved motion bearing (feed -> derived -> last).
+      const headingDeg=(motion && motion.bearingDeg!=null) ? motion.bearingDeg : toNum(pos.bearing ?? pos.heading);
+      if(headingDeg!==null){ ex.bearingDeg=((headingDeg%360)+360)%360; ex.heading=bearingToCompass(headingDeg); }
 
       // Odometer (metres -> km)
       const odo=formatOdometer(pos.odometer);
@@ -663,22 +819,11 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
         if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; }
-        map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id];
+        map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; motionState.delete(id);
       }
     });
 
-    if (pinnedPopup && pinnedFollow) {
-      try {
-        const ll = pinnedPopup.getLatLng();
-        const centerPx = map.latLngToLayerPoint(map.getCenter());
-        const vehPx = map.latLngToLayerPoint(ll);
-        const dx = Math.abs(centerPx.x - vehPx.x);
-        const dy = Math.abs(centerPx.y - vehPx.y);
-        if (dx > 6 || dy > 6) {
-          map.panTo(ll, { animate: true });
-        }
-      } catch {}
-    }
+    followPinnedIfNeeded(true);
 
     const nowTs = Date.now();
     localStorage.setItem("realtimeSnapshot",JSON.stringify(cachedState));
