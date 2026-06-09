@@ -220,19 +220,13 @@ async function fetchTripUpdatesDelays(){
   return buildDelayMap(ents);
 }
 
-// ===================== Motion / speed estimation + dead reckoning ====================
-// Two goals, both achieved WITHOUT any extra API calls (they reuse the existing poll):
-//  1. Better speed. AT's position.speed is often missing, zeroed-while-moving, or
-//     stale. We instead derive ground speed from successive GTFS-RT fixes
-//     (great-circle distance / Δt using each vehicle's own timestamp), smooth it with
-//     an EMA, and fall back to the feed value only when a fix-to-fix value cannot be
-//     computed (e.g. first sighting).
-//  2. Smoother tracking. Between the 15-27 s polls each moving marker is projected
-//     forward along its velocity vector (dead reckoning) on a throttled rAF loop, so
-//     motion looks continuous at the same poll cadence. On the next real poll the
-//     marker snaps back to ground truth.
+// ===================== Motion / speed estimation =====================================
+// Speed only. AT's position.speed is often missing, zeroed-while-moving, or stale, so we
+// derive ground speed from successive GTFS-RT fixes (great-circle distance / Δt using each
+// vehicle's own timestamp), smooth it with an EMA, and fall back to the feed value only
+// when a fix-to-fix value cannot be computed (e.g. first sighting). Markers are placed at
+// the reported feed positions on every poll; there is no between-poll projection.
 const R_EARTH = 6371000;
-const prefersReducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 
 const motionState = new Map(); // vehicleId -> motion record (persists across polls)
 
@@ -241,14 +235,9 @@ const SPEED_EMA_ALPHA      = 0.4;    // displayed-speed smoothing (0..1, higher 
 const DERIVE_MIN_DT_MS     = 2000;   // ignore fix gaps shorter than this (too noisy)
 const DERIVE_MAX_DT_MS     = 90000;  // gaps longer than this => treat as a fresh anchor
 const DERIVE_MAX_SPEED_MS  = 70;     // ~252 km/h; reject GPS glitches above this
-const DR_MIN_SPEED_MS      = 1.0;    // don't project below ~3.6 km/h (avoids jitter)
-const DR_MAX_PROJECT_MS    = 30000;  // stop projecting >30 s past the last fix
 const DR_MIN_BEARING_DISP_M= 5;      // need >5 m of travel to trust a derived bearing
-const DR_FRAME_MS          = 120;    // ~8 fps projection cadence (battery friendly)
 
-// Route-following (snap dead reckoning to the trip's GTFS shape instead of a straight
-// bearing). Shapes are static schedule data, fetched lazily and cached hard.
-const SNAP_MAX_M           = 60;     // if a fix is >60 m off the shape, treat as off-route
+// Shape fetching (used for the selected vehicle's route outline only).
 const SHAPE_FETCH_CAP      = 18;     // max NEW shapes fetched per pass (keeps calls low)
 const MIN_SHAPE_ZOOM       = 12;     // don't fetch shapes when zoomed too far out
 
@@ -271,13 +260,6 @@ function bearingDegBetween(lat1,lon1,lat2,lon2){
   const x=Math.cos(p1)*Math.sin(p2)-Math.sin(p1)*Math.cos(p2)*Math.cos(dl);
   return (toDeg(Math.atan2(y,x))+360)%360;
 }
-// Project a point forward (flat-earth approx; error is negligible under ~2 km).
-function projectLatLon(lat,lon,bearingDeg,distM){
-  const t=toRad(bearingDeg);
-  const dLat=(distM*Math.cos(t))/R_EARTH;
-  const dLon=(distM*Math.sin(t))/(R_EARTH*Math.cos(toRad(lat)));
-  return [lat+toDeg(dLat), lon+toDeg(dLon)];
-}
 
 // Build the cumulative-distance table for a raw [[lat,lon],...] shape.
 function ingestShape(id, pts){
@@ -290,52 +272,11 @@ function ingestShape(id, pts){
   shapeCache.set(id,{pts,cum,total});
 }
 
-// Nearest point on a shape to (lat,lon). Returns {distM, chainM, tangentDeg}.
-// Uses a local equirectangular projection (constant cosLat) so segment comparisons and
-// the resulting chainage are metric-consistent for the small spans involved.
-function snapToShape(shape, lat, lon){
-  const pts=shape.pts, cum=shape.cum;
-  const cosLat=Math.cos(toRad(lat));
-  const M=111320; // metres per degree (good enough locally)
-  const px=lon*cosLat, py=lat;
-  let bestD2=Infinity, bestChain=0, bestTan=null;
-  for(let i=0;i<pts.length-1;i++){
-    const ax=pts[i][1]*cosLat,   ay=pts[i][0];
-    const bx=pts[i+1][1]*cosLat, by=pts[i+1][0];
-    const abx=bx-ax, aby=by-ay;
-    const apx=px-ax, apy=py-ay;
-    const len2=abx*abx+aby*aby;
-    let t = len2>0 ? (apx*abx+apy*aby)/len2 : 0;
-    if(t<0) t=0; else if(t>1) t=1;
-    const cx=ax+t*abx, cy=ay+t*aby;
-    const dx=px-cx, dy=py-cy;
-    const d2=dx*dx+dy*dy;
-    if(d2<bestD2){
-      bestD2=d2;
-      bestChain=cum[i]+t*(cum[i+1]-cum[i]);
-      bestTan=bearingDegBetween(pts[i][0],pts[i][1],pts[i+1][0],pts[i+1][1]);
-    }
-  }
-  return { distM:Math.sqrt(bestD2)*M, chainM:bestChain, tangentDeg:bestTan };
-}
-
-// Map a chainage (m from shape start) back to [lat,lon].
-function chainageToLatLon(shape, d){
-  const {pts,cum,total}=shape;
-  if(d<=0) return pts[0];
-  if(d>=total) return pts[pts.length-1];
-  let lo=0, hi=cum.length-1;
-  while(lo+1<hi){ const mid=(lo+hi)>>1; if(cum[mid]<=d) lo=mid; else hi=mid; }
-  const segLen=(cum[hi]-cum[lo])||1;
-  const tt=(d-cum[lo])/segLen;
-  return [ pts[lo][0]+(pts[hi][0]-pts[lo][0])*tt, pts[lo][1]+(pts[hi][1]-pts[lo][1])*tt ];
-}
-
 // Update a vehicle's motion record each poll and return display values.
 //  fixTsMs: per-vehicle GTFS-RT timestamp in ms (0 if absent -> client time used).
 //  feedSpeedMs / feedBearingDeg: normalised feed values, may be null.
 // Returns {speedMs, bearingDeg, source} where source is "computed" | "GPS" | "".
-function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg,shapeId){
+function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg){
   const nowClient=Date.now();
   const prev=motionState.get(id);
   const effFixTs=fixTsMs||nowClient;
@@ -367,44 +308,21 @@ function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg,shapeId){
     speedMs=prev.speedMs; source=prev.source;
   }
 
-  // Bearing for projection + heading display: derived -> feed -> previous.
+  // Bearing for heading display: derived -> feed -> previous.
   let bearingDeg=null;
   if(derivedBearing!=null) bearingDeg=derivedBearing;
   else if(feedBearingDeg!=null) bearingDeg=((feedBearingDeg%360)+360)%360;
   else if(prev && prev.bearingDeg!=null) bearingDeg=prev.bearingDeg;
 
-  // Snap onto the route shape (if we have its geometry) so projection follows the path.
-  let onRoute=false, routePos=0, routeDir=1;
-  const shape = shapeId ? shapeCache.get(shapeId) : null;
-  if(shape){
-    const snap=snapToShape(shape,lat,lon);
-    if(snap.distM<=SNAP_MAX_M){
-      onRoute=true; routePos=snap.chainM;
-      // Decide travel direction along the shape by comparing heading to the segment
-      // tangent (shapes are ordered in the trip's direction, but verify per fix).
-      if(bearingDeg!=null && snap.tangentDeg!=null){
-        const diff=Math.abs(((bearingDeg-snap.tangentDeg+540)%360)-180); // 0..180
-        routeDir = diff>90 ? -1 : 1;
-      }
-    }
-  }
-
-  // Only dead-reckon vehicles that are genuinely moving, have a heading, are getting
-  // fresh fixes, and when the user hasn't asked to reduce motion.
-  const hasVel=(speedMs!=null && speedMs>=DR_MIN_SPEED_MS && bearingDeg!=null && !staleFix && !prefersReducedMotion);
-
   motionState.set(id,{
     fixLat:lat, fixLon:lon, fixTs:effFixTs,
-    trueLat:lat, trueLon:lon, anchorClientMs:nowClient,
-    speedMs, bearingDeg, source, hasVel,
-    shapeId:shapeId||null, onRoute, routePos, routeDir
+    speedMs, bearingDeg, source
   });
 
   return {speedMs, bearingDeg, source};
 }
 
-// Keep the followed vehicle roughly centred. Called from the rAF loop (animate=false
-// for per-frame nudges) and once per poll (animate=true).
+// Keep the followed vehicle roughly centred. Called once per poll after positions update.
 function followPinnedIfNeeded(animate){
   if(!(pinnedPopup && pinnedFollow)) return;
   try{
@@ -414,39 +332,6 @@ function followPinnedIfNeeded(animate){
     if(Math.abs(c.x-p.x)>6 || Math.abs(c.y-p.y)>6) map.panTo(ll,{animate});
   }catch{}
 }
-
-// Throttled dead-reckoning render loop.
-let _drLast=0;
-function deadReckonTick(ts){
-  requestAnimationFrame(deadReckonTick);
-  if(!isPageVisible() || prefersReducedMotion) return;
-  if(ts-_drLast<DR_FRAME_MS) return;
-  _drLast=ts;
-  const now=Date.now();
-  motionState.forEach((st,id)=>{
-    if(!st.hasVel) return;
-    const m=vehicleMarkers[id]; if(!m) return;
-    let elapsed=now-st.anchorClientMs;
-    if(elapsed<=0) return;
-    if(elapsed>DR_MAX_PROJECT_MS) elapsed=DR_MAX_PROJECT_MS;
-    const dist=st.speedMs*(elapsed/1000);
-
-    // Preferred: advance along the actual route shape.
-    if(st.onRoute && st.shapeId){
-      const shape=shapeCache.get(st.shapeId);
-      if(shape){
-        const [plat,plon]=chainageToLatLon(shape, st.routePos + st.routeDir*dist);
-        m.setLatLng([plat,plon]);
-        return;
-      }
-    }
-    // Fallback: straight-line bearing projection (no shape available).
-    const [plat,plon]=projectLatLon(st.trueLat,st.trueLon,st.bearingDeg,dist);
-    m.setLatLng([plat,plon]);
-  });
-  followPinnedIfNeeded(false);
-}
-if(!prefersReducedMotion) requestAnimationFrame(deadReckonTick);
 
 // ---- Route outline for the selected in-service vehicle ------------------------------
 // Dedicated pane keeps the outline beneath the vehicle markers.
@@ -925,8 +810,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       }
       const feedBearingDeg=toNum(v.vehicle.position.bearing ?? v.vehicle.position.heading);
 
-      const shapeIdForVeh=(tripId && tripCache[tripId]) ? tripCache[tripId].shape_id : null;
-      const motion=updateMotion(vehicleId,lat,lon,fixTsMs,feedMs,feedBearingDeg,shapeIdForVeh);
+      const motion=updateMotion(vehicleId,lat,lon,fixTsMs,feedMs,feedBearingDeg);
 
       let speedKmh=null, speedStr="N/A";
       if(motion.speedMs!=null){
