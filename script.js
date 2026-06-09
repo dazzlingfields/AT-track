@@ -322,7 +322,8 @@ function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg){
   return {speedMs, bearingDeg, source};
 }
 
-// Keep the followed vehicle roughly centred. Called once per poll after positions update.
+// Keep the followed vehicle roughly centred. Called once per poll after positions update,
+// and per-frame while a tween is running so following stays smooth.
 function followPinnedIfNeeded(animate){
   if(!(pinnedPopup && pinnedFollow)) return;
   try{
@@ -331,6 +332,55 @@ function followPinnedIfNeeded(animate){
     const p=map.latLngToLayerPoint(ll);
     if(Math.abs(c.x-p.x)>6 || Math.abs(c.y-p.y)>6) map.panTo(ll,{animate});
   }catch{}
+}
+
+// ===================== Position tween (between consecutive reported fixes) ============
+// Glides each marker from its previous reported position to the new reported position
+// over POS_TWEEN_MS. This interpolates ONLY between two known truths: it never advances a
+// marker past the latest fix, so it cannot invent position the way dead reckoning did.
+// The loop is self-stopping (no perpetual rAF) and skips work that has no visual benefit
+// (hidden tab, reduced-motion, off-screen markers, large jumps).
+const POS_TWEEN_MS = 300;   // glide duration toward each new reported position
+const TWEEN_SNAP_M = 1000;  // jumps larger than this snap instantly (glitch / reappearance)
+const prefersReducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+const activeTweens = new Map(); // vehicleId -> {sLat,sLon,eLat,eLon,start}
+let tweenRafId = null;
+
+// Queue a marker to glide toward (eLat,eLon). Snaps instead of tweening when animation
+// would be pointless or misleading.
+function queuePositionTween(id, marker, eLat, eLon){
+  const cur = marker.getLatLng();
+  if(prefersReducedMotion || !isPageVisible() ||
+     haversineM(cur.lat,cur.lng,eLat,eLon) > TWEEN_SNAP_M){
+    activeTweens.delete(id);
+    marker.setLatLng([eLat,eLon]);
+    return;
+  }
+  // Re-seed from the CURRENT (possibly mid-tween) position so retargeting is seamless.
+  activeTweens.set(id,{ sLat:cur.lat, sLon:cur.lng, eLat, eLon, start:performance.now() });
+  if(tweenRafId==null) tweenRafId = requestAnimationFrame(tweenTick);
+}
+
+function tweenTick(now){
+  const bounds = map.getBounds();
+  activeTweens.forEach((tw,id)=>{
+    const m = vehicleMarkers[id];
+    if(!m){ activeTweens.delete(id); return; }
+    let t = (now - tw.start) / POS_TWEEN_MS;
+    if(t >= 1){ m.setLatLng([tw.eLat,tw.eLon]); activeTweens.delete(id); return; }
+    if(t < 0) t = 0;
+    // Off-screen: no visual benefit, jump straight to the fix and drop it.
+    if(!bounds.contains(m.getLatLng()) && !bounds.contains(L.latLng(tw.eLat,tw.eLon))){
+      m.setLatLng([tw.eLat,tw.eLon]); activeTweens.delete(id); return;
+    }
+    // easeOutQuad: monotonic over [0,1], so the point stays on the segment between the
+    // two fixes (path is identical to linear; only the rate differs).
+    const k = t*(2-t);
+    m.setLatLng([ tw.sLat+(tw.eLat-tw.sLat)*k, tw.sLon+(tw.eLon-tw.sLon)*k ]);
+  });
+  followPinnedIfNeeded(false);
+  tweenRafId = activeTweens.size ? requestAnimationFrame(tweenTick) : null;
 }
 
 // ---- Route outline for the selected in-service vehicle ------------------------------
@@ -406,18 +456,24 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
 
   if(vehicleMarkers[id]){
     const m=vehicleMarkers[id];
-    m.setLatLng([lat,lon]);
+    const prevType=m.currentType;            // before fields overwrite it
+    queuePositionTween(id,m,lat,lon);        // glide between consecutive reported fixes
     m.setPopupContent(popupContent);
-    m.setStyle({fillColor:color});
+    if(m._fillColor!==color){ m.setStyle({fillColor:color}); m._fillColor=color; }
     m.tripId=tripId;
     if(m._baseRadius==null) m._baseRadius=baseRadius;
     Object.assign(m,fields);
 
-    Object.values(vehicleLayers).forEach(l=>l.removeLayer(m));
-    (vehicleLayers[type]||vehicleLayers.out).addLayer(m);
+    // Only touch layer membership when the mode actually changed (removing/re-adding to
+    // four layer groups every poll for every vehicle is expensive and pointless).
+    if(prevType!==type){
+      Object.values(vehicleLayers).forEach(l=>l.removeLayer(m));
+      (vehicleLayers[type]||vehicleLayers.out).addLayer(m);
+    }
   }else{
     const marker=L.circleMarker([lat,lon],{radius:baseRadius,fillColor:color,color:"#000",weight:1,opacity:1,fillOpacity:0.9});
     marker._baseRadius=baseRadius;
+    marker._fillColor=color;
     (vehicleLayers[type]||vehicleLayers.out).addLayer(marker);
     marker.bindPopup(popupContent,popupOpts);
 
@@ -440,9 +496,14 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
   }
 }
 function updateVehicleCount(){
-  const busCount=Object.values(vehicleMarkers).filter(m=>vehicleLayers.bus.hasLayer(m)).length;
-  const trainCount=Object.values(vehicleMarkers).filter(m=>vehicleLayers.train.hasLayer(m)).length;
-  const ferryCount=Object.values(vehicleMarkers).filter(m=>vehicleLayers.ferry.hasLayer(m)).length;
+  let busCount=0, trainCount=0, ferryCount=0;
+  for(const id in vehicleMarkers){
+    switch(vehicleMarkers[id].currentType){
+      case "bus":   busCount++;   break;
+      case "train": trainCount++; break;
+      case "ferry": ferryCount++; break;
+    }
+  }
   const el=document.getElementById("vehicle-count"); if(el) el.textContent=`Buses: ${busCount}, Trains: ${trainCount}, Ferries: ${ferryCount}`;
 }
 
@@ -940,7 +1001,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
         if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; clearRouteOutline(); }
-        map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; motionState.delete(id);
+        map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; motionState.delete(id); activeTweens.delete(id);
       }
     });
 
