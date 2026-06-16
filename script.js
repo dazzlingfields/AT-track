@@ -96,8 +96,77 @@ function saveSnapshot(state){
   if(window.requestIdleCallback) requestIdleCallback(write,{timeout:3000}); else setTimeout(write,0);
 }
 
-function parseRetryAfterMs(v){ if(!v) return 0; const s=Number(v); if(!isNaN(s)) return Math.max(0,Math.floor(s*1000)); const t=Date.parse(v); return isNaN(t)?0:Math.max(0,t-Date.now()); }
-async function safeFetch(url,opts={}){
+// ===================== IndexedDB cache (routes / trips / shapes) =====================
+// Persists reference data across sessions so cold loads skip /api/routes entirely (when
+// fresh) and avoid re-fetching trips/shapes already seen. This DIRECTLY reduces AT API
+// calls, not just CPU. Every operation is defensive: any failure falls back to network.
+// Keys: "routes" (single blob), "trip:<id>", "shape:<id>". Records are {t:savedMs, data}.
+const IDB_NAME="atrt-cache", IDB_STORE="kv", IDB_VER=1;
+const TTL_ROUTES = 24*3600*1000;   // routes change rarely
+const TTL_TRIP   = 18*3600*1000;   // trip_ids are roughly service-day scoped
+const TTL_SHAPE  = 7*24*3600*1000; // geometry is effectively static
+let _idbPromise=null;
+function idbOpen(){
+  if(_idbPromise) return _idbPromise;
+  _idbPromise=new Promise(resolve=>{
+    let req;
+    try{ req=indexedDB.open(IDB_NAME,IDB_VER); }catch{ resolve(null); return; }
+    req.onupgradeneeded=()=>{ const db=req.result; if(!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE); };
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>resolve(null);
+    req.onblocked=()=>resolve(null);
+  }).catch(()=>null);
+  return _idbPromise;
+}
+async function idbGet(key){
+  const db=await idbOpen(); if(!db) return null;
+  return new Promise(res=>{ try{ const r=db.transaction(IDB_STORE,"readonly").objectStore(IDB_STORE).get(key); r.onsuccess=()=>res(r.result??null); r.onerror=()=>res(null); }catch{ res(null); } });
+}
+// Batched put: one transaction for many [key,record] pairs.
+async function idbPutMany(pairs){
+  if(!pairs||!pairs.length) return;
+  const db=await idbOpen(); if(!db) return;
+  return new Promise(res=>{ try{ const tx=db.transaction(IDB_STORE,"readwrite"); const st=tx.objectStore(IDB_STORE); for(const [k,v] of pairs) st.put(v,k); tx.oncomplete=()=>res(); tx.onerror=()=>res(); tx.onabort=()=>res(); }catch{ res(); } });
+}
+// Iterate every record once: hydrate live caches and prune anything past its TTL.
+async function idbHydrateAndPrune(){
+  const db=await idbOpen(); if(!db) return;
+  const now=Date.now();
+  return new Promise(res=>{
+    let cur;
+    try{ cur=db.transaction(IDB_STORE,"readwrite").objectStore(IDB_STORE).openCursor(); }
+    catch{ res(); return; }
+    cur.onerror=()=>res();
+    cur.onsuccess=e=>{
+      const c=e.target.result;
+      if(!c){ res(); return; }
+      const key=c.key, rec=c.value;
+      let ttl=0;
+      if(typeof key==="string"){
+        if(key.startsWith("trip:")) ttl=TTL_TRIP;
+        else if(key.startsWith("shape:")) ttl=TTL_SHAPE;
+      }
+      if(rec && ttl && (now-(rec.t||0))<ttl){
+        if(key.startsWith("trip:") && rec.data) tripCache[rec.data.trip_id]=rec.data;
+        else if(key.startsWith("shape:") && rec.data) shapeCache.set(key.slice(6), rec.data);
+      }else if(ttl){
+        try{ c.delete(); }catch{}
+      }
+      c.continue();
+    };
+  });
+}
+function idbPutTrips(trips){
+  if(!trips||!trips.length) return;
+  const t=Date.now();
+  idbPutMany(trips.map(tr=>[`trip:${tr.trip_id}`,{t,data:tr}]));
+}
+function idbPutShape(id, data){
+  if(!id || !data) return; // never persist null ("tried, none") so it can retry next session
+  idbPutMany([[`shape:${id}`,{t:Date.now(),data}]]);
+}
+
+function parseRetryAfterMs(v){ if(!v) return 0; const s=Number(v); if(!isNaN(s)) return Math.max(0,Math.floor(s*1000)); const t=Date.parse(v); return isNaN(t)?0:Math.max(0,t-Date.now()); }async function safeFetch(url,opts={}){
   try{
     const res=await fetch(url,{cache:"no-store",...opts});
     if(res.status===429){const retryAfterMs=parseRetryAfterMs(res.headers.get("Retry-After")); return {_rateLimited:true,retryAfterMs};}
@@ -282,7 +351,9 @@ function ingestShape(id, pts){
     total+=haversineM(pts[i-1][0],pts[i-1][1],pts[i][0],pts[i][1]);
     cum.push(total);
   }
-  shapeCache.set(id,{pts,cum,total});
+  const obj={pts,cum,total};
+  shapeCache.set(id,obj);
+  idbPutShape(id,obj); // survive reloads so revisited areas don't refetch /api/shapes
 }
 
 // Update a vehicle's motion record each poll and return display values.
@@ -348,23 +419,21 @@ function followPinnedIfNeeded(animate){
 }
 
 // ===================== Position tween (between consecutive reported fixes) ============
-// Glides each marker from its previous reported position to the new reported position
-// over the measured poll gap (posTweenMs), giving continuous motion instead of a brief
-// hop. This interpolates ONLY between two known truths: it never advances a marker past
-// the latest fix, so it cannot invent position the way dead reckoning did. The loop is
-// self-stopping (no perpetual rAF when idle/hidden) and skips work that has no visual
-// benefit (hidden tab, reduced-motion, off-screen markers, large jumps).
+// On each position update, glides the marker once from its old fix to the new fix over
+// POS_TWEEN_MS, then leaves it static until the next update. This interpolates ONLY between
+// two known truths: it never advances a marker past the latest fix, so it cannot invent
+// position the way dead reckoning did. The loop is self-stopping (no rAF when idle/hidden)
+// and skips work with no visual benefit (hidden tab, reduced-motion, off-screen, big jumps).
 const TWEEN_SNAP_M = 1000;  // jumps larger than this snap instantly (glitch / reappearance)
-const POS_TWEEN_MIN = 5000, POS_TWEEN_MAX = 30000; // clamp for the adaptive glide duration
-let posTweenMs = 12000;     // updated every poll to the measured inter-poll gap (clamped)
+const POS_TWEEN_MS = 650;   // one-shot glide into each new reported fix, then the marker is static
 const prefersReducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 
-const activeTweens = new Map(); // vehicleId -> {sLat,sLon,eLat,eLon,start,dur}
+const activeTweens = new Map(); // vehicleId -> {sLat,sLon,eLat,eLon,start}
 let tweenRafId = null;
 
-// Queue a marker to glide toward (eLat,eLon) over the current poll gap, so motion is
-// continuous between fixes instead of a 300ms hop followed by ~20s of stillness. Still
-// pure interpolation: the marker never passes the latest reported fix.
+// Queue a marker to glide from its current spot to (eLat,eLon) once, over POS_TWEEN_MS, on
+// position update. No between-update motion: the marker sits at the last reported fix until
+// the next one arrives. Pure interpolation, never extrapolation.
 function queuePositionTween(id, marker, eLat, eLon){
   const cur = marker.getLatLng();
   if(prefersReducedMotion || !isPageVisible() ||
@@ -373,9 +442,9 @@ function queuePositionTween(id, marker, eLat, eLon){
     marker.setLatLng([eLat,eLon]);
     return;
   }
-  if(cur.lat===eLat && cur.lng===eLon){ activeTweens.delete(id); return; } // no movement, skip
-  // Re-seed from the CURRENT (possibly mid-tween) position so retargeting is seamless.
-  activeTweens.set(id,{ sLat:cur.lat, sLon:cur.lng, eLat, eLon, start:performance.now(), dur:posTweenMs });
+  if(cur.lat===eLat && cur.lng===eLon){ activeTweens.delete(id); return; } // unchanged, stay static
+  // Re-seed from the CURRENT (possibly mid-tween) position so a retarget is seamless.
+  activeTweens.set(id,{ sLat:cur.lat, sLon:cur.lng, eLat, eLon, start:performance.now() });
   if(tweenRafId==null) tweenRafId = requestAnimationFrame(tweenTick);
 }
 
@@ -385,16 +454,17 @@ function tweenTick(now){
   activeTweens.forEach((tw,id)=>{
     const m = vehicleMarkers[id];
     if(!m){ activeTweens.delete(id); return; }
-    let t = (now - tw.start) / tw.dur;
+    let t = (now - tw.start) / POS_TWEEN_MS;
     if(t >= 1){ m.setLatLng([tw.eLat,tw.eLon]); activeTweens.delete(id); return; }
     if(t < 0) t = 0;
     // Off-screen: no visual benefit, jump straight to the fix and drop it.
     if(!bounds.contains(m.getLatLng()) && !bounds.contains(L.latLng(tw.eLat,tw.eLon))){
       m.setLatLng([tw.eLat,tw.eLon]); activeTweens.delete(id); return;
     }
-    // Linear: constant velocity matches real vehicle motion across the gap. (easeOut would
-    // make every vehicle decelerate into each fix and look like it stops and restarts.)
-    m.setLatLng([ tw.sLat+(tw.eLat-tw.sLat)*t, tw.sLon+(tw.eLon-tw.sLon)*t ]);
+    // easeOutQuad: decelerates into the new fix, so the update reads as a smooth settle
+    // rather than a hard snap. Monotonic, so the marker stays on the segment between fixes.
+    const k = t*(2-t);
+    m.setLatLng([ tw.sLat+(tw.eLat-tw.sLat)*k, tw.sLon+(tw.eLon-tw.sLon)*k ]);
   });
   followPinnedIfNeeded(false);
   tweenRafId = activeTweens.size ? requestAnimationFrame(tweenTick) : null;
@@ -466,15 +536,22 @@ function ensureShapesForViewport(){
 let _shapeViewTimer=null;
 map.on("moveend zoomend",()=>{ clearTimeout(_shapeViewTimer); _shapeViewTimer=setTimeout(ensureShapesForViewport,400); });
 
-// Stash popup HTML on the marker and only push it into the DOM when that popup is actually
-// open. With 1000+ vehicles this avoids 1000 Leaflet setPopupContent calls every poll for
-// popups nobody is looking at.
-function setMarkerPopup(m, html){
-  m._popupHtml = html;
-  if(m.isPopupOpen && m.isPopupOpen()) m.setPopupContent(html);
+// Popups are built only when actually opened. With 1000+ vehicles, building popup HTML for
+// every marker every poll is pure waste since nobody is looking at most of them. We store
+// the raw fields on the marker and assemble the HTML in the popupopen handler / on refresh.
+function buildPopupForMarker(m){
+  const base=buildPopup(
+    m.routeName||"Unknown", m.destination||"Unknown", m.vehicleLabel||"N/A",
+    m.busType||"", m.licensePlate||"N/A", m.speedStr||"", m.scheduleLine||"",
+    m.occupancy||"", m.bikesLine||"", m.extraLines||""
+  );
+  return base + (m.pairedTo?`<br><b>Paired to:</b> ${m.pairedTo} (6-car)`:"");
+}
+function refreshOpenPopup(m){
+  if(m && m.isPopupOpen && m.isPopupOpen()) m.setPopupContent(buildPopupForMarker(m));
 }
 
-function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
+function addOrUpdateMarker(id,lat,lon,color,type,tripId,fields={}){
   const isMobile=window.innerWidth<=600;
   const baseRadius=isMobile?6:5;
   const popupOpts={maxWidth:isMobile?220:260,className:"vehicle-popup"};
@@ -482,12 +559,12 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
   if(vehicleMarkers[id]){
     const m=vehicleMarkers[id];
     const prevType=m.currentType;            // before fields overwrite it
-    queuePositionTween(id,m,lat,lon);        // glide between consecutive reported fixes
-    setMarkerPopup(m,popupContent);          // lazy: only touches the DOM if the popup is open
+    queuePositionTween(id,m,lat,lon);        // glide once toward the new reported fix
     if(m._fillColor!==color){ m.setStyle({fillColor:color}); m._fillColor=color; }
     m.tripId=tripId;
     if(m._baseRadius==null) m._baseRadius=baseRadius;
     Object.assign(m,fields);
+    refreshOpenPopup(m);                      // only rebuilds HTML if this popup is open
 
     // Only touch layer membership when the mode actually changed (removing/re-adding to
     // four layer groups every poll for every vehicle is expensive and pointless).
@@ -500,11 +577,11 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
     marker._baseRadius=baseRadius;
     marker._fillColor=color;
     (vehicleLayers[type]||vehicleLayers.out).addLayer(marker);
-    marker.bindPopup("",popupOpts);          // content is materialised lazily on open
-    marker._popupHtml=popupContent;
+    Object.assign(marker,fields);             // store fields BEFORE binding so open can build
+    marker.bindPopup("",popupOpts);           // content is materialised lazily on open
 
     if(!marker._eventsBound){
-      marker.on("popupopen",function(){ if(this._popupHtml) this.setPopupContent(this._popupHtml); });
+      marker.on("popupopen",function(){ this.setPopupContent(buildPopupForMarker(this)); });
       marker.on("mouseover",function(){ if(pinnedPopup!==this) this.openPopup(); });
       marker.on("mouseout", function(){ if(pinnedPopup!==this) this.closePopup(); });
       marker.on("click",    function(e){
@@ -518,7 +595,6 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
     }
 
     marker.tripId=tripId;
-    Object.assign(marker,fields);
     vehicleMarkers[id]=marker;
   }
 }
@@ -782,20 +858,26 @@ async function fetchTripsBatch(tripIds){
     const tripJson=await safeFetch(`${tripsUrl}?ids=${ids.join(",")}`);
     if(!tripJson || tripJson._rateLimited){ if(tripJson&&tripJson._rateLimited) applyRateLimitBackoff(tripJson.retryAfterMs,"trips"); continue; }
     if(tripJson?.data?.length>0){
+      const freshTrips=[];
       tripJson.data.forEach(t=>{
         const a=t.attributes;
-        if(a){ tripCache[a.trip_id]={trip_id:a.trip_id,trip_headsign:a.trip_headsign||"N/A",route_id:a.route_id,bikes_allowed:a.bikes_allowed,shape_id:a.shape_id}; }
+        if(a){
+          const obj={trip_id:a.trip_id,trip_headsign:a.trip_headsign||"N/A",route_id:a.route_id,bikes_allowed:a.bikes_allowed,shape_id:a.shape_id};
+          tripCache[a.trip_id]=obj;
+          freshTrips.push(obj);
+        }
       });
-  
+      idbPutTrips(freshTrips); // persist so future sessions skip /api/trips for these
+
+      // Fill in the route/destination now that the trip is known, then refresh only the
+      // popup that happens to be open. No per-vehicle HTML building otherwise.
       ids.forEach(tid=>{
         const trip=tripCache[tid]; if(!trip) return;
         const ms=markersByTrip.get(tid); if(!ms||!ms.length) return;
         const r=routes[trip.route_id]||{};
-        ms.forEach(m=>{
-          const base=buildPopup(r.route_short_name||r.route_long_name||"Unknown",trip.trip_headsign||r.route_long_name||"Unknown",m.vehicleLabel||"N/A",m.busType||"",m.licensePlate||"N/A",m.speedStr||"",m.scheduleLine||"",m.occupancy||"",m.bikesLine||"");
-          const pair=m.pairedTo?`<br><b>Paired to:</b> ${m.pairedTo} (6-car)`:``;
-          setMarkerPopup(m,base+pair);
-        });
+        const routeName=r.route_short_name||r.route_long_name||"Unknown";
+        const destination=trip.trip_headsign||r.route_long_name||"Unknown";
+        ms.forEach(m=>{ m.routeName=routeName; m.destination=destination; refreshOpenPopup(m); });
       });
     }
   }
@@ -815,7 +897,7 @@ function pairAMTrains(inSvc,outOfService){
   pairs.forEach(p=>{
     const inColor=p.inTrain.color||vehicleColors.train;
     const outM=vehicleMarkers[p.outTrain.vehicleId], inM=vehicleMarkers[p.inTrain.vehicleId];
-    if(outM){ outM.setStyle({fillColor:inColor}); const c=outM._popupHtml||""; setMarkerPopup(outM,c+`<br><b>Paired to:</b> ${p.inTrain.vehicleLabel} (6-car)`); outM.pairedTo=p.inTrain.vehicleLabel; }
+    if(outM){ outM.setStyle({fillColor:inColor}); outM._fillColor=inColor; outM.pairedTo=p.inTrain.vehicleLabel; refreshOpenPopup(outM); }
     if(inM) inM.pairedTo=p.outTrain.vehicleLabel;
   });
   return pairs;
@@ -823,8 +905,8 @@ function pairAMTrains(inSvc,outOfService){
 
 function renderFromCache(c){
   if(!c) return;
-  c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.popupContent,v.color,v.typeKey,v.tripId,{
-    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||""
+  c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.color,v.typeKey,v.tripId,{
+    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||"",routeName:v.routeName||"Unknown",destination:v.destination||"Unknown",extraLines:v.extraLines||""
   }));
   const ts = c[0]?.ts || Date.now();
   setDebug(`Showing cached data (last update: ${new Date(ts).toLocaleTimeString()})`);
@@ -863,11 +945,6 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     const vehicles=json?.response?.entity||json?.entity||[];
     const newIds=new Set(), inServiceAM=[], outOfServiceAM=[], allTripIds=[], cachedState=[];
     vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear(); markersByTrip.clear();
-
-    // Glide each marker over the gap actually observed between successful polls, so motion
-    // is continuous rather than a brief hop. Clamped to absorb backoff / missed polls.
-    const _gapNow=Date.now();
-    if(lastPollOkTs) posTweenMs=Math.min(POS_TWEEN_MAX,Math.max(POS_TWEEN_MIN,_gapNow-lastPollOkTs));
 
     // Schedule adherence: prefer trip_update entities already in the combined feed (free).
     // If the feed carries vehicles but no trip updates, fall back to the dedicated feed.
@@ -1002,15 +1079,13 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       const delaySec=(typeKey!=="out" && tripId) ? delayForTrip(delayMap.get(tripId), stopSeq) : null;
       const scheduleLine=scheduleLineHtml(delaySec);
 
-      const popup=buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,scheduleLine,occupancy,bikesLine,extraLines);
-
       if(vehicleLabel.startsWith("AM")){
         if(typeKey==="train") inServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel,color});
         else outOfServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel});
       }
 
-      addOrUpdateMarker(vehicleId,lat,lon,popup,color,typeKey,tripId,{
-        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine
+      addOrUpdateMarker(vehicleId,lat,lon,color,typeKey,tripId,{
+        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine,routeName,destination,extraLines
       });
 
       if(tripId){
@@ -1029,7 +1104,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         routeIndex.get(rk).add(vehicleMarkers[vehicleId]);
       }
 
-      cachedState.push({vehicleId,lat,lon,popupContent:popup,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine});
+      cachedState.push({vehicleId,lat,lon,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine,routeName,destination,extraLines});
     });
 
     pairAMTrains(inServiceAM,outOfServiceAM);
@@ -1124,8 +1199,23 @@ window.addEventListener("focus",()=>{ resumeUpdatesNow(); });
 window.addEventListener("blur",()=>{ schedulePauseAfterHide(); });
 
 async function init(){
-  const rj=await safeFetch(routesUrl); if(rj&&rj._rateLimited) applyRateLimitBackoff(rj.retryAfterMs,"routes");
-  if(rj?.data){ rj.data.forEach(r=>{const a=r.attributes||r; routes[r.id]={route_type:a.route_type,route_short_name:a.route_short_name,route_long_name:a.route_long_name,route_color:a.route_color,agency_id:a.agency_id};}); }
+  // Load persisted trips/shapes (and prune expired) before anything fetches, so the first
+  // poll's trip/shape lookups hit warm caches instead of the network.
+  try{ await idbHydrateAndPrune(); }catch{}
+
+  // Routes: reuse a fresh cached copy and skip /api/routes entirely; otherwise fetch + store.
+  let routesReady=false;
+  try{
+    const rc=await idbGet("routes");
+    if(rc && rc.data && (Date.now()-(rc.t||0))<TTL_ROUTES){ routes=rc.data; routesReady=true; }
+  }catch{}
+  if(!routesReady){
+    const rj=await safeFetch(routesUrl); if(rj&&rj._rateLimited) applyRateLimitBackoff(rj.retryAfterMs,"routes");
+    if(rj?.data){
+      rj.data.forEach(r=>{const a=r.attributes||r; routes[r.id]={route_type:a.route_type,route_short_name:a.route_short_name,route_long_name:a.route_long_name,route_color:a.route_color,agency_id:a.agency_id};});
+      idbPutMany([["routes",{t:Date.now(),data:routes}]]);
+    }
+  }
 
   const bj=await safeFetch(busTypesUrl);
   if(bj && !bj._rateLimited){ busTypes=bj; busTypeIndex=buildBusTypeIndex(bj); }
