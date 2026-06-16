@@ -15,7 +15,7 @@ const esriImagery= L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/serv
 const esriLabels = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",{attribution:"Labels © Esri",maxZoom:20});
 const esriHybrid = L.layerGroup([esriImagery, esriLabels]);
 
-const map = L.map("map",{center:[-36.8485,174.7633],zoom:12,layers:[light],zoomControl:false});
+const map = L.map("map",{center:[-36.8485,174.7633],zoom:12,layers:[light],zoomControl:false,preferCanvas:true,renderer:L.canvas({padding:0.5})});
 const baseMaps = {"Light":light,"Dark":dark,"OSM":osm,"Satellite":satellite,"Esri Hybrid":esriHybrid};
 L.control.layers(baseMaps,null).addTo(map);
 
@@ -27,6 +27,7 @@ let routes={}, busTypes={}, busTypeIndex={};
 const vehicleIndexByFleet=new Map();  
 const routeIndex=new Map();         
 const oosIndexByFleet=new Map();
+const markersByTrip=new Map();        // tripId -> [markers], rebuilt each poll for O(1) trip lookups
 const debugBox=document.getElementById("debug");
 const mobileUpdateEl=document.getElementById("mobile-last-update");
 
@@ -81,6 +82,18 @@ function setLastUpdateTs(ts){
   const mm = String(t.getMinutes()).padStart(2,"0");
   const ss = String(t.getSeconds()).padStart(2,"0");
   mobileUpdateEl.textContent = `Last update: ${hh}:${mm}:${ss}`;
+}
+
+// Persist the fleet snapshot at most every 45s, on the idle queue, so a full-fleet
+// JSON.stringify never blocks the frame on a poll. The cache only needs to be "recent
+// enough" to seed a cold load, not perfectly current.
+let lastSnapSaveTs=0;
+function saveSnapshot(state){
+  const now=Date.now();
+  if(now-lastSnapSaveTs < 45000) return;
+  lastSnapSaveTs=now;
+  const write=()=>{ try{ localStorage.setItem("realtimeSnapshot",JSON.stringify(state)); }catch{} };
+  if(window.requestIdleCallback) requestIdleCallback(write,{timeout:3000}); else setTimeout(write,0);
 }
 
 function parseRetryAfterMs(v){ if(!v) return 0; const s=Number(v); if(!isNaN(s)) return Math.max(0,Math.floor(s*1000)); const t=Date.parse(v); return isNaN(t)?0:Math.max(0,t-Date.now()); }
@@ -336,19 +349,22 @@ function followPinnedIfNeeded(animate){
 
 // ===================== Position tween (between consecutive reported fixes) ============
 // Glides each marker from its previous reported position to the new reported position
-// over POS_TWEEN_MS. This interpolates ONLY between two known truths: it never advances a
-// marker past the latest fix, so it cannot invent position the way dead reckoning did.
-// The loop is self-stopping (no perpetual rAF) and skips work that has no visual benefit
-// (hidden tab, reduced-motion, off-screen markers, large jumps).
-const POS_TWEEN_MS = 300;   // glide duration toward each new reported position
+// over the measured poll gap (posTweenMs), giving continuous motion instead of a brief
+// hop. This interpolates ONLY between two known truths: it never advances a marker past
+// the latest fix, so it cannot invent position the way dead reckoning did. The loop is
+// self-stopping (no perpetual rAF when idle/hidden) and skips work that has no visual
+// benefit (hidden tab, reduced-motion, off-screen markers, large jumps).
 const TWEEN_SNAP_M = 1000;  // jumps larger than this snap instantly (glitch / reappearance)
+const POS_TWEEN_MIN = 5000, POS_TWEEN_MAX = 30000; // clamp for the adaptive glide duration
+let posTweenMs = 12000;     // updated every poll to the measured inter-poll gap (clamped)
 const prefersReducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 
-const activeTweens = new Map(); // vehicleId -> {sLat,sLon,eLat,eLon,start}
+const activeTweens = new Map(); // vehicleId -> {sLat,sLon,eLat,eLon,start,dur}
 let tweenRafId = null;
 
-// Queue a marker to glide toward (eLat,eLon). Snaps instead of tweening when animation
-// would be pointless or misleading.
+// Queue a marker to glide toward (eLat,eLon) over the current poll gap, so motion is
+// continuous between fixes instead of a 300ms hop followed by ~20s of stillness. Still
+// pure interpolation: the marker never passes the latest reported fix.
 function queuePositionTween(id, marker, eLat, eLon){
   const cur = marker.getLatLng();
   if(prefersReducedMotion || !isPageVisible() ||
@@ -357,27 +373,28 @@ function queuePositionTween(id, marker, eLat, eLon){
     marker.setLatLng([eLat,eLon]);
     return;
   }
+  if(cur.lat===eLat && cur.lng===eLon){ activeTweens.delete(id); return; } // no movement, skip
   // Re-seed from the CURRENT (possibly mid-tween) position so retargeting is seamless.
-  activeTweens.set(id,{ sLat:cur.lat, sLon:cur.lng, eLat, eLon, start:performance.now() });
+  activeTweens.set(id,{ sLat:cur.lat, sLon:cur.lng, eLat, eLon, start:performance.now(), dur:posTweenMs });
   if(tweenRafId==null) tweenRafId = requestAnimationFrame(tweenTick);
 }
 
 function tweenTick(now){
+  if(!isPageVisible()){ tweenRafId=null; return; } // resumes when the next poll re-queues
   const bounds = map.getBounds();
   activeTweens.forEach((tw,id)=>{
     const m = vehicleMarkers[id];
     if(!m){ activeTweens.delete(id); return; }
-    let t = (now - tw.start) / POS_TWEEN_MS;
+    let t = (now - tw.start) / tw.dur;
     if(t >= 1){ m.setLatLng([tw.eLat,tw.eLon]); activeTweens.delete(id); return; }
     if(t < 0) t = 0;
     // Off-screen: no visual benefit, jump straight to the fix and drop it.
     if(!bounds.contains(m.getLatLng()) && !bounds.contains(L.latLng(tw.eLat,tw.eLon))){
       m.setLatLng([tw.eLat,tw.eLon]); activeTweens.delete(id); return;
     }
-    // easeOutQuad: monotonic over [0,1], so the point stays on the segment between the
-    // two fixes (path is identical to linear; only the rate differs).
-    const k = t*(2-t);
-    m.setLatLng([ tw.sLat+(tw.eLat-tw.sLat)*k, tw.sLon+(tw.eLon-tw.sLon)*k ]);
+    // Linear: constant velocity matches real vehicle motion across the gap. (easeOut would
+    // make every vehicle decelerate into each fix and look like it stops and restarts.)
+    m.setLatLng([ tw.sLat+(tw.eLat-tw.sLat)*t, tw.sLon+(tw.eLon-tw.sLon)*t ]);
   });
   followPinnedIfNeeded(false);
   tweenRafId = activeTweens.size ? requestAnimationFrame(tweenTick) : null;
@@ -449,6 +466,14 @@ function ensureShapesForViewport(){
 let _shapeViewTimer=null;
 map.on("moveend zoomend",()=>{ clearTimeout(_shapeViewTimer); _shapeViewTimer=setTimeout(ensureShapesForViewport,400); });
 
+// Stash popup HTML on the marker and only push it into the DOM when that popup is actually
+// open. With 1000+ vehicles this avoids 1000 Leaflet setPopupContent calls every poll for
+// popups nobody is looking at.
+function setMarkerPopup(m, html){
+  m._popupHtml = html;
+  if(m.isPopupOpen && m.isPopupOpen()) m.setPopupContent(html);
+}
+
 function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
   const isMobile=window.innerWidth<=600;
   const baseRadius=isMobile?6:5;
@@ -458,7 +483,7 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
     const m=vehicleMarkers[id];
     const prevType=m.currentType;            // before fields overwrite it
     queuePositionTween(id,m,lat,lon);        // glide between consecutive reported fixes
-    m.setPopupContent(popupContent);
+    setMarkerPopup(m,popupContent);          // lazy: only touches the DOM if the popup is open
     if(m._fillColor!==color){ m.setStyle({fillColor:color}); m._fillColor=color; }
     m.tripId=tripId;
     if(m._baseRadius==null) m._baseRadius=baseRadius;
@@ -475,9 +500,11 @@ function addOrUpdateMarker(id,lat,lon,popupContent,color,type,tripId,fields={}){
     marker._baseRadius=baseRadius;
     marker._fillColor=color;
     (vehicleLayers[type]||vehicleLayers.out).addLayer(marker);
-    marker.bindPopup(popupContent,popupOpts);
+    marker.bindPopup("",popupOpts);          // content is materialised lazily on open
+    marker._popupHtml=popupContent;
 
     if(!marker._eventsBound){
+      marker.on("popupopen",function(){ if(this._popupHtml) this.setPopupContent(this._popupHtml); });
       marker.on("mouseover",function(){ if(pinnedPopup!==this) this.openPopup(); });
       marker.on("mouseout", function(){ if(pinnedPopup!==this) this.closePopup(); });
       marker.on("click",    function(e){
@@ -762,13 +789,12 @@ async function fetchTripsBatch(tripIds){
   
       ids.forEach(tid=>{
         const trip=tripCache[tid]; if(!trip) return;
-        Object.values(vehicleMarkers).forEach(m=>{
-          if(m.tripId===tid){
-            const r=routes[trip.route_id]||{};
-            const base=buildPopup(r.route_short_name||r.route_long_name||"Unknown",trip.trip_headsign||r.route_long_name||"Unknown",m.vehicleLabel||"N/A",m.busType||"",m.licensePlate||"N/A",m.speedStr||"",m.scheduleLine||"",m.occupancy||"",m.bikesLine||"");
-            const pair=m.pairedTo?`<br><b>Paired to:</b> ${m.pairedTo} (6-car)`:``;
-            m.setPopupContent(base+pair);
-          }
+        const ms=markersByTrip.get(tid); if(!ms||!ms.length) return;
+        const r=routes[trip.route_id]||{};
+        ms.forEach(m=>{
+          const base=buildPopup(r.route_short_name||r.route_long_name||"Unknown",trip.trip_headsign||r.route_long_name||"Unknown",m.vehicleLabel||"N/A",m.busType||"",m.licensePlate||"N/A",m.speedStr||"",m.scheduleLine||"",m.occupancy||"",m.bikesLine||"");
+          const pair=m.pairedTo?`<br><b>Paired to:</b> ${m.pairedTo} (6-car)`:``;
+          setMarkerPopup(m,base+pair);
         });
       });
     }
@@ -789,7 +815,7 @@ function pairAMTrains(inSvc,outOfService){
   pairs.forEach(p=>{
     const inColor=p.inTrain.color||vehicleColors.train;
     const outM=vehicleMarkers[p.outTrain.vehicleId], inM=vehicleMarkers[p.inTrain.vehicleId];
-    if(outM){ outM.setStyle({fillColor:inColor}); const c=outM.getPopup()?.getContent()||""; outM.getPopup().setContent(c+`<br><b>Paired to:</b> ${p.inTrain.vehicleLabel} (6-car)`); outM.pairedTo=p.inTrain.vehicleLabel; }
+    if(outM){ outM.setStyle({fillColor:inColor}); const c=outM._popupHtml||""; setMarkerPopup(outM,c+`<br><b>Paired to:</b> ${p.inTrain.vehicleLabel} (6-car)`); outM.pairedTo=p.inTrain.vehicleLabel; }
     if(inM) inM.pairedTo=p.outTrain.vehicleLabel;
   });
   return pairs;
@@ -836,7 +862,12 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     const vehicles=json?.response?.entity||json?.entity||[];
     const newIds=new Set(), inServiceAM=[], outOfServiceAM=[], allTripIds=[], cachedState=[];
-    vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear();
+    vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear(); markersByTrip.clear();
+
+    // Glide each marker over the gap actually observed between successful polls, so motion
+    // is continuous rather than a brief hop. Clamped to absorb backoff / missed polls.
+    const _gapNow=Date.now();
+    if(lastPollOkTs) posTweenMs=Math.min(POS_TWEEN_MAX,Math.max(POS_TWEEN_MIN,_gapNow-lastPollOkTs));
 
     // Schedule adherence: prefer trip_update entities already in the combined feed (free).
     // If the feed carries vehicles but no trip updates, fall back to the dedicated feed.
@@ -982,6 +1013,11 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine
       });
 
+      if(tripId){
+        let arr=markersByTrip.get(tripId); if(!arr){ arr=[]; markersByTrip.set(tripId,arr); }
+        arr.push(vehicleMarkers[vehicleId]);
+      }
+
       if(vehicleLabel){
         const norm=normalizeFleetLabel(vehicleLabel);
         if(typeKey!=="out") vehicleIndexByFleet.set(norm,vehicleMarkers[vehicleId]);
@@ -1008,7 +1044,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     followPinnedIfNeeded(true);
 
     const nowTs = Date.now();
-    localStorage.setItem("realtimeSnapshot",JSON.stringify(cachedState));
+    saveSnapshot(cachedState);
     setDebug(`Realtime update complete at ${new Date(nowTs).toLocaleTimeString()}`);
     setLastUpdateTs(nowTs);
     lastPollOkTs=nowTs;
