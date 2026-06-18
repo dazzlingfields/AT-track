@@ -48,6 +48,11 @@ const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"
 const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8"};
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 
+// At/above this zoom, bus + train markers render as a labelled pill showing the route
+// code (e.g. "STH", "70"). Below it they stay as plain dots to avoid clutter when the
+// whole region is in view. Tune to taste.
+const LABEL_MIN_ZOOM=13;
+
 
 const MIN_POLL_MS=15000, MAX_POLL_MS=27000;
 function basePollDelay(){return MIN_POLL_MS+Math.floor(Math.random()*(MAX_POLL_MS-MIN_POLL_MS+1));}
@@ -551,6 +556,98 @@ function refreshOpenPopup(m){
   if(m && m.isPopupOpen && m.isPopupOpen()) m.setPopupContent(buildPopupForMarker(m));
 }
 
+// ===================== Labelled canvas markers =====================
+// Vehicles are drawn straight onto Leaflet's shared canvas (preferCanvas), so labels are
+// drawn onto that same canvas rather than as DOM nodes. This keeps the route code "inside"
+// the marker with zero extra DOM and redraws for free inside the existing tween/redraw
+// pipeline (setLatLng -> canvas _draw -> layer._updatePath). At low zoom we fall back to
+// the plain dot to avoid clutter.
+
+// Short code shown in the pill. Trains collapse to the line code (STH/EAST/WEST/ONE);
+// buses use the route_short_name (the bus number). Ferry/out-of-service get no label.
+function badgeForRoute(typeKey, routeName){
+  if(typeKey==="train"){
+    const s=(routeName||"").toUpperCase();
+    if(s.includes("STH")||s.includes("SOUTH")) return "STH";
+    if(s.includes("WEST")) return "WEST";
+    if(s.includes("EAST")) return "EAST";
+    if(s.includes("ONE")||s.includes("ONEHUNGA")) return "ONE";
+    return (s.split(/\s+/)[0]||"").slice(0,4) || "TRN";
+  }
+  if(typeKey==="bus"){
+    const s=(routeName||"").trim();
+    if(!s || s==="Unknown" || s==="Out of service") return "";
+    return s.length>6 ? s.slice(0,6) : s; // guard against a route_long_name fallback
+  }
+  return ""; // ferry / out -> plain dot
+}
+
+// Pick black or white text for legibility over the pill's fill colour.
+function badgeTextColor(hex){
+  const c=(hex||"").replace("#","");
+  if(c.length<6) return "#fff";
+  const r=parseInt(c.slice(0,2),16), g=parseInt(c.slice(2,4),16), b=parseInt(c.slice(4,6),16);
+  const L=(0.299*r+0.587*g+0.114*b)/255;
+  return L>0.6 ? "#111" : "#fff";
+}
+
+function roundRectPath(ctx,x,y,w,h,r){
+  r=Math.min(r,w/2,h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+const LabeledCircleMarker = L.CircleMarker.extend({
+  // Canvas draw hook. Leaflet's canvas renderer calls this for every visible layer each
+  // redraw. We either draw the labelled pill or defer to the stock circle drawing.
+  _updatePath:function(){
+    const z=this._map ? this._map.getZoom() : 99;
+    if(this.badgeText && z>=LABEL_MIN_ZOOM){
+      this._drawBadge();
+    }else{
+      this._badgeBox=null;                 // revert to circular hit-testing
+      this._renderer._updateCircle(this);  // stock dot
+    }
+  },
+  _drawBadge:function(){
+    const r=this._renderer, ctx=r&&r._ctx, p=this._point;
+    if(!ctx||!p) return;
+    const text=this.badgeText;
+    ctx.save();
+    ctx.font='700 11px -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif';
+    ctx.textAlign="center";
+    ctx.textBaseline="middle";
+    const tw=ctx.measureText(text).width;
+    const H=15, padX=6;
+    const W=Math.max(H, Math.ceil(tw)+padX*2);
+    const x=p.x-W/2, y=p.y-H/2;
+    this._badgeBox={hw:W/2, hh:H/2};       // rectangular hit area for clicks/hover
+    roundRectPath(ctx,x,y,W,H,H/2);
+    ctx.fillStyle=this._fillColor||vehicleColors.bus;
+    ctx.fill();
+    ctx.lineWidth=this.options.weight||1;  // thickens to 3 on search highlight
+    ctx.strokeStyle="rgba(0,0,0,0.55)";
+    ctx.stroke();
+    ctx.fillStyle=badgeTextColor(this._fillColor||vehicleColors.bus);
+    ctx.fillText(text,p.x,p.y+0.5);
+    ctx.restore();
+    r._drawnLayers[this._leaflet_id]=this;  // mirror _updateCircle's bookkeeping
+  },
+  // Hit-test the pill rectangle when labelled, else the circle.
+  _containsPoint:function(point){
+    if(this._badgeBox){
+      const b=this._badgeBox, t=this._clickTolerance();
+      return Math.abs(point.x-this._point.x)<=b.hw+t && Math.abs(point.y-this._point.y)<=b.hh+t;
+    }
+    return point.distanceTo(this._point)<=this._radius+this._clickTolerance();
+  }
+});
+
 function addOrUpdateMarker(id,lat,lon,color,type,tripId,fields={}){
   const isMobile=window.innerWidth<=600;
   const baseRadius=isMobile?6:5;
@@ -573,11 +670,11 @@ function addOrUpdateMarker(id,lat,lon,color,type,tripId,fields={}){
       (vehicleLayers[type]||vehicleLayers.out).addLayer(m);
     }
   }else{
-    const marker=L.circleMarker([lat,lon],{radius:baseRadius,fillColor:color,color:"#000",weight:1,opacity:1,fillOpacity:0.9});
+    const marker=new LabeledCircleMarker([lat,lon],{radius:baseRadius,fillColor:color,color:"#000",weight:1,opacity:1,fillOpacity:0.9});
     marker._baseRadius=baseRadius;
     marker._fillColor=color;
+    Object.assign(marker,fields);             // store fields BEFORE first draw/bind so label + popup build
     (vehicleLayers[type]||vehicleLayers.out).addLayer(marker);
-    Object.assign(marker,fields);             // store fields BEFORE binding so open can build
     marker.bindPopup("",popupOpts);           // content is materialised lazily on open
 
     if(!marker._eventsBound){
@@ -877,7 +974,7 @@ async function fetchTripsBatch(tripIds){
         const r=routes[trip.route_id]||{};
         const routeName=r.route_short_name||r.route_long_name||"Unknown";
         const destination=trip.trip_headsign||r.route_long_name||"Unknown";
-        ms.forEach(m=>{ m.routeName=routeName; m.destination=destination; refreshOpenPopup(m); });
+        ms.forEach(m=>{ m.routeName=routeName; m.destination=destination; m.badgeText=badgeForRoute(m.currentType,routeName); m.redraw(); refreshOpenPopup(m); });
       });
     }
   }
@@ -906,7 +1003,7 @@ function pairAMTrains(inSvc,outOfService){
 function renderFromCache(c){
   if(!c) return;
   c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.color,v.typeKey,v.tripId,{
-    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||"",routeName:v.routeName||"Unknown",destination:v.destination||"Unknown",extraLines:v.extraLines||""
+    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||"",routeName:v.routeName||"Unknown",destination:v.destination||"Unknown",extraLines:v.extraLines||"",badgeText:v.badgeText??badgeForRoute(v.typeKey,v.routeName||"")
   }));
   const ts = c[0]?.ts || Date.now();
   setDebug(`Showing cached data (last update: ${new Date(ts).toLocaleTimeString()})`);
@@ -1084,8 +1181,9 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         else outOfServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel});
       }
 
+      const badgeText=badgeForRoute(typeKey,routeName);
       addOrUpdateMarker(vehicleId,lat,lon,color,typeKey,tripId,{
-        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine,routeName,destination,extraLines
+        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText
       });
 
       if(tripId){
@@ -1104,7 +1202,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         routeIndex.get(rk).add(vehicleMarkers[vehicleId]);
       }
 
-      cachedState.push({vehicleId,lat,lon,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine,routeName,destination,extraLines});
+      cachedState.push({vehicleId,lat,lon,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText});
     });
 
     pairAMTrains(inServiceAM,outOfServiceAM);
