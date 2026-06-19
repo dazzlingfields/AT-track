@@ -615,7 +615,7 @@ let stopsData=[], stopsRailFerry=[], stopsBus=[], stopsEnabled=true;
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
 try{ map.createPane("stopsPane"); map.getPane("stopsPane").style.zIndex=250; }catch{}
-const stopsRenderer=L.canvas({pane:"stopsPane",padding:0.5});
+const stopsRenderer=L.canvas({pane:"stopsPane",padding:0.5,tolerance:10}); // +10px hit area so tiny bus dots are easy to tap
 const stopsLayer=L.layerGroup();
 
 const STOP_STYLE={
@@ -641,10 +641,10 @@ function nearestStop(lat,lon,maxKm){
 
 function makeStopMarker(s){
   const st=STOP_STYLE[s[4]]||STOP_STYLE[0];
-  const m=L.circleMarker([s[0],s[1]],{renderer:stopsRenderer,radius:st.radius,color:st.color,weight:st.weight,fillColor:st.fill,fillOpacity:0.95,opacity:1});
+  const m=L.circleMarker([s[0],s[1]],{renderer:stopsRenderer,radius:st.radius,color:st.color,weight:st.weight,fillColor:st.fill,fillOpacity:0.95,opacity:1,interactive:true,bubblingMouseEvents:false});
   m.bindPopup(`<div style="font-size:0.9em;line-height:1.3;"><b>${escapeHtml(s[3])}</b><br>Stop ${escapeHtml(String(s[2]||"—"))} &middot; ${st.label}</div>`,{maxWidth:220,className:"vehicle-popup"});
-  m.on("mouseover",function(){ this.openPopup(); });
-  m.on("mouseout", function(){ this.closePopup(); });
+  // Open on click/tap (bindPopup's default). Works on both desktop and touch and stays open
+  // until dismissed, unlike the old hover behaviour which vanished as the cursor moved off.
   return m;
 }
 
