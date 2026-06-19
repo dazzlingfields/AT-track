@@ -49,9 +49,9 @@ const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8"
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 
 // At/above this zoom, bus + train markers render as a labelled pill showing the route
-// code (e.g. "STH", "70"). Below it they stay as plain dots to avoid clutter when the
-// whole region is in view. Tune to taste.
-const LABEL_MIN_ZOOM=13;
+// code (e.g. "STH", "70"); below it they stay as plain dots. 12 is the default map zoom, so
+// labels are visible from the opening view. Raise it (13-14) if the wide view feels cluttered.
+const LABEL_MIN_ZOOM=12;
 
 
 const MIN_POLL_MS=15000, MAX_POLL_MS=27000;
@@ -907,43 +907,67 @@ function roundRectPath(ctx,x,y,w,h,r){
   ctx.closePath();
 }
 
+// Badge geometry is computed independently of the render context (off-screen measuring
+// canvas) so it is available in _updateBounds, which runs on project/zoom before any draw.
+// Font auto-shrinks a step for longer codes so the text always fits the pill.
+const _badgeMeasureCtx = document.createElement("canvas").getContext("2d");
+function badgeFont(text){ return `700 ${(text||"").length>4?10:11}px -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif`; }
+function badgeMetrics(text){
+  const t=text||"";
+  let tw;
+  if(_badgeMeasureCtx){ _badgeMeasureCtx.font=badgeFont(t); tw=_badgeMeasureCtx.measureText(t).width; }
+  else { tw=t.length*(t.length>4?10:11)*0.62; } // rough fallback if no 2D context
+  const H=16, padX=6;
+  const W=Math.max(H, Math.ceil(tw)+padX*2);
+  return {W,H,hw:W/2,hh:H/2,tw};
+}
+
+
 const LabeledCircleMarker = L.CircleMarker.extend({
-  // Canvas draw hook. Leaflet's canvas renderer calls this for every visible layer each
-  // redraw. We either draw the labelled pill or defer to the stock circle drawing.
-  _updatePath:function(){
-    const z=this._map ? this._map.getZoom() : 99;
-    if(this.badgeText && z>=LABEL_MIN_ZOOM){
-      this._drawBadge();
+  _labelled:function(){ return !!(this.badgeText && this._map && this._map.getZoom()>=LABEL_MIN_ZOOM); },
+  // Cache pill geometry, recomputing only when the text changes.
+  _badgeMetrics:function(){
+    if(this._bm_text!==this.badgeText){ this._bm_text=this.badgeText; this._bm=this.badgeText?badgeMetrics(this.badgeText):null; }
+    return this._bm;
+  },
+  // Critical: report bounds covering the whole pill (not just the dot) when labelled, so the
+  // canvas renderer clears/repaints the full label and never leaves it half-erased by a
+  // neighbour's redraw rectangle. Off-screen culling still works because the bounds are real.
+  _updateBounds:function(){
+    if(this._labelled()){
+      const m=this._badgeMetrics(), w=this._clickTolerance();
+      const p=L.point(m.hw+w, m.hh+w);
+      this._pxBounds=new L.Bounds(this._point.subtract(p), this._point.add(p));
     }else{
-      this._badgeBox=null;                 // revert to circular hit-testing
-      this._renderer._updateCircle(this);  // stock dot
+      L.CircleMarker.prototype._updateBounds.call(this);
     }
+  },
+  _updatePath:function(){
+    if(this._labelled()) this._drawBadge();
+    else { this._badgeBox=null; this._renderer._updateCircle(this); }
   },
   _drawBadge:function(){
     const r=this._renderer, ctx=r&&r._ctx, p=this._point;
     if(!ctx||!p) return;
-    const text=this.badgeText;
+    if(this._pxBounds && r._bounds && !r._bounds.intersects(this._pxBounds)) return; // off-screen
+    const text=this.badgeText, m=this._badgeMetrics();
+    const x=p.x-m.hw, y=p.y-m.hh;
+    this._badgeBox={hw:m.hw, hh:m.hh};            // rectangular hit area for clicks/hover
     ctx.save();
-    ctx.font='700 11px -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif';
-    ctx.textAlign="center";
-    ctx.textBaseline="middle";
-    const tw=ctx.measureText(text).width;
-    const H=15, padX=6;
-    const W=Math.max(H, Math.ceil(tw)+padX*2);
-    const x=p.x-W/2, y=p.y-H/2;
-    this._badgeBox={hw:W/2, hh:H/2};       // rectangular hit area for clicks/hover
-    roundRectPath(ctx,x,y,W,H,H/2);
+    roundRectPath(ctx,x,y,m.W,m.H,m.H/2);
     ctx.fillStyle=this._fillColor||vehicleColors.bus;
     ctx.fill();
-    ctx.lineWidth=this.options.weight||1;  // thickens to 3 on search highlight
+    ctx.lineWidth=this.options.weight||1;         // thickens to 3 on search highlight
     ctx.strokeStyle="rgba(0,0,0,0.55)";
     ctx.stroke();
+    ctx.font=badgeFont(text);
+    ctx.textAlign="center";
+    ctx.textBaseline="middle";
     ctx.fillStyle=badgeTextColor(this._fillColor||vehicleColors.bus);
     ctx.fillText(text,p.x,p.y+0.5);
     ctx.restore();
-    r._drawnLayers[this._leaflet_id]=this;  // mirror _updateCircle's bookkeeping
+    r._drawnLayers[this._leaflet_id]=this;
   },
-  // Hit-test the pill rectangle when labelled, else the circle.
   _containsPoint:function(point){
     if(this._badgeBox){
       const b=this._badgeBox, t=this._clickTolerance();
