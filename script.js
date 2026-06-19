@@ -918,15 +918,22 @@ function roundRectPath(ctx,x,y,w,h,r){
 // canvas) so it is available in _updateBounds, which runs on project/zoom before any draw.
 // Font auto-shrinks a step for longer codes so the text always fits the pill.
 const _badgeMeasureCtx = document.createElement("canvas").getContext("2d");
-function badgeFont(text){ return `700 ${(text||"").length>4?10:11}px -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif`; }
+// Fixed pill size for visual consistency: every badge is the same width/height regardless of
+// code length. Longer codes (e.g. "WEST") get a slightly smaller font so they still fit,
+// while short codes (e.g. "70") keep the base size, centred in the same pill.
+const BADGE_W=36, BADGE_H=16, BADGE_PADX=5, BADGE_FONT_MAX=11, BADGE_FONT_MIN=8;
+function badgeFontStr(fs){ return `700 ${fs}px -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif`; }
 function badgeMetrics(text){
   const t=text||"";
-  let tw;
-  if(_badgeMeasureCtx){ _badgeMeasureCtx.font=badgeFont(t); tw=_badgeMeasureCtx.measureText(t).width; }
-  else { tw=t.length*(t.length>4?10:11)*0.62; } // rough fallback if no 2D context
-  const H=16, padX=6;
-  const W=Math.max(H, Math.ceil(tw)+padX*2);
-  return {W,H,hw:W/2,hh:H/2,tw};
+  const inner=BADGE_W-BADGE_PADX*2;
+  let fs=BADGE_FONT_MAX;
+  if(_badgeMeasureCtx){
+    for(; fs>BADGE_FONT_MIN; fs--){ _badgeMeasureCtx.font=badgeFontStr(fs); if(_badgeMeasureCtx.measureText(t).width<=inner) break; }
+  }else{
+    const est=t.length*BADGE_FONT_MAX*0.62;            // rough fallback if no 2D context
+    if(est>inner) fs=Math.max(BADGE_FONT_MIN, Math.floor(BADGE_FONT_MAX*inner/est));
+  }
+  return {W:BADGE_W,H:BADGE_H,hw:BADGE_W/2,hh:BADGE_H/2,fontSize:fs};
 }
 
 
@@ -956,7 +963,7 @@ const LabeledCircleMarker = L.CircleMarker.extend({
     ctx.lineWidth=this.options.weight||1;         // thickens to 3 on search highlight
     ctx.strokeStyle="rgba(0,0,0,0.55)";
     ctx.stroke();
-    ctx.font=badgeFont(text);
+    ctx.font=badgeFontStr(m.fontSize);
     ctx.textAlign="center";
     ctx.textBaseline="middle";
     ctx.fillStyle=badgeTextColor(this._fillColor||vehicleColors.bus);
