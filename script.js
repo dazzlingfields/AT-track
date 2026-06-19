@@ -45,7 +45,7 @@ map.on("dragstart", ()=> { pinnedFollow=false; });
 map.on("popupclose", ()=> { pinnedFollow=false; });
 
 const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"};
-const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8"};
+const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8",HUIA:"#8e44ad"};
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 
 // At/above this zoom, bus + train markers render as a labelled pill showing the route
@@ -767,6 +767,81 @@ async function loadStops(){
   }catch{}
   setDebug("No stop data found (add stops_train.csv / stops_bus.csv)");
 }
+
+// ===================== Rail line geometry (optional GeoJSON) ==========================
+// The AT "Train Route" CSV export has attributes but no geometry, so route lines come from
+// a GeoJSON export of the same layer (Download > GeoJSON on the AT Open GIS Data portal,
+// or append ?f=geojson to the layer's REST query). Same replaceable-file workflow: drop in
+// train_routes.geojson, reload, lines redraw. Lines are coloured by line code and sit on
+// their own pane beneath everything else. Absent file -> layer simply never appears.
+const RAIL_LINES_FILE="train_routes.geojson";
+let railLinesLayer=null, railLinesEnabled=true;
+const RAIL_DEDUPE_BY_LINE=true; // keep only the longest pattern per line code (clean overview)
+
+try{ map.createPane("railPane"); map.getPane("railPane").style.zIndex=240; }catch{}
+
+function railLineColor(props){
+  const p=props||{};
+  const s=`${p.ROUTENUMBER??p.routenumber??p.ROUTE??""} ${p.ROUTENAME??p.routename??""}`.toUpperCase();
+  if(s.includes("STH")||s.includes("SOUTH")) return trainLineColors.STH;
+  if(s.includes("WEST")) return trainLineColors.WEST;
+  if(s.includes("EAST")) return trainLineColors.EAST;
+  if(s.includes("ONE")||s.includes("ONEHUNGA")) return trainLineColors.ONE;
+  if(s.includes("HUIA")||s.includes("HAMILTON")) return trainLineColors.HUIA;
+  return vehicleColors.train;
+}
+
+async function loadRailLines(){
+  let gj=null;
+  try{
+    const res=await fetch(RAIL_LINES_FILE,{cache:"no-cache"}); // revalidate so new commits show up
+    if(!res.ok) return;
+    gj=await res.json();
+  }catch{ return; }
+  if(railLinesLayer){ try{ map.removeLayer(railLinesLayer); }catch{} railLinesLayer=null; }
+
+  // AT's export carries every pattern variant (dozens of overlapping Southern Line copies),
+  // so for a clean network overview keep only the longest pattern per line code. Works the
+  // same whether the file is the slim shipped one or a raw multi-pattern AT export.
+  const feats=(gj?.features||[]).filter(f=>{ const m=String(f?.properties?.MODE??f?.properties?.mode??"").toLowerCase(); return !m || m.includes("train")||m.includes("rail"); });
+  const keep=new Set();
+  if(RAIL_DEDUPE_BY_LINE){
+    const longest=new Map(); // line code -> {len, id}
+    feats.forEach(f=>{
+      const p=f.properties||{};
+      const code=String(p.ROUTENUMBER??p.routenumber??p.OBJECTID??Math.random()).toUpperCase();
+      const len=Number(p.Shape__Length??p.shape__length??0)||0;
+      const id=p.OBJECTID??p.objectid??f;
+      const cur=longest.get(code);
+      if(!cur || len>cur.len) longest.set(code,{len,id});
+    });
+    longest.forEach(v=>keep.add(v.id));
+  }
+  const keepFeature=f=>{ const p=f.properties||{}; return !RAIL_DEDUPE_BY_LINE || keep.has(p.OBJECTID??p.objectid??f); };
+
+  try{
+    railLinesLayer=L.geoJSON(gj,{
+      pane:"railPane",
+      filter:f=>{ const m=String(f?.properties?.MODE??f?.properties?.mode??"").toLowerCase(); return (!m || m.includes("train")||m.includes("rail")) && keepFeature(f); },
+      style:f=>({color:railLineColor(f.properties),weight:3,opacity:0.65,lineJoin:"round",lineCap:"round"}),
+      onEachFeature:(f,layer)=>{
+        const p=f.properties||{};
+        const nm=p.ROUTENAME||p.routename||p.ROUTENUMBER||p.routenumber||"Train route";
+        layer.bindTooltip(String(nm),{sticky:true});
+      },
+    });
+    if(railLinesEnabled) railLinesLayer.addTo(map);
+    setDebug(`Rail lines loaded (${railLinesLayer.getLayers().length} segments)`);
+  }catch(e){ console.warn("[rail] bad GeoJSON", e); }
+}
+
+function setRailLinesEnabled(on){
+  railLinesEnabled=on;
+  if(!railLinesLayer) return;
+  if(on){ if(!map.hasLayer(railLinesLayer)) railLinesLayer.addTo(map); }
+  else map.removeLayer(railLinesLayer);
+}
+
 
 
 // Popups are built only when actually opened. With 1000+ vehicles, building popup HTML for
@@ -1555,6 +1630,7 @@ async function init(){
     cb.addEventListener("change",e=>{
       const layer=e.target.getAttribute("data-layer");
       if(layer==="stops"){ setStopsEnabled(e.target.checked); }
+      else if(layer==="rail"){ setRailLinesEnabled(e.target.checked); }
       else if(vehicleLayers[layer]){ if(e.target.checked) map.addLayer(vehicleLayers[layer]); else map.removeLayer(vehicleLayers[layer]); }
       updateControlsHeight();
     });
@@ -1564,6 +1640,11 @@ async function init(){
   const stopsCb=document.querySelector('#filters input[data-layer="stops"]');
   if(stopsCb) stopsEnabled=stopsCb.checked;
   loadStops();
+
+  // Same for the optional rail-line GeoJSON overlay.
+  const railCb=document.querySelector('#filters input[data-layer="rail"]');
+  if(railCb) railLinesEnabled=railCb.checked;
+  loadRailLines();
 
   updateControlsHeight();
 
