@@ -15,7 +15,13 @@ const esriImagery= L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/serv
 const esriLabels = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",{attribution:"Labels © Esri",maxZoom:20});
 const esriHybrid = L.layerGroup([esriImagery, esriLabels]);
 
-const map = L.map("map",{center:[-36.8485,174.7633],zoom:12,layers:[light],zoomControl:false,preferCanvas:true,renderer:L.canvas({padding:0.5})});
+const vehicleRenderer = L.canvas({padding:0.5});
+const map = L.map("map",{center:[-36.8485,174.7633],zoom:12,layers:[light],zoomControl:false,preferCanvas:true,renderer:vehicleRenderer});
+// Force the vehicle canvas to clear and repaint the WHOLE canvas on every redraw instead of
+// just the changed markers' rectangles. Labels are wider than their dots, so partial-rect
+// redraws left them half-erased by neighbours and made them vanish during tween/zoom. Full
+// redraws cannot ghost or partially-erase; off-screen markers still self-cull in their draw.
+vehicleRenderer._extendRedrawBounds = function(){};
 const baseMaps = {"Light":light,"Dark":dark,"OSM":osm,"Satellite":satellite,"Esri Hybrid":esriHybrid};
 L.control.layers(baseMaps,null).addTo(map);
 
@@ -48,10 +54,11 @@ const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"
 const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8",HUIA:"#8e44ad"};
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 
-// At/above this zoom, bus + train markers render as a labelled pill showing the route
-// code (e.g. "STH", "70"); below it they stay as plain dots. 12 is the default map zoom, so
-// labels are visible from the opening view. Raise it (13-14) if the wide view feels cluttered.
-const LABEL_MIN_ZOOM=12;
+// At/above this zoom, bus + train markers render as a labelled pill showing the route code
+// (e.g. "STH", "70"); below it they stay as plain dots. Kept at suburb level so the full-city
+// view stays light and pannable. Raise for fewer labels, lower (to 12) for the whole-region
+// view, but expect heavier rendering when hundreds are on screen at once.
+const LABEL_MIN_ZOOM=13;
 
 
 const MIN_POLL_MS=15000, MAX_POLL_MS=27000;
@@ -930,18 +937,6 @@ const LabeledCircleMarker = L.CircleMarker.extend({
     if(this._bm_text!==this.badgeText){ this._bm_text=this.badgeText; this._bm=this.badgeText?badgeMetrics(this.badgeText):null; }
     return this._bm;
   },
-  // Critical: report bounds covering the whole pill (not just the dot) when labelled, so the
-  // canvas renderer clears/repaints the full label and never leaves it half-erased by a
-  // neighbour's redraw rectangle. Off-screen culling still works because the bounds are real.
-  _updateBounds:function(){
-    if(this._labelled()){
-      const m=this._badgeMetrics(), w=this._clickTolerance();
-      const p=L.point(m.hw+w, m.hh+w);
-      this._pxBounds=new L.Bounds(this._point.subtract(p), this._point.add(p));
-    }else{
-      L.CircleMarker.prototype._updateBounds.call(this);
-    }
-  },
   _updatePath:function(){
     if(this._labelled()) this._drawBadge();
     else { this._badgeBox=null; this._renderer._updateCircle(this); }
@@ -949,8 +944,9 @@ const LabeledCircleMarker = L.CircleMarker.extend({
   _drawBadge:function(){
     const r=this._renderer, ctx=r&&r._ctx, p=this._point;
     if(!ctx||!p) return;
-    if(this._pxBounds && r._bounds && !r._bounds.intersects(this._pxBounds)) return; // off-screen
+    if(this._empty && this._empty()){ this._badgeBox=null; return; } // off-screen: same test stock circles use
     const text=this.badgeText, m=this._badgeMetrics();
+    if(!m){ this._renderer._updateCircle(this); return; }
     const x=p.x-m.hw, y=p.y-m.hh;
     this._badgeBox={hw:m.hw, hh:m.hh};            // rectangular hit area for clicks/hover
     ctx.save();
@@ -966,7 +962,6 @@ const LabeledCircleMarker = L.CircleMarker.extend({
     ctx.fillStyle=badgeTextColor(this._fillColor||vehicleColors.bus);
     ctx.fillText(text,p.x,p.y+0.5);
     ctx.restore();
-    r._drawnLayers[this._leaflet_id]=this;
   },
   _containsPoint:function(point){
     if(this._badgeBox){
