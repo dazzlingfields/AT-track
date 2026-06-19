@@ -484,24 +484,77 @@ function clearRouteOutline(){
   if(routeOutline?.layer){ try{ map.removeLayer(routeOutline.layer); }catch{} }
   routeOutline=null;
 }
-function drawRouteOutline(shapeId,color){
+// ---- Turf: project a vehicle onto its route shape ------------------------------------
+// Turf works in [lon,lat]; our shapes are [lat,lon]. We cache the turf LineString on the
+// shape object (rebuilt cheaply if absent). nearestPointOnLine snaps the vehicle to the
+// polyline and reports distance travelled along it, which we turn into a progress %, a
+// distance-to-end, and a travelled/remaining split for the drawn outline.
+function buildTurfLine(shape){
+  if(shape._turf!==undefined) return shape._turf;
+  if(typeof turf==="undefined" || !shape.pts || shape.pts.length<2){ shape._turf=null; return null; }
+  try{ shape._turf=turf.lineString(shape.pts.map(p=>[p[1],p[0]])); }
+  catch{ shape._turf=null; }
+  return shape._turf;
+}
+// Returns {frac, alongKm, totalKm, traversed:[[lat,lon]...], remaining:[[lat,lon]...]} or null.
+function projectOnRoute(shape, lat, lon){
+  const line=buildTurfLine(shape);
+  if(!line) return null;
+  try{
+    const totalKm = (shape.total!=null && shape.total>0) ? shape.total/1000 : turf.length(line,{units:"kilometers"});
+    const snap = turf.nearestPointOnLine(line, turf.point([lon,lat]), {units:"kilometers"});
+    const alongKm = snap.properties.location;
+    const coords = line.geometry.coordinates;
+    const toLL = c => c.map(x=>[x[1],x[0]]);
+    const traversed = toLL(turf.lineSlice(turf.point(coords[0]), snap, line).geometry.coordinates);
+    const remaining = toLL(turf.lineSlice(snap, turf.point(coords[coords.length-1]), line).geometry.coordinates);
+    const frac = totalKm>0 ? Math.max(0,Math.min(1, alongKm/totalKm)) : 0;
+    return {frac, alongKm, totalKm, traversed, remaining};
+  }catch{ return null; }
+}
+
+function drawRouteOutline(shapeId,color,proj){
   const shape=shapeCache.get(shapeId);
   if(!shape || !shape.pts?.length){ clearRouteOutline(); return; }
   clearRouteOutline();
-  const casing=L.polyline(shape.pts,{pane:"routePane",color:"#000",opacity:0.22,weight:8,lineJoin:"round",lineCap:"round",interactive:false});
-  const line  =L.polyline(shape.pts,{pane:"routePane",color:color||"#0a84ff",opacity:0.9,weight:4,lineJoin:"round",lineCap:"round",interactive:false});
-  routeOutline={ shapeId, layer:L.layerGroup([casing,line]).addTo(map) };
+  const c=color||"#0a84ff";
+  const layers=[ L.polyline(shape.pts,{pane:"routePane",color:"#000",opacity:0.22,weight:8,lineJoin:"round",lineCap:"round",interactive:false}) ];
+  if(proj && proj.traversed?.length>1 && proj.remaining?.length>1){
+    // Travelled portion dimmed, remaining portion bright, so the vehicle reads as a fill line.
+    layers.push(L.polyline(proj.traversed,{pane:"routePane",color:c,opacity:0.28,weight:4,lineJoin:"round",lineCap:"round",interactive:false}));
+    layers.push(L.polyline(proj.remaining,{pane:"routePane",color:c,opacity:0.95,weight:4,lineJoin:"round",lineCap:"round",interactive:false}));
+  }else{
+    layers.push(L.polyline(shape.pts,{pane:"routePane",color:c,opacity:0.9,weight:4,lineJoin:"round",lineCap:"round",interactive:false}));
+  }
+  routeOutline={ shapeId, layer:L.layerGroup(layers).addTo(map) };
 }
+
+// Progress + nearest-stop line for the pinned vehicle's popup.
+function buildProgressHtml(proj, lat, lon){
+  const bits=[];
+  if(proj && proj.totalKm>0){
+    const pct=Math.round(proj.frac*100);
+    const remKm=Math.max(0, proj.totalKm-proj.alongKm);
+    bits.push(`<b>Route progress:</b> ${pct}% · ${remKm.toFixed(1)} km to end`);
+  }
+  const ns=nearestStop(lat,lon,0.4); // within 400 m
+  if(ns) bits.push(`<b>Nearest stop:</b> ${escapeHtml(ns.name)} (${ns.distM} m)`);
+  return bits.length ? bits.join("<br>") : "";
+}
+
 async function showRouteOutlineFor(marker){
-  if(!marker || marker.currentType==="out" || !marker.tripId){ clearRouteOutline(); return; }
+  if(!marker || marker.currentType==="out" || !marker.tripId){ clearRouteOutline(); if(marker) marker._progressHtml=""; return; }
   const sid=tripCache[marker.tripId]?.shape_id;
-  if(!sid){ clearRouteOutline(); console.warn("[shapes] no shape_id for trip", marker.tripId); setDebug("No shape_id for this trip (check /api/trips passes shape_id)"); return; }
-  if(routeOutline && routeOutline.shapeId===sid) return; // already shown
+  if(!sid){ clearRouteOutline(); marker._progressHtml=""; console.warn("[shapes] no shape_id for trip", marker.tripId); setDebug("No shape_id for this trip (check /api/trips passes shape_id)"); return; }
   if(!shapeCache.has(sid)) await fetchShapes([sid]);
   if(pinnedPopup!==marker) return;                       // selection changed while fetching
   const shape=shapeCache.get(sid);
-  if(!shape){ clearRouteOutline(); console.warn("[shapes] empty/failed shape", sid, "- check /api/shapes?ids="+sid); setDebug("Route shape unavailable (open /api/shapes?ids="+sid+" to see _diag)"); return; }
-  drawRouteOutline(sid, marker.options?.fillColor || vehicleColors.bus);
+  if(!shape){ clearRouteOutline(); marker._progressHtml=""; console.warn("[shapes] empty/failed shape", sid, "- check /api/shapes?ids="+sid); setDebug("Route shape unavailable (open /api/shapes?ids="+sid+" to see _diag)"); return; }
+  const ll=marker.getLatLng();
+  const proj=projectOnRoute(shape, ll.lat, ll.lng);
+  drawRouteOutline(sid, marker.options?.fillColor || vehicleColors.bus, proj);
+  marker._progressHtml=buildProgressHtml(proj, ll.lat, ll.lng);
+  refreshOpenPopup(marker);
 }
 
 // ---- Lazy shape fetching (deduped, viewport-limited, capped) -------------------------
@@ -541,6 +594,181 @@ function ensureShapesForViewport(){
 let _shapeViewTimer=null;
 map.on("moveend zoomend",()=>{ clearTimeout(_shapeViewTimer); _shapeViewTimer=setTimeout(ensureShapesForViewport,400); });
 
+// ===================== Stops & stations ==============================================
+// Stop geometry is not in the realtime feed, so it loads once from a static stops.json
+// (generate it from a current AT GTFS export with build-stops.mjs). Stations and ferry
+// terminals are few and act as map landmarks, so they show across the region; bus stops
+// are dense, so they only appear when zoomed right in. Only the stops inside the current
+// viewport are drawn, on their own canvas pane beneath the vehicles, capped for safety.
+const STOP_MIN_ZOOM_RAILFERRY = 11;
+const STOP_MIN_ZOOM_BUS       = 16;
+const STOP_RENDER_CAP         = 800;
+let stopsData=[], stopsRailFerry=[], stopsBus=[], stopsEnabled=true;
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+try{ map.createPane("stopsPane"); map.getPane("stopsPane").style.zIndex=250; }catch{}
+const stopsRenderer=L.canvas({pane:"stopsPane",padding:0.5});
+const stopsLayer=L.layerGroup();
+
+const STOP_STYLE={
+  1:{radius:5,color:trainLineColors.STH,fill:"#fff",weight:2,label:"Rail station"},
+  2:{radius:5,color:vehicleColors.ferry,fill:"#fff",weight:2,label:"Ferry terminal"},
+  0:{radius:3,color:"#666",fill:"#fff",weight:1,label:"Bus stop"},
+};
+
+// Nearest stop to a point via a bbox prefilter + great-circle distance (reuses haversineM).
+function nearestStop(lat,lon,maxKm){
+  if(!stopsData.length) return null;
+  const dLat=maxKm/111, dLon=maxKm/(111*Math.cos(lat*Math.PI/180)||1);
+  let best=null,bestD=Infinity;
+  for(let i=0;i<stopsData.length;i++){
+    const s=stopsData[i];
+    if(Math.abs(s[0]-lat)>dLat || Math.abs(s[1]-lon)>dLon) continue;
+    const d=haversineM(lat,lon,s[0],s[1]);
+    if(d<bestD){ bestD=d; best=s; }
+  }
+  if(!best || bestD>maxKm*1000) return null;
+  return {name:best[3], distM:Math.round(bestD)};
+}
+
+function makeStopMarker(s){
+  const st=STOP_STYLE[s[4]]||STOP_STYLE[0];
+  const m=L.circleMarker([s[0],s[1]],{renderer:stopsRenderer,radius:st.radius,color:st.color,weight:st.weight,fillColor:st.fill,fillOpacity:0.95,opacity:1});
+  m.bindPopup(`<div style="font-size:0.9em;line-height:1.3;"><b>${escapeHtml(s[3])}</b><br>Stop ${escapeHtml(String(s[2]||"—"))} &middot; ${st.label}</div>`,{maxWidth:220,className:"vehicle-popup"});
+  m.on("mouseover",function(){ this.openPopup(); });
+  m.on("mouseout", function(){ this.closePopup(); });
+  return m;
+}
+
+function renderStopsForViewport(){
+  if(!stopsEnabled || !stopsData.length){ stopsLayer.clearLayers(); return; }
+  const z=map.getZoom();
+  const showRailFerry=z>=STOP_MIN_ZOOM_RAILFERRY;
+  const showBus=z>=STOP_MIN_ZOOM_BUS;
+  stopsLayer.clearLayers();
+  if(!showRailFerry && !showBus) return;
+  const b=map.getBounds().pad(0.2);
+  const south=b.getSouth(),north=b.getNorth(),west=b.getWest(),east=b.getEast();
+  const inView=s=>s[0]>=south&&s[0]<=north&&s[1]>=west&&s[1]<=east;
+  // Stations/ferries first (always drawn when visible), then bus stops up to the cap.
+  if(showRailFerry) for(const s of stopsRailFerry){ if(inView(s)) stopsLayer.addLayer(makeStopMarker(s)); }
+  if(showBus){ let n=0; for(const s of stopsBus){ if(!inView(s)) continue; stopsLayer.addLayer(makeStopMarker(s)); if(++n>=STOP_RENDER_CAP) break; } }
+}
+
+let _stopsTimer=null;
+function scheduleStopsRender(){ clearTimeout(_stopsTimer); _stopsTimer=setTimeout(renderStopsForViewport,250); }
+map.on("moveend zoomend", scheduleStopsRender);
+
+function setStopsEnabled(on){
+  stopsEnabled=on;
+  if(on){ if(!map.hasLayer(stopsLayer)) map.addLayer(stopsLayer); renderStopsForViewport(); }
+  else { map.removeLayer(stopsLayer); stopsLayer.clearLayers(); }
+}
+
+// Stop geometry is loaded directly from AT CSV exports hosted alongside the site, so
+// refreshing the data is just "replace the CSV and reload" with no build step. Drop the
+// AT downloads in as these filenames (extra files, e.g. a ferry export, can be appended).
+// Each CSV carries WGS84 lat/lon and a Mode column, which is all we need; train platforms
+// are collapsed to one marker per parent station.
+const STOP_CSV_FILES = ["stops_train.csv", "stops_bus.csv", "stops_ferry.csv"];
+
+// Quote-aware single-line CSV splitter (handles "a,b" and escaped "").
+function csvSplitLine(line){
+  const out=[]; let cur="", inQ=false;
+  for(let i=0;i<line.length;i++){
+    const c=line[i];
+    if(inQ){ if(c==='"'){ if(line[i+1]==='"'){ cur+='"'; i++; } else inQ=false; } else cur+=c; }
+    else { if(c==='"') inQ=true; else if(c===","){ out.push(cur); cur=""; } else cur+=c; }
+  }
+  out.push(cur); return out;
+}
+const _normHdr = h => h.toLowerCase().replace(/[^a-z0-9]/g,"");
+function _pickCol(idx, cands){ for(const c of cands){ if(idx[c]!=null) return idx[c]; } return -1; }
+
+// Parse one AT stops CSV into {lat,lon,name,code,type,parent} rows. Header matching is
+// case/space-insensitive so the differing bus ("Stop Latitude") and train ("STOPLAT")
+// schemas both work. Mode column sets type: 1 rail, 2 ferry, 0 bus.
+function parseStopsCsv(text){
+  const out=[];
+  const rows=text.replace(/^\uFEFF/,"").split(/\r?\n/);
+  if(rows.length<2) return out;
+  const header=csvSplitLine(rows[0]).map(_normHdr);
+  const idx={}; header.forEach((h,i)=>{ if(idx[h]==null) idx[h]=i; });
+  const ci={
+    lat:    _pickCol(idx,["stoplat","stoplatitude","latitude","lat"]),
+    lon:    _pickCol(idx,["stoplon","stoplongitude","longitude","lon","lng"]),
+    name:   _pickCol(idx,["stopname","name"]),
+    code:   _pickCol(idx,["stopcode","code"]),
+    mode:   _pickCol(idx,["mode"]),
+    parent: _pickCol(idx,["parentstation","parent"]),
+  };
+  if(ci.lat<0||ci.lon<0||ci.name<0) return out;
+  for(let i=1;i<rows.length;i++){
+    if(!rows[i]) continue;
+    const f=csvSplitLine(rows[i]);
+    const lat=parseFloat(f[ci.lat]), lon=parseFloat(f[ci.lon]);
+    if(!isFinite(lat)||!isFinite(lon)) continue;
+    const name=(f[ci.name]||"").trim(); if(!name) continue;
+    const modeStr=ci.mode>=0?(f[ci.mode]||""):"";
+    const type=/train|rail/i.test(modeStr)?1:(/ferry/i.test(modeStr)?2:0);
+    out.push({
+      lat, lon, name,
+      code:   ci.code>=0?(f[ci.code]||"").trim():"",
+      parent: ci.parent>=0?(f[ci.parent]||"").trim():"",
+      type,
+    });
+  }
+  return out;
+}
+
+// Bus stops are kept as-is; rail/ferry collapse to one entry per parent station (or cleaned
+// name), dropping per-platform duplicates and the trailing platform number in the label.
+function dedupeStops(rows){
+  const seen=new Set(), res=[];
+  for(const s of rows){
+    if(s.type===0){ res.push([s.lat,s.lon,s.code,s.name,0]); continue; }
+    const clean=s.name.replace(/\s+(platform\s*)?\d+$/i,"").trim();
+    const key=s.type+"|"+(s.parent||clean.toLowerCase());
+    if(seen.has(key)) continue;
+    seen.add(key);
+    res.push([s.lat,s.lon,s.code,clean,s.type]);
+  }
+  return res;
+}
+
+function afterStopsLoaded(){
+  stopsRailFerry=stopsData.filter(s=>s[4]!==0);
+  stopsBus=stopsData.filter(s=>s[4]===0);
+  if(stopsEnabled){ if(!map.hasLayer(stopsLayer)) map.addLayer(stopsLayer); renderStopsForViewport(); }
+}
+
+async function loadStops(){
+  const rows=[];
+  for(const file of STOP_CSV_FILES){
+    try{
+      const res=await fetch(file,{cache:"no-cache"}); // revalidate so new commits show up
+      if(!res.ok) continue;
+      const parsed=parseStopsCsv(await res.text());
+      if(parsed.length) rows.push(...parsed);
+    }catch{}
+  }
+  if(rows.length){
+    stopsData=dedupeStops(rows);
+    const c=stopsData.reduce((a,s)=>(a[s[4]]=(a[s[4]]||0)+1,a),{});
+    setDebug(`Stops loaded: ${c[1]||0} rail, ${c[2]||0} ferry, ${c[0]||0} bus`);
+    afterStopsLoaded();
+    return;
+  }
+  // Fallback: prebuilt stops.json from the older build-script workflow, if present.
+  try{
+    const r=await fetch("stops.json",{cache:"force-cache"});
+    if(r.ok){ const j=await r.json(); if(Array.isArray(j?.stops)){ stopsData=j.stops; afterStopsLoaded(); return; } }
+  }catch{}
+  setDebug("No stop data found (add stops_train.csv / stops_bus.csv)");
+}
+
+
 // Popups are built only when actually opened. With 1000+ vehicles, building popup HTML for
 // every marker every poll is pure waste since nobody is looking at most of them. We store
 // the raw fields on the marker and assemble the HTML in the popupopen handler / on refresh.
@@ -550,7 +778,9 @@ function buildPopupForMarker(m){
     m.busType||"", m.licensePlate||"N/A", m.speedStr||"", m.scheduleLine||"",
     m.occupancy||"", m.bikesLine||"", m.extraLines||""
   );
-  return base + (m.pairedTo?`<br><b>Paired to:</b> ${m.pairedTo} (6-car)`:"");
+  return base
+    + (m._progressHtml?`<div style="font-size:0.9em;line-height:1.3;margin-top:3px;">${m._progressHtml}</div>`:"")
+    + (m.pairedTo?`<br><b>Paired to:</b> ${m.pairedTo} (6-car)`:"");
 }
 function refreshOpenPopup(m){
   if(m && m.isPopupOpen && m.isPopupOpen()) m.setPopupContent(buildPopupForMarker(m));
@@ -1324,10 +1554,16 @@ async function init(){
   document.querySelectorAll('#filters input[type="checkbox"]').forEach(cb=>{
     cb.addEventListener("change",e=>{
       const layer=e.target.getAttribute("data-layer");
-      if(vehicleLayers[layer]){ if(e.target.checked) map.addLayer(vehicleLayers[layer]); else map.removeLayer(vehicleLayers[layer]); }
+      if(layer==="stops"){ setStopsEnabled(e.target.checked); }
+      else if(vehicleLayers[layer]){ if(e.target.checked) map.addLayer(vehicleLayers[layer]); else map.removeLayer(vehicleLayers[layer]); }
       updateControlsHeight();
     });
   });
+
+  // Sync stops toggle to its checkbox state, then load stop geometry.
+  const stopsCb=document.querySelector('#filters input[data-layer="stops"]');
+  if(stopsCb) stopsEnabled=stopsCb.checked;
+  loadStops();
 
   updateControlsHeight();
 
