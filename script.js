@@ -241,10 +241,11 @@ function buildExtraLines(ex){
   return lines.length?("<br>"+lines.join("<br>")):"";
 }
 
-function buildPopup(routeName,destination,vehicleLabel,busType,licensePlate,speedStr,scheduleLine,occupancy,bikesLine,extraLines){
+function buildPopup(routeName,destination,nextStopLine,vehicleLabel,busType,licensePlate,speedStr,scheduleLine,occupancy,bikesLine,extraLines){
   return `<div style="font-size:0.9em;line-height:1.3;">
       <b>Route:</b> ${routeName}<br>
       <b>Destination:</b> ${destination}<br>
+      ${nextStopLine?`${nextStopLine}<br>`:""}
       <b>Vehicle:</b> ${vehicleLabel}<br>
       ${busType?`<b>Bus model:</b> ${busType}<br>`:""}
       <b>Number plate:</b> ${licensePlate}<br>
@@ -269,19 +270,25 @@ function buildDelayMap(entities){
   }
   return map;
 }
-function delayForTrip(tu, currentStopSeq){
+// Pick the stop_time_update most relevant to "now": the earliest stop at or beyond the
+// vehicle's current stop sequence (i.e. the next stop), falling back to the final stop.
+function pickRelevantStu(tu, currentStopSeq){
   if(!tu) return null;
   const stus=tu.stop_time_update||tu.stopTimeUpdate||[];
-  let chosen=null;
-  if(currentStopSeq!=null && stus.length){
+  if(!stus.length) return null;
+  if(currentStopSeq!=null){
     let best=null;
     for(const s of stus){
       const seq=toNum(s.stop_sequence ?? s.stopSequence); if(seq==null) continue;
       if(seq>=currentStopSeq && (best==null || seq<best.seq)) best={seq,s};
     }
-    chosen=best?.s || null;
+    if(best) return best.s;
   }
-  if(!chosen && stus.length) chosen=stus[stus.length-1];
+  return stus[stus.length-1];
+}
+function delayForTrip(tu, currentStopSeq){
+  if(!tu) return null;
+  const chosen=pickRelevantStu(tu,currentStopSeq);
   let delay=null;
   if(chosen){
     const arr=chosen.arrival, dep=chosen.departure;
@@ -289,6 +296,17 @@ function delayForTrip(tu, currentStopSeq){
   }
   if(delay==null) delay=toNum(tu.delay); // some feeds carry a trip-level delay
   return delay;
+}
+// Next-stop id + predicted time + delay for the vehicle's trip, from the same trip update.
+function nextStopInfo(tu, currentStopSeq){
+  const s=pickRelevantStu(tu,currentStopSeq);
+  if(!s) return null;
+  const stopId = s.stop_id ?? s.stopId ?? null;
+  const arr=s.arrival, dep=s.departure;
+  const timeSec = toNum(arr?.time) ?? toNum(dep?.time);
+  let delay=toNum(arr?.delay); if(delay==null) delay=toNum(dep?.delay);
+  const seq=toNum(s.stop_sequence ?? s.stopSequence);
+  return {stopId, timeSec, delay, seq};
 }
 function formatDelay(sec){
   if(sec==null) return "";
@@ -303,6 +321,26 @@ function scheduleLineHtml(sec){
   const txt=formatDelay(sec);
   const col = txt==="On time" ? "#1a8f3c" : (sec>0 ? "#d0021b" : "#0a84ff");
   return `<br><b>Schedule:</b> <span style="color:${col}">${txt}</span>`;
+}
+
+// ---- Next stop (vehicle popup) ------------------------------------------------------
+// Resolves a GTFS stop_id to a station name (built from the stops CSVs) and renders an ETA
+// from the trip update's predicted arrival time. Degrades to the raw id, then to nothing.
+function stopNameForId(id){ if(id===null||id===undefined||id==="") return ""; return stopById.get(String(id))||""; }
+function formatEta(timeSec){
+  const t=toNum(timeSec); if(t===null||t<=0) return "";
+  const s=Math.round(t-Date.now()/1000);
+  if(s<=-90) return "";          // clearly stale prediction: show no ETA rather than a lie
+  if(s<30) return "due";
+  const m=Math.round(s/60);
+  return m<=1 ? "in 1 min" : `in ${m} min`;
+}
+function buildNextStopLine(info, fallbackStopId){
+  const stopId = (info && info.stopId!=null) ? info.stopId : (fallbackStopId ?? null);
+  if(stopId===null||stopId===undefined||stopId==="") return "";
+  const name = stopNameForId(stopId) || `Stop ${stopId}`;
+  const eta  = info ? formatEta(info.timeSec) : "";
+  return `<b>Next stop:</b> ${escapeHtml(name)}${eta?` · ${eta}`:""}`;
 }
 
 // Fallback path: only used if the combined realtime feed carries no trip updates.
@@ -612,6 +650,15 @@ const STOP_MIN_ZOOM_BUS       = 16;
 const STOP_RENDER_CAP         = 800;
 let stopsData=[], stopsRailFerry=[], stopsBus=[], stopsEnabled=true;
 
+// Lookups built from the stops CSVs, used to name a vehicle's next stop and to group live
+// arrivals at a station. stopById maps every GTFS stop_id (and parent_station id) to a clean
+// display name; stopKeyById maps each id to the collapsed station key used for arrivals.
+const stopById     = new Map(); // stop_id -> display name
+const stopKeyById  = new Map(); // stop_id -> stationKey
+const stopNameByKey= new Map(); // stationKey -> display name
+// Rebuilt every poll: stationKey -> [{badge,color,etaSec,delaySec}] of inbound services.
+const arrivalsByStop = new Map();
+
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
 try{ map.createPane("stopsPane"); map.getPane("stopsPane").style.zIndex=250; }catch{}
@@ -639,10 +686,46 @@ function nearestStop(lat,lon,maxKm){
   return {name:best[3], distM:Math.round(bestD)};
 }
 
+// Arrivals board shown inside a station/stop popup. Lists inbound services for which THIS
+// station is the next stop, soonest first. Built from arrivalsByStop (refreshed each poll);
+// content is materialised on each popup open, so reopening reflects the latest poll.
+function buildArrivalsBoard(key){
+  const list = key ? arrivalsByStop.get(key) : null;
+  if(!list || !list.length) return "";
+  const rows = list
+    .map(a=>({a, eta:formatEta(a.etaSec)}))
+    .filter(x=>x.eta!=="")                 // drop stale predictions
+    .sort((x,y)=>(toNum(x.a.etaSec)??1e15)-(toNum(y.a.etaSec)??1e15))
+    .slice(0,6);
+  if(!rows.length) return "";
+  const items = rows.map(({a,eta})=>{
+    const badge = escapeHtml(String(a.badge||"?")).slice(0,6);
+    const when  = eta==="due" ? "due" : eta.replace("in ","");
+    let late="";
+    if(a.delaySec!=null && Math.abs(a.delaySec)>30){
+      const mins=Math.round(a.delaySec/60);
+      late = a.delaySec>0 ? ` <span style="color:#d0021b">+${mins||1}m</span>`
+                          : ` <span style="color:#0a84ff">${mins||-1}m</span>`;
+    }
+    return `<div style="display:flex;justify-content:space-between;gap:10px;margin-top:3px;">
+        <span style="display:inline-block;min-width:34px;text-align:center;background:${a.color};color:${badgeTextColor(a.color)};border-radius:8px;padding:1px 5px;font-weight:700;font-size:11px;">${badge}</span>
+        <span style="text-align:right;white-space:nowrap;">${when}${late}</span>
+      </div>`;
+  }).join("");
+  return `<div style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>Next arrivals</b>${items}</div>`;
+}
+function buildStopPopup(m){
+  const st=STOP_STYLE[m._stopType]||STOP_STYLE[0];
+  const head=`<b>${escapeHtml(m._stopName)}</b><br><span style="color:var(--text-subtle);font-size:0.92em;">Stop ${escapeHtml(String(m._stopCode||"—"))} &middot; ${st.label}</span>`;
+  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${buildArrivalsBoard(m._stopKey)}</div>`;
+}
+
 function makeStopMarker(s){
   const st=STOP_STYLE[s[4]]||STOP_STYLE[0];
   const m=L.circleMarker([s[0],s[1]],{renderer:stopsRenderer,radius:st.radius,color:st.color,weight:st.weight,fillColor:st.fill,fillOpacity:0.95,opacity:1,interactive:true,bubblingMouseEvents:false});
-  m.bindPopup(`<div style="font-size:0.9em;line-height:1.3;"><b>${escapeHtml(s[3])}</b><br>Stop ${escapeHtml(String(s[2]||"—"))} &middot; ${st.label}</div>`,{maxWidth:220,className:"vehicle-popup"});
+  m._stopName=s[3]; m._stopCode=s[2]; m._stopType=s[4]; m._stopKey=s[5];
+  // Function content => rebuilt on every open, so the arrivals board stays current.
+  m.bindPopup(()=>buildStopPopup(m),{maxWidth:240,className:"vehicle-popup"});
   // Open on click/tap (bindPopup's default). Works on both desktop and touch and stays open
   // until dismissed, unlike the old hover behaviour which vanished as the cursor moved off.
   return m;
@@ -709,6 +792,7 @@ function parseStopsCsv(text){
     code:   _pickCol(idx,["stopcode","code"]),
     mode:   _pickCol(idx,["mode"]),
     parent: _pickCol(idx,["parentstation","parent"]),
+    id:     _pickCol(idx,["stopid","stop_id","id","platformid","platform_id"]),
   };
   if(ci.lat<0||ci.lon<0||ci.name<0) return out;
   for(let i=1;i<rows.length;i++){
@@ -723,6 +807,7 @@ function parseStopsCsv(text){
       lat, lon, name,
       code:   ci.code>=0?(f[ci.code]||"").trim():"",
       parent: ci.parent>=0?(f[ci.parent]||"").trim():"",
+      id:     ci.id>=0?(f[ci.id]||"").trim():"",
       type,
     });
   }
@@ -731,15 +816,25 @@ function parseStopsCsv(text){
 
 // Bus stops are kept as-is; rail/ferry collapse to one entry per parent station (or cleaned
 // name), dropping per-platform duplicates and the trailing platform number in the label.
+// Every row (including platforms removed by the collapse) registers its stop_id against the
+// station's clean name and key, so a trip update referencing any platform id still resolves
+// to the right station for naming and the arrivals board. Tuple gains a 6th field: the key.
 function dedupeStops(rows){
+  stopById.clear(); stopKeyById.clear(); stopNameByKey.clear();
   const seen=new Set(), res=[];
   for(const s of rows){
-    if(s.type===0){ res.push([s.lat,s.lon,s.code,s.name,0]); continue; }
-    const clean=s.name.replace(/\s+(platform\s*)?\d+$/i,"").trim();
-    const key=s.type+"|"+(s.parent||clean.toLowerCase());
-    if(seen.has(key)) continue;
-    seen.add(key);
-    res.push([s.lat,s.lon,s.code,clean,s.type]);
+    const isBus = s.type===0;
+    const clean = isBus ? s.name : s.name.replace(/\s+(platform\s*)?\d+$/i,"").trim();
+    const stationKey = isBus
+      ? ("0|"+(s.id||s.code||clean.toLowerCase()))
+      : (s.type+"|"+(s.parent||clean.toLowerCase()));
+    if(s.id){ stopById.set(String(s.id), clean); stopKeyById.set(String(s.id), stationKey); }
+    if(s.parent){ stopById.set(String(s.parent), clean); stopKeyById.set(String(s.parent), stationKey); }
+    stopNameByKey.set(stationKey, clean);
+    if(isBus){ res.push([s.lat,s.lon,s.code,clean,0,stationKey]); continue; }
+    if(seen.has(stationKey)) continue;
+    seen.add(stationKey);
+    res.push([s.lat,s.lon,s.code,clean,s.type,stationKey]);
   }
   return res;
 }
@@ -856,7 +951,7 @@ function setRailLinesEnabled(on){
 // the raw fields on the marker and assemble the HTML in the popupopen handler / on refresh.
 function buildPopupForMarker(m){
   const base=buildPopup(
-    m.routeName||"Unknown", m.destination||"Unknown", m.vehicleLabel||"N/A",
+    m.routeName||"Unknown", m.destination||"Unknown", m.nextStopLine||"", m.vehicleLabel||"N/A",
     m.busType||"", m.licensePlate||"N/A", m.speedStr||"", m.scheduleLine||"",
     m.occupancy||"", m.bikesLine||"", m.extraLines||""
   );
@@ -1334,7 +1429,7 @@ function pairAMTrains(inSvc,outOfService){
 function renderFromCache(c){
   if(!c) return;
   c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.color,v.typeKey,v.tripId,{
-    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||"",routeName:v.routeName||"Unknown",destination:v.destination||"Unknown",extraLines:v.extraLines||"",badgeText:v.badgeText??badgeForRoute(v.typeKey,v.routeName||"")
+    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",nextStopLine:v.nextStopLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||"",routeName:v.routeName||"Unknown",destination:v.destination||"Unknown",extraLines:v.extraLines||"",badgeText:v.badgeText??badgeForRoute(v.typeKey,v.routeName||"")
   }));
   const ts = c[0]?.ts || Date.now();
   setDebug(`Showing cached data (last update: ${new Date(ts).toLocaleTimeString()})`);
@@ -1372,7 +1467,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     const vehicles=json?.response?.entity||json?.entity||[];
     const newIds=new Set(), inServiceAM=[], outOfServiceAM=[], allTripIds=[], cachedState=[];
-    vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear(); markersByTrip.clear();
+    vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear(); markersByTrip.clear(); arrivalsByStop.clear();
 
     // Schedule adherence: prefer trip_update entities already in the combined feed (free).
     // If the feed carries vehicles but no trip updates, fall back to the dedicated feed.
@@ -1504,8 +1599,17 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
       // Schedule adherence for in-service vehicles (uses the current stop sequence to
       // pick the most relevant delay from the trip update).
-      const delaySec=(typeKey!=="out" && tripId) ? delayForTrip(delayMap.get(tripId), stopSeq) : null;
+      const tu=(typeKey!=="out" && tripId) ? delayMap.get(tripId) : null;
+      const delaySec=tu ? delayForTrip(tu, stopSeq) : null;
       const scheduleLine=scheduleLineHtml(delaySec);
+
+      // Next stop: prefer the trip update's next stop_time_update (gives a name + ETA);
+      // fall back to the vehicle's own stop_id when its status says it is heading to one.
+      const nsInfo = tu ? nextStopInfo(tu, stopSeq) : null;
+      const upcoming = (csNum===0 || csNum===2); // Approaching / In transit to
+      const nextStopLine = (typeKey!=="out")
+        ? buildNextStopLine(nsInfo, upcoming ? stopRef : null)
+        : "";
 
       if(vehicleLabel.startsWith("AM")){
         if(typeKey==="train") inServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel,color});
@@ -1513,8 +1617,16 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       }
 
       const badgeText=badgeForRoute(typeKey,routeName);
+
+      // Register this service as an inbound arrival at its next stop, for the station popup.
+      if(typeKey!=="out" && nsInfo && nsInfo.stopId!=null){
+        const key = stopKeyById.get(String(nsInfo.stopId)) || String(nsInfo.stopId);
+        let arr=arrivalsByStop.get(key); if(!arr){ arr=[]; arrivalsByStop.set(key,arr); }
+        arr.push({ badge: badgeText || routeName, color, etaSec: nsInfo.timeSec, delaySec });
+      }
+
       addOrUpdateMarker(vehicleId,lat,lon,color,typeKey,tripId,{
-        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText
+        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText
       });
 
       if(tripId){
@@ -1533,7 +1645,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         routeIndex.get(rk).add(vehicleMarkers[vehicleId]);
       }
 
-      cachedState.push({vehicleId,lat,lon,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,scheduleLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText});
+      cachedState.push({vehicleId,lat,lon,color,typeKey,tripId,ts:Date.now(),vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText});
     });
 
     pairAMTrains(inServiceAM,outOfServiceAM);
