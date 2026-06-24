@@ -46,6 +46,11 @@ let pinnedFollow=false;
 let routeFocusEnabled=false;
 let focusedRouteKey=null;
 
+// Optional marker decorations (drawn on the vehicle canvas, only when zoomed in enough).
+let occupancyRingsEnabled=false;   // ring coloured by how full the vehicle is
+let bearingTicksEnabled=true;      // small arrow showing direction of travel
+const DECOR_MIN_ZOOM=12;           // below this the dots are too small/dense to decorate
+
 map.on("click",()=>{
   if(pinnedPopup){ pinnedPopup.closePopup(); pinnedPopup=null; pinnedFollow=false; }
   clearRouteHighlights();
@@ -60,6 +65,8 @@ map.on("popupclose", ()=> { pinnedFollow=false; });
 const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"};
 const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8",HUIA:"#8e44ad"};
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
+// Ring colours for the optional occupancy overlay, green (empty) -> red (full).
+const OCC_COLORS=["#19a463","#5cb800","#b3a200","#ef9b00","#ef6a00","#e0241b","#7a1410"];
 
 // At/above this zoom, bus + train markers render as a labelled pill showing the route code
 // (e.g. "STH", "70"); below it they stay as plain dots. Kept at suburb level so the full-city
@@ -1310,6 +1317,55 @@ const LabeledCircleMarker = L.CircleMarker.extend({
   _updatePath:function(){
     if(this._labelled()) this._drawBadge();
     else { this._badgeBox=null; this._renderer._updateCircle(this); }
+    this._drawDecor();
+  },
+  // Occupancy ring + heading arrow. Both are optional and only shown when zoomed in.
+  _drawDecor:function(){
+    if(!occupancyRingsEnabled && !bearingTicksEnabled) return;
+    const r=this._renderer, ctx=r&&r._ctx, p=this._point;
+    if(!ctx||!p) return;
+    if(this._empty && this._empty()) return;
+    if(!this._map || this._map.getZoom()<DECOR_MIN_ZOOM) return;
+    const op=(this.options && this.options.opacity!=null)?this.options.opacity:1;
+    if(op<=0.13) return; // skip near-invisible (route-focus dimmed) vehicles
+    const b=this._badgeBox;
+
+    // Occupancy ring: rounded-rect hugging the pill, or a circle around the dot.
+    if(occupancyRingsEnabled && this._occColor){
+      ctx.save();
+      if(op<1) ctx.globalAlpha=op;
+      ctx.lineWidth=2.5; ctx.strokeStyle=this._occColor;
+      if(b){
+        const pad=3;
+        roundRectPath(ctx, p.x-b.hw-pad, p.y-b.hh-pad, (b.hw+pad)*2, (b.hh+pad)*2, b.hh+pad);
+        ctx.stroke();
+      }else{
+        ctx.beginPath(); ctx.arc(p.x,p.y,(this._radius||5)+2.5,0,2*Math.PI); ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // Heading arrow: a small triangle just outside the marker pointing along the bearing.
+    const brg=this.bearingDeg;
+    if(bearingTicksEnabled && brg!=null && isFinite(brg)){
+      const rad=brg*Math.PI/180;
+      const dx=Math.sin(rad), dy=-Math.cos(rad);      // 0deg = north = up
+      const gap=3, size=4.6;
+      const tip=b ? (Math.abs(dx)*b.hw + Math.abs(dy)*b.hh + gap) : (this._radius||5)+gap;
+      const cx=p.x+dx*tip, cy=p.y+dy*tip;             // base centre, sitting on the marker edge
+      const ux=-dy, uy=dx;                            // perpendicular
+      ctx.save();
+      if(op<1) ctx.globalAlpha=op;
+      ctx.beginPath();
+      ctx.moveTo(cx+dx*size, cy+dy*size);             // tip (ahead)
+      ctx.lineTo(cx+ux*size*0.8, cy+uy*size*0.8);
+      ctx.lineTo(cx-ux*size*0.8, cy-uy*size*0.8);
+      ctx.closePath();
+      ctx.fillStyle=this._fillColor||vehicleColors.bus;
+      ctx.fill();
+      ctx.lineWidth=1; ctx.strokeStyle="rgba(0,0,0,0.5)"; ctx.stroke();
+      ctx.restore();
+    }
   },
   _drawBadge:function(){
     const r=this._renderer, ctx=r&&r._ctx, p=this._point;
@@ -1414,48 +1470,100 @@ function updateVehicleCount(){
 // performance over the time the map has been open rather than a single instant. Sampling
 // runs every poll regardless of whether the panel is visible, so opening it shows the full
 // session so far.
-const ONTIME_EARLY_S = -90;    // earlier than this  => "Early"
-const ONTIME_LATE_S  = 300;    // later than this    => "Late"
+const ONTIME_EARLY_S = -90;    // earlier than this  => "Early" bucket
+const ONTIME_LATE_S  = 300;    // later than this    => "Late" bucket
 const DASH_MIN_SAMPLES = 5;    // ignore polls with too few schedule readings to be meaningful
+const SESSION_HISTORY_MAX = 80;// sparkline length (oldest points roll off)
 let dashboardEnabled=false;
-let sessionPolls=0, sessionOnTimeSum=0;
-const sessionStart=Date.now();
+let sessionPolls=0, sessionScoreSum=0;
+let sessionStart=Date.now();
+const sessionHistory=[];       // per-poll graded punctuality score over the session (desktop trend)
 let lastPunctuality=null;
 
 function bucketForDelay(d){ return d<ONTIME_EARLY_S ? "early" : (d>ONTIME_LATE_S ? "late" : "ontime"); }
 
+// Graded punctuality: 1.0 = on time, decaying smoothly with how far off schedule a vehicle
+// is, so a few seconds late counts as essentially on time and only sizeable delays pull the
+// score down. A short grace window stays at 1.0, then an exponential decay (lateness is
+// penalised a little more gently than running early, which strands passengers).
+function punctualityScore(d){
+  const graceLate=60, graceEarly=30, tauLate=300, tauEarly=180;
+  if(d>graceLate)   return Math.exp(-(d-graceLate)/tauLate);
+  if(d<-graceEarly) return Math.exp(-(-d-graceEarly)/tauEarly);
+  return 1;
+}
+
 function updatePunctuality(samples){
   const buckets={early:0,ontime:0,late:0};
-  const byMode={bus:{n:0,ot:0,sum:0},train:{n:0,ot:0,sum:0},ferry:{n:0,ot:0,sum:0}};
+  const byMode={bus:{n:0,sc:0,sum:0},train:{n:0,sc:0,sum:0},ferry:{n:0,sc:0,sum:0}};
   const byRoute=new Map();
-  let n=0;
+  let n=0, sum=0, scoreSum=0;
   for(const s of (samples||[])){
     const d=s.delay; if(d==null) continue;
-    n++;
-    const b=bucketForDelay(d); buckets[b]++;
-    const m=byMode[s.mode]; if(m){ m.n++; m.sum+=d; if(b==="ontime") m.ot++; }
+    n++; sum+=d;
+    const sc=punctualityScore(d); scoreSum+=sc;
+    buckets[bucketForDelay(d)]++;
+    const m=byMode[s.mode]; if(m){ m.n++; m.sc+=sc; m.sum+=d; }
     const rk=normalizeRouteKey(s.route)||"?";
     let r=byRoute.get(rk); if(!r){ r={label:s.route||rk, n:0, sum:0}; byRoute.set(rk,r); }
     r.n++; r.sum+=d;
   }
-  const ontimePct = n ? Math.round(100*buckets.ontime/n) : null;
-  if(n>=DASH_MIN_SAMPLES && ontimePct!=null){ sessionPolls++; sessionOnTimeSum+=ontimePct; }
-  const sessionAvg = sessionPolls ? Math.round(sessionOnTimeSum/sessionPolls) : ontimePct;
+  const pollScore = n ? Math.round(100*scoreSum/n) : null;   // graded, not a hard on-time %
+  const avgDelay  = n ? sum/n : null;
+  if(n>=DASH_MIN_SAMPLES && pollScore!=null){
+    sessionPolls++; sessionScoreSum+=pollScore;
+    sessionHistory.push(pollScore);
+    if(sessionHistory.length>SESSION_HISTORY_MAX) sessionHistory.shift();
+  }
+  const sessionAvg = sessionPolls ? Math.round(sessionScoreSum/sessionPolls) : pollScore;
 
   const worst=[...byRoute.values()]
     .filter(r=>r.n>=2)                       // need a couple of readings to flag a route
     .map(r=>({label:r.label, avg:r.sum/r.n}))
     .filter(r=>r.avg>60)                      // only routes averaging more than a minute late
     .sort((a,b)=>b.avg-a.avg)
-    .slice(0,3);
+    .slice(0,6);                              // desktop shows up to 6 (mobile trims to 3 via CSS)
 
-  lastPunctuality={ n, buckets, ontimePct, sessionAvg, byMode, worst };
+  lastPunctuality={ n, buckets, pollScore, sessionAvg, avgDelay, byMode, worst };
   renderDashboard();
+  savePunctuality();
 }
 
 function fmtMinSec(sec){
   const a=Math.abs(Math.round(sec)), m=Math.floor(a/60), s=a%60;
   return a<60 ? `${a}s` : (s?`${m}m ${s}s`:`${m}m`);
+}
+
+// ---- Persistent session history (survives reloads within PUNCT_MAX_AGE) -------------
+const PUNCT_KEY="punctuality:v1";
+const PUNCT_MAX_AGE_MS=8*60*60*1000;     // older than this on load => start a fresh session
+let _punctSaveTs=0;
+function savePunctuality(){
+  const now=Date.now();
+  if(now-_punctSaveTs<15000) return;     // throttle IDB writes to ~once / 15s
+  _punctSaveTs=now;
+  idbPutMany([[PUNCT_KEY,{ history:sessionHistory.slice(-SESSION_HISTORY_MAX), polls:sessionPolls, sum:sessionScoreSum, start:sessionStart, savedAt:now }]]);
+}
+async function loadPunctuality(){
+  let rec=null; try{ rec=await idbGet(PUNCT_KEY); }catch{}
+  if(!rec || !rec.savedAt || (Date.now()-rec.savedAt)>PUNCT_MAX_AGE_MS) return;
+  if(Array.isArray(rec.history)){ sessionHistory.length=0; for(const v of rec.history) if(typeof v==="number") sessionHistory.push(v); }
+  if(typeof rec.polls==="number") sessionPolls=rec.polls;
+  if(typeof rec.sum==="number")   sessionScoreSum=rec.sum;
+  if(typeof rec.start==="number") sessionStart=rec.start;
+}
+
+// Inline SVG sparkline of the session's punctuality score (0–100 domain). Desktop only.
+function sparklineSVG(vals, w=300, h=40){
+  if(!vals || vals.length<2) return "";
+  const nn=vals.length;
+  const x=i=>(i/(nn-1))*w;
+  const y=v=>h-(Math.max(0,Math.min(100,v))/100)*h;
+  const line=vals.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const area=`0,${h} ${line} ${w},${h}`;
+  return `<svg class="dash-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">`
+    + `<polyline class="spark-area" points="${area}"/>`
+    + `<polyline class="spark-line" points="${line}"/></svg>`;
 }
 
 function renderDashboard(){
@@ -1465,26 +1573,41 @@ function renderDashboard(){
   if(!P || !P.n){ body.innerHTML=`<p class="dash-empty">Waiting for schedule data…</p>`; return; }
 
   const sinceMin=Math.max(1,Math.round((Date.now()-sessionStart)/60000));
+  const total=(P.buckets.early+P.buckets.ontime+P.buckets.late)||1;
+  const pctOf=k=>Math.round(100*P.buckets[k]/total);
+  const avgTxt = P.avgDelay==null ? "—"
+    : (Math.abs(P.avgDelay)<=30 ? "on time"
+      : (P.avgDelay>0 ? `${fmtMinSec(P.avgDelay)} late` : `${fmtMinSec(P.avgDelay)} early`));
+
   const modeRow=(key,name)=>{
     const m=P.byMode[key]; if(!m || !m.n) return "";
-    const pct=Math.round(100*m.ot/m.n);
-    return `<div class="dash-mode"><span class="name">${name}</span><span class="bar"><span style="width:${pct}%"></span></span><span class="pct">${pct}%</span></div>`;
+    const pct=Math.round(100*m.sc/m.n);              // graded score per mode
+    return `<div class="dash-mode"><span class="name">${name}</span><span class="bar"><span style="width:${pct}%"></span></span><span class="pct">${pct}</span></div>`;
   };
   const worstRows=P.worst.length
-    ? P.worst.map(r=>`<div class="dash-route"><span class="badge">${escapeHtml(String(r.label).slice(0,6))}</span><span class="delay">${fmtMinSec(r.avg)} late</span></div>`).join("")
+    ? P.worst.map((r,i)=>`<div class="dash-route${i>=3?" dash-route-extra":""}"><span class="badge">${escapeHtml(String(r.label).slice(0,6))}</span><span class="delay">${fmtMinSec(r.avg)} late</span></div>`).join("")
     : `<p class="dash-empty">Nothing running notably late.</p>`;
+  const trendBlock = sessionHistory.length>=2
+    ? `<div class="dash-subhead dash-desktop-only">Session trend</div><div class="dash-desktop-only">${sparklineSVG(sessionHistory)}</div>`
+    : "";
 
   body.innerHTML=`
     <div class="dash-hero">
-      <span class="num">${P.sessionAvg ?? "—"}</span><span class="unit">%</span>
-      <span class="sub">on time this session<br>${P.n} live · ${sinceMin} min</span>
+      <span class="num">${P.sessionAvg ?? "—"}</span><span class="unit">/100</span>
+      <span class="sub">session punctuality<br>${P.n} live · ${sinceMin} min · avg ${avgTxt}</span>
+    </div>
+    ${trendBlock}
+    <div class="dash-split" role="img" aria-label="Early ${pctOf("early")}%, on time ${pctOf("ontime")}%, late ${pctOf("late")}%">
+      <span class="seg early" style="width:${pctOf("early")}%"></span>
+      <span class="seg ontime" style="width:${pctOf("ontime")}%"></span>
+      <span class="seg late" style="width:${pctOf("late")}%"></span>
     </div>
     <div class="dash-buckets">
       <div class="dash-chip early"><div class="c">${P.buckets.early}</div><div class="l">Early</div></div>
       <div class="dash-chip ontime"><div class="c">${P.buckets.ontime}</div><div class="l">On time</div></div>
       <div class="dash-chip late"><div class="c">${P.buckets.late}</div><div class="l">Late</div></div>
     </div>
-    <div class="dash-subhead">By mode (on time now)</div>
+    <div class="dash-subhead">By mode (punctuality /100)</div>
     ${modeRow("bus","Bus")}${modeRow("train","Train")}${modeRow("ferry","Ferry")}
     <div class="dash-subhead">Running behind</div>
     ${worstRows}
@@ -1497,6 +1620,16 @@ function setDashboardEnabled(on){
   if(el) el.hidden=!on;
   if(on) renderDashboard();
 }
+
+// Repaint the shared vehicle canvas once (used by the marker-decoration toggles).
+function repaintVehicles(){
+  try{
+    if(typeof vehicleRenderer._redraw==="function") vehicleRenderer._redraw();
+    else { for(const id in vehicleMarkers){ vehicleMarkers[id].redraw?.(); break; } }
+  }catch{}
+}
+function setOccupancyRingsEnabled(on){ occupancyRingsEnabled=on; repaintVehicles(); }
+function setBearingTicksEnabled(on){ bearingTicksEnabled=on; repaintVehicles(); }
 
 (function injectExtraStyle(){
   const style=document.createElement("style");
@@ -1896,19 +2029,21 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
           : `${speedKmh.toFixed(1)} km/h${srcTag}`;
       }
 
-      let occupancy="N/A";
+      let occupancy="N/A", occLevel=null;
       const occProto = v.vehicle?.occupancy_status ?? v.vehicle?.occupancyStatus ?? v.vehicle?.occupancy?.status;
       if(occProto!==undefined && occProto!==null){
         if (typeof occProto === "number" && occProto>=0 && occProto<=6) {
-          occupancy = occupancyLabels[occProto];
+          occLevel = occProto;
         } else if (typeof occProto === "string") {
           const key = occProto.trim().toUpperCase();
           const map = {
             "EMPTY":0,"MANY_SEATS_AVAILABLE":1,"FEW_SEATS_AVAILABLE":2,"STANDING_ROOM_ONLY":3,"LIMITED_STANDING_ROOM":4,"FULL":5,"NOT_ACCEPTING_PASSENGERS":6
           };
-          if (map[key] !== undefined) occupancy = occupancyLabels[map[key]];
+          if (map[key] !== undefined) occLevel = map[key];
         }
       }
+      if(occLevel!=null) occupancy = occupancyLabels[occLevel];
+      const occColor = occLevel!=null ? OCC_COLORS[occLevel] : null;
 
       let typeKey="out", color=vehicleColors.out, routeName="Out of service", destination="Unknown";
       if(routeId && tripId && routes[routeId]){
@@ -2010,7 +2145,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       }
 
       addOrUpdateMarker(vehicleId,lat,lon,color,typeKey,tripId,{
-        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText,bearingDeg:(ex.bearingDeg??null)
+        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText,bearingDeg:(ex.bearingDeg??null),_occColor:occColor
       });
 
       if(tripId){
@@ -2156,6 +2291,8 @@ async function init(){
       if(layer==="overlays"){ setOverlaysEnabled(e.target.checked); }
       else if(layer==="focus"){ setRouteFocusEnabled(e.target.checked); }
       else if(layer==="dashboard"){ setDashboardEnabled(e.target.checked); }
+      else if(layer==="occupancy"){ setOccupancyRingsEnabled(e.target.checked); }
+      else if(layer==="bearing"){ setBearingTicksEnabled(e.target.checked); }
       else if(layer==="stops"){ setStopsEnabled(e.target.checked); }
       else if(layer==="rail"){ setRailLinesEnabled(e.target.checked); }
       else if(layer==="frequent"){ setFrequentLinesEnabled(e.target.checked); }
@@ -2176,8 +2313,10 @@ async function init(){
   const focusCb=document.querySelector('#filters input[data-layer="focus"]');
   routeFocusEnabled = focusCb ? focusCb.checked : false;
 
-  // On-time dashboard: sync to its switch (default off) and wire its close button.
+  // On-time dashboard: restore any persisted session history, sync to its switch (default
+  // off) and wire its close button.
   const dashCb=document.querySelector('#filters input[data-layer="dashboard"]');
+  await loadPunctuality();
   setDashboardEnabled(dashCb ? dashCb.checked : false);
   const dashClose=document.getElementById("dashboard-close");
   if(dashClose) dashClose.addEventListener("click",()=>{
@@ -2185,6 +2324,15 @@ async function init(){
     if(cb) cb.checked=false;
     setDashboardEnabled(false);
   });
+  // Flush the session history when the tab is hidden/closed so nothing is lost.
+  const flushPunct=()=>{ _punctSaveTs=0; savePunctuality(); };
+  window.addEventListener("pagehide", flushPunct);
+  document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="hidden") flushPunct(); });
+
+  // Optional marker decorations: heading arrows (default on) and occupancy rings (default off).
+  const bearingCb=document.querySelector('#filters input[data-layer="bearing"]');
+  occupancyRingsEnabled = !!document.querySelector('#filters input[data-layer="occupancy"]')?.checked;
+  bearingTicksEnabled = bearingCb ? bearingCb.checked : true;
 
   // Warm the larger bus_routes.geojson on the idle queue so the first bus click is usually
   // instant, without blocking first paint. Click-time load still covers a cold cache.
