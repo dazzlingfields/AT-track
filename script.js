@@ -588,7 +588,20 @@ function buildProgressHtml(proj, lat, lon){
 }
 
 async function showRouteOutlineFor(marker){
-  if(!marker || marker.currentType==="out" || !marker.tripId){ clearRouteOutline(); if(marker) marker._progressHtml=""; return; }
+  if(!marker || marker.currentType==="out"){ clearRouteOutline(); if(marker) marker._progressHtml=""; return; }
+
+  // Buses: draw the route straight from the local GeoJSON file(s) (frequent_routes.geojson
+  // for NX1/NX2/WX1, bus_routes.geojson for everything else). This is the primary source
+  // now — it's complete, works offline, and avoids a per-trip /api/shapes call. If the
+  // route isn't in the file yet (e.g. a brand-new service), we fall through to the API
+  // shape method below so nothing regresses.
+  if(marker.currentType==="bus"){
+    const handled=await showBusRouteFromFile(marker);
+    if(handled) return;
+  }
+
+  // Trains / ferries (and any bus not found in the file): API GTFS shape via shape_id.
+  if(!marker.tripId){ clearRouteOutline(); marker._progressHtml=""; return; }
   const sid=tripCache[marker.tripId]?.shape_id;
   if(!sid){ clearRouteOutline(); marker._progressHtml=""; console.warn("[shapes] no shape_id for trip", marker.tripId); setDebug("No shape_id for this trip (check /api/trips passes shape_id)"); return; }
   if(!shapeCache.has(sid)) await fetchShapes([sid]);
@@ -942,6 +955,147 @@ function setRailLinesEnabled(on){
   if(!railLinesLayer) return;
   if(on){ if(!map.hasLayer(railLinesLayer)) railLinesLayer.addTo(map); }
   else map.removeLayer(railLinesLayer);
+}
+
+// ===================== Bus route geometry (local GeoJSON files) ======================
+// Two replaceable files, same drop-in-and-reload workflow as the rail lines:
+//
+//   frequent_routes.geojson  – NX1 / NX2 / WX1 only. Drawn permanently on the map (like
+//                              the rail lines) in their brand colours, and toggled by the
+//                              "Express Bus Lines" checkbox. Tiny (~150 KB), loaded at start.
+//   bus_routes.geojson       – every other bus route. NOT drawn by default; it is the
+//                              source clicked-bus routes are drawn from. Larger (~7 MB), so
+//                              it is fetched lazily (on the first bus click, or prefetched
+//                              on the idle queue shortly after load) to keep first paint fast.
+//
+// To update for a service change: regenerate the files from a fresh AT GeoJSON export
+// (split by ROUTENUMBER into the frequent three vs the rest) and commit them. No code change.
+//
+// Both files are keyed by ROUTENUMBER, which equals the GTFS route_short_name we already
+// store on each vehicle marker (marker.routeName), so a clicked bus maps to its geometry
+// with a direct lookup. AT's export splits each pattern into many out-of-order segments,
+// so every segment is drawn individually (never concatenated) to avoid phantom connectors.
+const FREQUENT_ROUTES_FILE = "frequent_routes.geojson";
+const BUS_ROUTES_FILE      = "bus_routes.geojson";
+// AT brand colours. WX1 "fun green" and NX2 "strong cyan" are AT's published values; NX1 is
+// the Northern Express blue. Tweak any of these freely — they drive both the always-on lines
+// and the colour a clicked bus's route is drawn in.
+const FREQUENT_ROUTE_COLORS = { NX1:"#0079c2", NX2:"#00a6b6", WX1:"#00843c" };
+const FREQUENT_SET = new Set(Object.keys(FREQUENT_ROUTE_COLORS));
+
+// ROUTENUMBER (normalised) -> array of polylines [[lat,lon],...]. Filled from the frequent
+// file at startup and the main file on lazy load; both feed the same clicked-route lookup.
+const busRouteIndex = new Map();
+
+function featureSegsLatLon(ft){
+  const g=ft && ft.geometry; if(!g) return [];
+  const conv=line=>line.map(c=>[c[1],c[0]]); // GeoJSON is [lon,lat]; Leaflet wants [lat,lon]
+  if(g.type==="LineString") return [conv(g.coordinates)];
+  if(g.type==="MultiLineString") return g.coordinates.map(conv);
+  return [];
+}
+function indexBusRoutesGeoJSON(gj){
+  for(const ft of (gj?.features||[])){
+    const rn=normalizeRouteKey(ft.properties?.ROUTENUMBER); if(!rn) continue;
+    let arr=busRouteIndex.get(rn); if(!arr){ arr=[]; busRouteIndex.set(rn,arr); }
+    for(const seg of featureSegsLatLon(ft)) if(seg.length>=2) arr.push(seg);
+  }
+}
+
+// ---- Always-on frequent lines (NX1 / NX2 / WX1) -------------------------------------
+let frequentLinesLayer=null, frequentLinesEnabled=true;
+// Sits just above the rail pane (240) but below stops (250), vehicles, and the selected
+// route outline (350), so a clicked route still stands out over a permanent express line.
+try{ map.createPane("frequentPane"); map.getPane("frequentPane").style.zIndex=242; }catch{}
+
+async function loadFrequentRoutes(){
+  let gj=null;
+  try{
+    const res=await fetch(FREQUENT_ROUTES_FILE,{cache:"no-cache"}); // revalidate so new commits show
+    if(!res.ok) return;
+    gj=await res.json();
+  }catch{ return; }
+
+  indexBusRoutesGeoJSON(gj); // also make these three clickable from the same index
+
+  if(frequentLinesLayer){ try{ map.removeLayer(frequentLinesLayer); }catch{} frequentLinesLayer=null; }
+  try{
+    frequentLinesLayer=L.geoJSON(gj,{
+      pane:"frequentPane",
+      style:f=>({
+        color: FREQUENT_ROUTE_COLORS[normalizeRouteKey(f.properties?.ROUTENUMBER)] || vehicleColors.bus,
+        weight:3.5, opacity:0.85, lineJoin:"round", lineCap:"round",
+      }),
+      onEachFeature:(f,layer)=>{
+        const p=f.properties||{};
+        const nm=`${p.ROUTENUMBER||""}${p.ROUTENAME?` · ${p.ROUTENAME}`:""}`.trim();
+        if(nm) layer.bindTooltip(nm,{sticky:true});
+      },
+    });
+    if(frequentLinesEnabled) frequentLinesLayer.addTo(map);
+    setDebug(`Express bus lines loaded (${frequentLinesLayer.getLayers().length} segments)`);
+  }catch(e){ console.warn("[frequent] bad GeoJSON", e); }
+}
+
+function setFrequentLinesEnabled(on){
+  frequentLinesEnabled=on;
+  if(!frequentLinesLayer) return;
+  if(on){ if(!map.hasLayer(frequentLinesLayer)) frequentLinesLayer.addTo(map); }
+  else map.removeLayer(frequentLinesLayer);
+}
+
+// ---- Lazy load of the main bus_routes.geojson ---------------------------------------
+let _busRoutesLoaded=false, _busRoutesPromise=null;
+function ensureBusRoutesLoaded(){
+  if(_busRoutesLoaded) return Promise.resolve();
+  if(_busRoutesPromise) return _busRoutesPromise;
+  _busRoutesPromise=(async()=>{
+    setDebug("Loading bus routes…");
+    const res=await fetch(BUS_ROUTES_FILE,{cache:"no-cache"});
+    if(!res.ok){ _busRoutesPromise=null; setDebug(`Bus routes file unavailable (${res.status})`); return; }
+    const gj=await res.json();
+    indexBusRoutesGeoJSON(gj);
+    _busRoutesLoaded=true;
+    setDebug(`Bus routes loaded (${busRouteIndex.size} routes indexed)`);
+  })().catch(err=>{ _busRoutesPromise=null; console.warn("[bus-routes] load failed", err); });
+  return _busRoutesPromise;
+}
+
+// ---- Draw a clicked bus's route from the file ---------------------------------------
+// Draws every segment of the route in its colour (black casing first so the colour rides
+// on top across overlaps). Reuses the routeOutline slot + routePane as the API path does.
+function drawBusRouteSegments(routeKey, segs, color){
+  clearRouteOutline();
+  if(!segs || !segs.length) return;
+  const c=color||"#0a84ff";
+  const layers=[];
+  for(const pts of segs) if(pts.length>=2) layers.push(L.polyline(pts,{pane:"routePane",color:"#000",opacity:0.20,weight:7,lineJoin:"round",lineCap:"round",interactive:false}));
+  for(const pts of segs) if(pts.length>=2) layers.push(L.polyline(pts,{pane:"routePane",color:c,opacity:0.9,weight:4,lineJoin:"round",lineCap:"round",interactive:false}));
+  routeOutline={ shapeId:null, routeKey, layer:L.layerGroup(layers).addTo(map) };
+}
+
+// Returns true if it handled the route (drawn, or definitively in-progress/aborted), false
+// only when the route is genuinely absent from the file so the caller can try the API.
+async function showBusRouteFromFile(marker){
+  const rn=normalizeRouteKey(marker.routeName);
+  if(!rn || marker.routeName==="Unknown") return false;
+
+  // Make sure the right source is in memory. Frequent routes are already indexed at startup;
+  // anything else needs the (lazy) main file.
+  if(!busRouteIndex.has(rn) && !FREQUENT_SET.has(rn)) await ensureBusRoutesLoaded();
+  if(pinnedPopup!==marker) return true; // selection changed while the file loaded
+
+  const segs=busRouteIndex.get(rn);
+  if(!segs || !segs.length) return false; // not in the file — let the API fallback try
+
+  const color=FREQUENT_ROUTE_COLORS[rn] || marker.options?.fillColor || vehicleColors.bus;
+  // Avoid redrawing the same corridor every poll; just refresh the nearest-stop readout.
+  if(!(routeOutline && routeOutline.routeKey===rn)) drawBusRouteSegments(rn, segs, color);
+
+  const ll=marker.getLatLng();
+  marker._progressHtml=buildProgressHtml(null, ll.lat, ll.lng); // nearest stop (no % — see note above)
+  refreshOpenPopup(marker);
+  return true;
 }
 
 
@@ -1769,6 +1923,7 @@ async function init(){
       const layer=e.target.getAttribute("data-layer");
       if(layer==="stops"){ setStopsEnabled(e.target.checked); }
       else if(layer==="rail"){ setRailLinesEnabled(e.target.checked); }
+      else if(layer==="frequent"){ setFrequentLinesEnabled(e.target.checked); }
       else if(vehicleLayers[layer]){ if(e.target.checked) map.addLayer(vehicleLayers[layer]); else map.removeLayer(vehicleLayers[layer]); }
       updateControlsHeight();
     });
@@ -1783,6 +1938,17 @@ async function init(){
   const railCb=document.querySelector('#filters input[data-layer="rail"]');
   if(railCb) railLinesEnabled=railCb.checked;
   loadRailLines();
+
+  // Always-on express bus lines (NX1/NX2/WX1) from frequent_routes.geojson.
+  const freqCb=document.querySelector('#filters input[data-layer="frequent"]');
+  if(freqCb) frequentLinesEnabled=freqCb.checked;
+  loadFrequentRoutes();
+
+  // Warm the larger bus_routes.geojson on the idle queue so the first bus click is usually
+  // instant, without blocking first paint. Click-time load still covers a cold cache.
+  const prefetchBusRoutes=()=>ensureBusRoutesLoaded();
+  if(window.requestIdleCallback) requestIdleCallback(prefetchBusRoutes,{timeout:8000});
+  else setTimeout(prefetchBusRoutes,4000);
 
   updateControlsHeight();
 
