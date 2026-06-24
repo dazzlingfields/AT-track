@@ -1496,7 +1496,7 @@ function punctualityScore(d){
 function updatePunctuality(samples){
   const buckets={early:0,ontime:0,late:0};
   const byMode={bus:{n:0,sc:0,sum:0},train:{n:0,sc:0,sum:0},ferry:{n:0,sc:0,sum:0}};
-  const byRoute=new Map();
+  const late=[];
   let n=0, sum=0, scoreSum=0;
   for(const s of (samples||[])){
     const d=s.delay; if(d==null) continue;
@@ -1504,9 +1504,7 @@ function updatePunctuality(samples){
     const sc=punctualityScore(d); scoreSum+=sc;
     buckets[bucketForDelay(d)]++;
     const m=byMode[s.mode]; if(m){ m.n++; m.sc+=sc; m.sum+=d; }
-    const rk=normalizeRouteKey(s.route)||"?";
-    let r=byRoute.get(rk); if(!r){ r={label:s.route||rk, n:0, sum:0}; byRoute.set(rk,r); }
-    r.n++; r.sum+=d;
+    if(d>60) late.push({ route:s.route||"?", label:(s.label && s.label!=="N/A") ? s.label : "", delay:d });
   }
   const pollScore = n ? Math.round(100*scoreSum/n) : null;   // graded, not a hard on-time %
   const avgDelay  = n ? sum/n : null;
@@ -1517,12 +1515,8 @@ function updatePunctuality(samples){
   }
   const sessionAvg = sessionPolls ? Math.round(sessionScoreSum/sessionPolls) : pollScore;
 
-  const worst=[...byRoute.values()]
-    .filter(r=>r.n>=2)                       // need a couple of readings to flag a route
-    .map(r=>({label:r.label, avg:r.sum/r.n}))
-    .filter(r=>r.avg>60)                      // only routes averaging more than a minute late
-    .sort((a,b)=>b.avg-a.avg)
-    .slice(0,6);                              // desktop shows up to 6 (mobile trims to 3 via CSS)
+  // The individual vehicles running most behind right now (each row names the vehicle).
+  const worst=late.sort((a,b)=>b.delay-a.delay).slice(0,6);
 
   lastPunctuality={ n, buckets, pollScore, sessionAvg, avgDelay, byMode, worst };
   renderDashboard();
@@ -1585,7 +1579,7 @@ function renderDashboard(){
     return `<div class="dash-mode"><span class="name">${name}</span><span class="bar"><span style="width:${pct}%"></span></span><span class="pct">${pct}</span></div>`;
   };
   const worstRows=P.worst.length
-    ? P.worst.map((r,i)=>`<div class="dash-route${i>=3?" dash-route-extra":""}"><span class="badge">${escapeHtml(String(r.label).slice(0,6))}</span><span class="delay">${fmtMinSec(r.avg)} late</span></div>`).join("")
+    ? P.worst.map((r,i)=>`<div class="dash-route${i>=3?" dash-route-extra":""}"><span class="badge">${escapeHtml(String(r.route).slice(0,6))}</span><span class="veh">${r.label?escapeHtml(String(r.label)):"—"}</span><span class="delay">${fmtMinSec(r.delay)} late</span></div>`).join("")
     : `<p class="dash-empty">Nothing running notably late.</p>`;
   const trendBlock = sessionHistory.length>=2
     ? `<div class="dash-subhead dash-desktop-only">Session trend</div><div class="dash-desktop-only">${sparklineSVG(sessionHistory)}</div>`
@@ -2119,7 +2113,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       // pick the most relevant delay from the trip update).
       const tu=(typeKey!=="out" && tripId) ? delayMap.get(tripId) : null;
       const delaySec=tu ? delayForTrip(tu, stopSeq) : null;
-      if(typeKey!=="out" && delaySec!=null) punctSamples.push({mode:typeKey, route:routeName, delay:delaySec});
+      if(typeKey!=="out" && delaySec!=null) punctSamples.push({mode:typeKey, route:routeName, delay:delaySec, label:vehicleLabel});
       const scheduleLine=scheduleLineHtml(delaySec);
 
       // Next stop: prefer the trip update's next stop_time_update (gives a name + ETA);
