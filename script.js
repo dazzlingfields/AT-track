@@ -40,10 +40,17 @@ const mobileUpdateEl=document.getElementById("mobile-last-update");
 let pinnedPopup=null;           
 let pinnedFollow=false;            
 
+// Route focus mode: when the switch is on and a vehicle is selected, every vehicle NOT on
+// the selected route is dimmed so a single line stands out. focusedRouteKey is the
+// normalised route_short_name currently isolated (null = nothing isolated yet).
+let routeFocusEnabled=false;
+let focusedRouteKey=null;
+
 map.on("click",()=>{
   if(pinnedPopup){ pinnedPopup.closePopup(); pinnedPopup=null; pinnedFollow=false; }
   clearRouteHighlights();
   clearRouteOutline();
+  if(routeFocusEnabled && focusedRouteKey){ focusedRouteKey=null; applyRouteFocus(); }
 });
 
 
@@ -983,8 +990,11 @@ const BUS_ROUTES_FILE      = "bus_routes.geojson";
 const FREQUENT_ROUTE_COLORS = { NX1:"#0079c2", NX2:"#00a6b6", WX1:"#00843c" };
 const FREQUENT_SET = new Set(Object.keys(FREQUENT_ROUTE_COLORS));
 
-// ROUTENUMBER (normalised) -> array of polylines [[lat,lon],...]. Filled from the frequent
-// file at startup and the main file on lazy load; both feed the same clicked-route lookup.
+// ROUTENUMBER (normalised) -> array of patterns. Each pattern is one GeoJSON feature:
+// { pattern, name, segs:[[[lat,lon],...], ...] }. Keeping patterns separate (rather than
+// flattening every segment together) is what lets a clicked bus highlight just the one
+// direction it is travelling. Filled from the frequent file at startup and the main file
+// on lazy load; both feed the same clicked-route lookup.
 const busRouteIndex = new Map();
 
 function featureSegsLatLon(ft){
@@ -997,8 +1007,10 @@ function featureSegsLatLon(ft){
 function indexBusRoutesGeoJSON(gj){
   for(const ft of (gj?.features||[])){
     const rn=normalizeRouteKey(ft.properties?.ROUTENUMBER); if(!rn) continue;
+    const segs=featureSegsLatLon(ft).filter(s=>s.length>=2);
+    if(!segs.length) continue;
     let arr=busRouteIndex.get(rn); if(!arr){ arr=[]; busRouteIndex.set(rn,arr); }
-    for(const seg of featureSegsLatLon(ft)) if(seg.length>=2) arr.push(seg);
+    arr.push({ pattern:String(ft.properties?.ROUTEPATTERN??arr.length), name:ft.properties?.ROUTENAME||"", segs });
   }
 }
 
@@ -1061,17 +1073,67 @@ function ensureBusRoutesLoaded(){
   return _busRoutesPromise;
 }
 
-// ---- Draw a clicked bus's route from the file ---------------------------------------
-// Draws every segment of the route in its colour (black casing first so the colour rides
-// on top across overlaps). Reuses the routeOutline slot + routePane as the API path does.
-function drawBusRouteSegments(routeKey, segs, color){
+// ---- Direction-aware route drawing for a clicked bus --------------------------------
+// AT's export splits each pattern into many out-of-order segments, so segments are always
+// drawn individually (never concatenated) to avoid phantom connectors. The pattern the bus
+// is actually travelling is chosen by proximity, broken by heading when two directions
+// overlap the same road, then drawn bright over the rest of the corridor (dimmed).
+
+// Squared planar point-to-segment distance + the segment's bearing at the nearest point.
+// Planar approx (lon scaled by cos lat) is plenty accurate at city scale and avoids turf
+// overhead across thousands of vertices.
+function nearestOnPattern(lat, lon, segs){
+  const cosLat=Math.cos(lat*Math.PI/180)||1;
+  let best=Infinity, bestBrg=null;
+  for(const seg of segs){
+    for(let i=0;i<seg.length-1;i++){
+      const a=seg[i], b=seg[i+1];
+      const bx=(b[1]-a[1])*cosLat, by=(b[0]-a[0]);
+      const px=(lon-a[1])*cosLat,  py=(lat-a[0]);
+      const len2=bx*bx+by*by;
+      let t=len2>0?(px*bx+py*by)/len2:0; if(t<0)t=0; else if(t>1)t=1;
+      const dx=px-bx*t, dy=py-by*t;
+      const d2=dx*dx+dy*dy;
+      if(d2<best){ best=d2; bestBrg=bearingDegBetween(a[0],a[1],b[0],b[1]); }
+    }
+  }
+  return { distM:Math.sqrt(best)*111320, brg:bestBrg };
+}
+
+// Pick the pattern the vehicle is on: nearest by distance, tie-broken by heading match.
+function pickDirectionalPattern(marker, patterns){
+  if(patterns.length===1) return patterns[0];
+  const ll=marker.getLatLng();
+  const scored=patterns.map(p=>({ p, ...nearestOnPattern(ll.lat, ll.lng, p.segs) }));
+  scored.sort((a,b)=>a.distM-b.distM);
+  const vbrg=toNum(marker.bearingDeg);
+  if(vbrg==null) return scored[0].p;
+  // Among patterns about as close as the nearest (overlapping opposite directions), prefer
+  // the one whose local travel direction best matches the bus's heading.
+  const margin=35; // m
+  const cands=scored.filter(s=>s.distM<=scored[0].distM+margin);
+  let best=scored[0], bestDiff=Infinity;
+  for(const s of cands){
+    if(s.brg==null) continue;
+    const diff=Math.abs(((s.brg-vbrg+540)%360)-180); // 0 = same way, 180 = opposite
+    if(diff<bestDiff){ bestDiff=diff; best=s; }
+  }
+  return best.p;
+}
+
+// Draw the whole corridor dimmed, with the chosen direction bright on top.
+function drawBusRoute(routeKey, patterns, chosen, color){
   clearRouteOutline();
-  if(!segs || !segs.length) return;
   const c=color||"#0a84ff";
   const layers=[];
-  for(const pts of segs) if(pts.length>=2) layers.push(L.polyline(pts,{pane:"routePane",color:"#000",opacity:0.20,weight:7,lineJoin:"round",lineCap:"round",interactive:false}));
-  for(const pts of segs) if(pts.length>=2) layers.push(L.polyline(pts,{pane:"routePane",color:c,opacity:0.9,weight:4,lineJoin:"round",lineCap:"round",interactive:false}));
-  routeOutline={ shapeId:null, routeKey, layer:L.layerGroup(layers).addTo(map) };
+  const add=(pts,opts)=>{ if(pts.length>=2) layers.push(L.polyline(pts,Object.assign({pane:"routePane",lineJoin:"round",lineCap:"round",interactive:false},opts))); };
+  // 1) black casing for every segment (depth + contrast on any basemap)
+  for(const p of patterns) for(const pts of p.segs) add(pts,{color:"#000",opacity:0.16,weight:7});
+  // 2) the other directions, dimmed
+  for(const p of patterns){ if(p===chosen) continue; for(const pts of p.segs) add(pts,{color:c,opacity:0.30,weight:3}); }
+  // 3) the bus's direction, bright and thicker
+  if(chosen) for(const pts of chosen.segs) add(pts,{color:c,opacity:0.95,weight:5});
+  routeOutline={ shapeId:null, routeKey, patternKey:chosen?chosen.pattern:null, layer:L.layerGroup(layers).addTo(map) };
 }
 
 // Returns true if it handled the route (drawn, or definitively in-progress/aborted), false
@@ -1085,17 +1147,69 @@ async function showBusRouteFromFile(marker){
   if(!busRouteIndex.has(rn) && !FREQUENT_SET.has(rn)) await ensureBusRoutesLoaded();
   if(pinnedPopup!==marker) return true; // selection changed while the file loaded
 
-  const segs=busRouteIndex.get(rn);
-  if(!segs || !segs.length) return false; // not in the file — let the API fallback try
+  const patterns=busRouteIndex.get(rn);
+  if(!patterns || !patterns.length) return false; // not in the file — let the API fallback try
 
   const color=FREQUENT_ROUTE_COLORS[rn] || marker.options?.fillColor || vehicleColors.bus;
-  // Avoid redrawing the same corridor every poll; just refresh the nearest-stop readout.
-  if(!(routeOutline && routeOutline.routeKey===rn)) drawBusRouteSegments(rn, segs, color);
+  const chosen=pickDirectionalPattern(marker, patterns);
+  // Only redraw when the route OR the highlighted direction actually changes (not every poll).
+  if(!(routeOutline && routeOutline.routeKey===rn && routeOutline.patternKey===(chosen?chosen.pattern:null))){
+    drawBusRoute(rn, patterns, chosen, color);
+  }
 
   const ll=marker.getLatLng();
   marker._progressHtml=buildProgressHtml(null, ll.lat, ll.lng); // nearest stop (no % — see note above)
   refreshOpenPopup(marker);
   return true;
+}
+
+// ---- Map overlays: one switch drives stops + rail lines + express bus lines ----------
+function setOverlaysEnabled(on){
+  setStopsEnabled(on);
+  setRailLinesEnabled(on);
+  setFrequentLinesEnabled(on);
+}
+
+// ---- Route focus mode ---------------------------------------------------------------
+// Dims every vehicle that isn't on the focused route so one line reads clearly. Styles are
+// written to all markers, then the shared vehicle canvas is repainted once (cheap) — far
+// better than a per-marker redraw, which would repaint the whole canvas hundreds of times.
+function applyRouteFocus(){
+  const active=routeFocusEnabled && !!focusedRouteKey;
+  let changed=false;
+  for(const id in vehicleMarkers){
+    const m=vehicleMarkers[id];
+    const on=!active || normalizeRouteKey(m.routeName)===focusedRouteKey;
+    const op=on?1:0.12, fop=on?0.9:0.10;
+    if(m.options.opacity!==op || m.options.fillOpacity!==fop){
+      L.setOptions(m,{opacity:op, fillOpacity:fop});
+      m._dimmed=!on;
+      changed=true;
+    }
+  }
+  if(changed){
+    // Canvas setStyle doesn't repaint on its own, so repaint the shared vehicle canvas once.
+    try{
+      if(typeof vehicleRenderer._redraw==="function") vehicleRenderer._redraw();
+      else { for(const id in vehicleMarkers){ vehicleMarkers[id].redraw?.(); break; } }
+    }catch{}
+  }
+}
+// Click/select a vehicle while focus is on -> isolate that vehicle's route.
+function focusOnMarkerIfEnabled(m){
+  if(!routeFocusEnabled || !m) return;
+  focusedRouteKey=normalizeRouteKey(m.routeName)||null;
+  applyRouteFocus();
+}
+function setRouteFocusEnabled(on){
+  routeFocusEnabled=on;
+  if(on){
+    if(pinnedPopup) focusedRouteKey=normalizeRouteKey(pinnedPopup.routeName)||null;
+    if(!focusedRouteKey) setDebug("Route focus on — tap a vehicle to isolate its route");
+  }else{
+    focusedRouteKey=null;
+  }
+  applyRouteFocus();
 }
 
 
@@ -1206,6 +1320,9 @@ const LabeledCircleMarker = L.CircleMarker.extend({
     const x=p.x-m.hw, y=p.y-m.hh;
     this._badgeBox={hw:m.hw, hh:m.hh};            // rectangular hit area for clicks/hover
     ctx.save();
+    // Honour the marker's opacity so dimmed (route-focus) vehicles fade their pill + label too.
+    const _op=(this.options && this.options.opacity!=null)?this.options.opacity:1;
+    if(_op<1) ctx.globalAlpha=_op;
     roundRectPath(ctx,x,y,m.W,m.H,m.H/2);
     ctx.fillStyle=this._fillColor||vehicleColors.bus;
     ctx.fill();
@@ -1266,6 +1383,7 @@ function addOrUpdateMarker(id,lat,lon,color,type,tripId,fields={}){
         pinnedPopup=this; pinnedFollow=true;
         this.openPopup();
         showRouteOutlineFor(this);
+        focusOnMarkerIfEnabled(this);
         e?.originalEvent?.stopPropagation?.();
       });
       marker._eventsBound=true;
@@ -1306,7 +1424,23 @@ const __controlsRO = new ResizeObserver(updateControlsHeight);
 document.addEventListener("DOMContentLoaded", () => {
   const el = document.getElementById("controls");
   if (el) __controlsRO.observe(el);
+  setupControlsCollapse();
 });
+
+// Collapse/expand the controls panel from its header. Starts collapsed on phones so the
+// map is unobstructed; one tap reveals the switches.
+function setupControlsCollapse(){
+  const el=document.getElementById("controls");
+  const btn=document.getElementById("controls-toggle");
+  if(!el || !btn || btn._wired) return;
+  btn._wired=true;
+  if(window.innerWidth<=600){ el.classList.add("collapsed"); btn.setAttribute("aria-expanded","false"); }
+  btn.addEventListener("click",()=>{
+    const collapsed=el.classList.toggle("collapsed");
+    btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    updateControlsHeight();
+  });
+}
 
 function normalizeFleetLabel(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
 function normalizeRouteKey(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
@@ -1401,6 +1535,7 @@ const SearchControl=L.Control.extend({
       pinnedPopup = m;
       pinnedFollow = true;
       showRouteOutlineFor(m);
+      focusOnMarkerIfEnabled(m);
 
       const needMove =
         map.getZoom() < targetZoom ||
@@ -1780,7 +1915,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       }
 
       addOrUpdateMarker(vehicleId,lat,lon,color,typeKey,tripId,{
-        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText
+        currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText,bearingDeg:(ex.bearingDeg??null)
       });
 
       if(tripId){
@@ -1819,6 +1954,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     setLastUpdateTs(nowTs);
     lastPollOkTs=nowTs;
     updateVehicleCount();
+    applyRouteFocus(); // keep dimming consistent as vehicles appear/disappear
 
     await fetchTripsBatch([...new Set(allTripIds)]);
 
@@ -1921,7 +2057,9 @@ async function init(){
   document.querySelectorAll('#filters input[type="checkbox"]').forEach(cb=>{
     cb.addEventListener("change",e=>{
       const layer=e.target.getAttribute("data-layer");
-      if(layer==="stops"){ setStopsEnabled(e.target.checked); }
+      if(layer==="overlays"){ setOverlaysEnabled(e.target.checked); }
+      else if(layer==="focus"){ setRouteFocusEnabled(e.target.checked); }
+      else if(layer==="stops"){ setStopsEnabled(e.target.checked); }
       else if(layer==="rail"){ setRailLinesEnabled(e.target.checked); }
       else if(layer==="frequent"){ setFrequentLinesEnabled(e.target.checked); }
       else if(vehicleLayers[layer]){ if(e.target.checked) map.addLayer(vehicleLayers[layer]); else map.removeLayer(vehicleLayers[layer]); }
@@ -1929,20 +2067,17 @@ async function init(){
     });
   });
 
-  // Sync stops toggle to its checkbox state, then load stop geometry.
-  const stopsCb=document.querySelector('#filters input[data-layer="stops"]');
-  if(stopsCb) stopsEnabled=stopsCb.checked;
+  // One "Map overlays" switch drives stops, rail lines, and express bus lines together.
+  const overlaysCb=document.querySelector('#filters input[data-layer="overlays"]');
+  const overlaysOn = overlaysCb ? overlaysCb.checked : true;
+  stopsEnabled=overlaysOn; railLinesEnabled=overlaysOn; frequentLinesEnabled=overlaysOn;
   loadStops();
-
-  // Same for the optional rail-line GeoJSON overlay.
-  const railCb=document.querySelector('#filters input[data-layer="rail"]');
-  if(railCb) railLinesEnabled=railCb.checked;
   loadRailLines();
-
-  // Always-on express bus lines (NX1/NX2/WX1) from frequent_routes.geojson.
-  const freqCb=document.querySelector('#filters input[data-layer="frequent"]');
-  if(freqCb) frequentLinesEnabled=freqCb.checked;
   loadFrequentRoutes();
+
+  // Route focus starts from the switch's initial state (default off).
+  const focusCb=document.querySelector('#filters input[data-layer="focus"]');
+  routeFocusEnabled = focusCb ? focusCb.checked : false;
 
   // Warm the larger bus_routes.geojson on the idle queue so the first bus click is usually
   // instant, without blocking first paint. Click-time load still covers a cold cache.

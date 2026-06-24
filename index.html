@@ -70,47 +70,72 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
   border: 1px solid var(--panel-border);
   border-radius: var(--r-xl);
   box-shadow: var(--elev-1);
-  padding: 10px 11px;
-  max-width: 280px;
-  display: grid;
-  gap: var(--gap-3);
-  transition: box-shadow 140ms ease, transform 140ms ease;
+  width: 218px;
+  overflow: hidden;
+  transition: box-shadow 140ms ease;
 }
-#controls:focus-within { box-shadow: var(--elev-2); transform: translateY(-0.5px); }
+#controls:focus-within { box-shadow: var(--elev-2); }
 
-.control-group { margin: 0; }
-.control-group h4 { font-size: 18px; margin-bottom: 6px; }
+/* Header doubles as the collapse control */
+#controls-toggle {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; box-sizing: border-box;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 11px 13px;
+  background: transparent; border: 0; cursor: pointer; color: var(--text-strong);
+  font: 600 15px/1 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  letter-spacing: 0.2px;
+}
+#controls-toggle .chev { width: 18px; height: 18px; color: var(--text-subtle); transition: transform 180ms ease; }
+#controls.collapsed #controls-toggle .chev { transform: rotate(-90deg); }
 
-#filters { display: grid; gap: 8px; }
-#filters label {
-  display: grid; grid-template-columns: 18px 1fr; align-items: center; column-gap: 10px;
-  font-size: 14px; color: var(--text-strong); cursor: pointer; user-select: none;
-  padding: 6px 8px; border-radius: var(--r-md);
+#controls-body {
+  padding: 0 9px 9px;
+  display: grid; gap: 9px;
+  max-height: 72vh; overflow-y: auto; overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+#controls.collapsed #controls-body { display: none; }
+
+/* Group eyebrow (Vehicles / Map) */
+.switch-section {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase;
+  color: var(--text-subtle); padding: 2px 6px 0;
+}
+
+#filters { display: grid; gap: 2px; }
+
+.switch-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 7px 8px; border-radius: var(--r-md);
+  font-size: 14px; color: var(--text-strong);
+  cursor: pointer; user-select: none;
   transition: background-color 120ms ease;
 }
-#filters label:hover { background: var(--accent-weak); }
-#filters input[type="checkbox"] {
-  width: 16px; height: 16px; margin: 0;
-  accent-color: var(--accent);
-}
+.switch-row:hover { background: var(--accent-weak); }
+.switch-label { line-height: 1.15; }
 
-/* NEW: Tunnel toggle layout reuses filter styles */
-#tunnel-toggle { display: grid; gap: 8px; }
-#tunnel-toggle label {
-  display: grid; grid-template-columns: 18px 1fr; align-items: center; column-gap: 10px;
-  font-size: 14px; color: var(--text-strong); cursor: pointer; user-select: none;
-  padding: 6px 8px; border-radius: var(--r-md);
-  transition: background-color 120ms ease;
+/* iOS-style toggle (native checkbox sits invisible on top for a11y + label clicks) */
+.switch { position: relative; flex: 0 0 auto; width: 40px; height: 24px; }
+.switch input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; z-index: 2; }
+.switch .track {
+  position: absolute; inset: 0; border-radius: 999px;
+  background: rgba(120,120,128,0.30); transition: background-color 180ms ease;
 }
-#tunnel-toggle label:hover { background: var(--accent-weak); }
-#tunnel-toggle input[type="checkbox"]{
-  width: 16px; height: 16px; margin: 0;
-  accent-color: var(--accent);
+.switch .knob {
+  position: absolute; top: 2px; left: 2px; width: 20px; height: 20px;
+  border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3), 0 0 1px rgba(0,0,0,0.2);
+  transition: transform 180ms ease;
 }
+.switch input:checked ~ .track { background: var(--accent); }
+.switch input:checked ~ .knob { transform: translateX(16px); }
+.switch input:focus-visible ~ .track { box-shadow: var(--ring); }
 
 #debug, #vehicle-count {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px; color: var(--text-subtle); line-height: 1.35;
+  padding: 0 6px;
 }
 
 /* Leaflet popups */
@@ -243,16 +268,16 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
     top: max(10px, env(safe-area-inset-top));
     left: max(10px, env(safe-area-inset-left));
     right: auto; bottom: auto;
-    width: 140px;
-    border-radius: 14px;
-    padding: 8px 9px;
-    gap: 8px;
+    width: 200px;
+    border-radius: 16px;
     box-shadow: var(--elev-2);
   }
-  .control-group h4{ font-size: 14px; margin-bottom: 4px; }
-  #filters{ gap: 6px; grid-template-columns: 1fr; }
-  #filters label{ padding: 6px 8px; font-size: 12px; column-gap: 8px; border-radius: 10px; }
-  #filters input[type="checkbox"]{ width: 16px; height: 16px; }
+  #controls-toggle{ padding: 10px 12px; font-size: 14px; }
+  #controls-body{ padding: 0 8px 8px; gap: 8px; }
+  .switch-row{ padding: 9px 8px; font-size: 14px; }   /* taller rows = easier taps */
+  .switch{ width: 42px; height: 25px; }
+  .switch .knob{ width: 21px; height: 21px; }
+  .switch input:checked ~ .knob{ transform: translateX(17px); }
 
   .leaflet-popup-content{ font-size: 13.5px; line-height: 1.35; }
 
@@ -297,9 +322,9 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
 /* Extra small phones */
 @media (max-width: 360px){
-  #controls{ width: 135px; padding: 8px 9px; border-radius: 12px; top: calc(12px + 4px); }
-  #filters label{ font-size: 12px; padding: 6px 7px; }
-  .control-group h4{ font-size: 13px; }
+  #controls{ width: 184px; border-radius: 14px; top: calc(12px + 4px); }
+  #controls-toggle{ font-size: 13px; }
+  .switch-row{ font-size: 13px; }
   .search-control.expanded .search-input{ max-width: min(52vw, 300px); }
   .search-control .search-suggestions{ max-width: min(52vw, 300px); max-height: min(44vh, 280px); }
 }
@@ -341,22 +366,26 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
 <body>
   <div id="controls">
-    <div class="control-group">
-      <h4>Vehicle Display</h4>
+    <button id="controls-toggle" type="button" aria-expanded="true" aria-controls="controls-body">
+      <span>Map</span>
+      <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <div id="controls-body">
       <div id="filters">
-        <label><input type="checkbox" data-layer="bus" checked> Buses</label>
-        <label><input type="checkbox" data-layer="train" checked> Trains</label>
-        <label><input type="checkbox" data-layer="ferry" checked> Ferries</label>
-        <label><input type="checkbox" data-layer="out" checked> Out of Service</label>
-        <label><input type="checkbox" data-layer="stops" checked> Stops &amp; Stations</label>
-        <label><input type="checkbox" data-layer="rail" checked> Rail Lines</label>
-        <label><input type="checkbox" data-layer="frequent" checked> Express Bus Lines</label>
-      </div>
-    </div>
+        <div class="switch-section">Vehicles</div>
+        <label class="switch-row"><span class="switch-label">Buses</span><span class="switch"><input type="checkbox" data-layer="bus" checked><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Trains</span><span class="switch"><input type="checkbox" data-layer="train" checked><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Ferries</span><span class="switch"><input type="checkbox" data-layer="ferry" checked><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Out of service</span><span class="switch"><input type="checkbox" data-layer="out" checked><span class="track"></span><span class="knob"></span></span></label>
 
-  
-    <div id="debug">Realtime status...</div>
-    <div id="vehicle-count">Vehicles: 0 | Last refresh: N/A</div>
+        <div class="switch-section">Map</div>
+        <label class="switch-row"><span class="switch-label">Map overlays</span><span class="switch"><input type="checkbox" data-layer="overlays" checked><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Route focus</span><span class="switch"><input type="checkbox" data-layer="focus"><span class="track"></span><span class="knob"></span></span></label>
+      </div>
+
+      <div id="debug">Realtime status...</div>
+      <div id="vehicle-count">Vehicles: 0 | Last refresh: N/A</div>
+    </div>
   </div>
 
   <div id="map"></div>
