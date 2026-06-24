@@ -1405,6 +1405,99 @@ function updateVehicleCount(){
   const el=document.getElementById("vehicle-count"); if(el) el.textContent=`Buses: ${busCount}, Trains: ${trainCount}, Ferries: ${ferryCount}`;
 }
 
+// ===================== Session on-time dashboard ====================================
+// Aggregates the per-vehicle schedule delay (already computed each poll for the popups)
+// into a live punctuality readout: a headline on-time %, an Early / On time / Late split,
+// an on-time % per mode, and the routes running most behind. "On time" = no more than 90s
+// early and no more than 5 min late (a common transit punctuality window). The headline
+// "session" figure is a running average of each poll's network on-time %, so it reads as
+// performance over the time the map has been open rather than a single instant. Sampling
+// runs every poll regardless of whether the panel is visible, so opening it shows the full
+// session so far.
+const ONTIME_EARLY_S = -90;    // earlier than this  => "Early"
+const ONTIME_LATE_S  = 300;    // later than this    => "Late"
+const DASH_MIN_SAMPLES = 5;    // ignore polls with too few schedule readings to be meaningful
+let dashboardEnabled=false;
+let sessionPolls=0, sessionOnTimeSum=0;
+const sessionStart=Date.now();
+let lastPunctuality=null;
+
+function bucketForDelay(d){ return d<ONTIME_EARLY_S ? "early" : (d>ONTIME_LATE_S ? "late" : "ontime"); }
+
+function updatePunctuality(samples){
+  const buckets={early:0,ontime:0,late:0};
+  const byMode={bus:{n:0,ot:0,sum:0},train:{n:0,ot:0,sum:0},ferry:{n:0,ot:0,sum:0}};
+  const byRoute=new Map();
+  let n=0;
+  for(const s of (samples||[])){
+    const d=s.delay; if(d==null) continue;
+    n++;
+    const b=bucketForDelay(d); buckets[b]++;
+    const m=byMode[s.mode]; if(m){ m.n++; m.sum+=d; if(b==="ontime") m.ot++; }
+    const rk=normalizeRouteKey(s.route)||"?";
+    let r=byRoute.get(rk); if(!r){ r={label:s.route||rk, n:0, sum:0}; byRoute.set(rk,r); }
+    r.n++; r.sum+=d;
+  }
+  const ontimePct = n ? Math.round(100*buckets.ontime/n) : null;
+  if(n>=DASH_MIN_SAMPLES && ontimePct!=null){ sessionPolls++; sessionOnTimeSum+=ontimePct; }
+  const sessionAvg = sessionPolls ? Math.round(sessionOnTimeSum/sessionPolls) : ontimePct;
+
+  const worst=[...byRoute.values()]
+    .filter(r=>r.n>=2)                       // need a couple of readings to flag a route
+    .map(r=>({label:r.label, avg:r.sum/r.n}))
+    .filter(r=>r.avg>60)                      // only routes averaging more than a minute late
+    .sort((a,b)=>b.avg-a.avg)
+    .slice(0,3);
+
+  lastPunctuality={ n, buckets, ontimePct, sessionAvg, byMode, worst };
+  renderDashboard();
+}
+
+function fmtMinSec(sec){
+  const a=Math.abs(Math.round(sec)), m=Math.floor(a/60), s=a%60;
+  return a<60 ? `${a}s` : (s?`${m}m ${s}s`:`${m}m`);
+}
+
+function renderDashboard(){
+  const body=document.getElementById("dashboard-body");
+  if(!body || !dashboardEnabled) return;
+  const P=lastPunctuality;
+  if(!P || !P.n){ body.innerHTML=`<p class="dash-empty">Waiting for schedule data…</p>`; return; }
+
+  const sinceMin=Math.max(1,Math.round((Date.now()-sessionStart)/60000));
+  const modeRow=(key,name)=>{
+    const m=P.byMode[key]; if(!m || !m.n) return "";
+    const pct=Math.round(100*m.ot/m.n);
+    return `<div class="dash-mode"><span class="name">${name}</span><span class="bar"><span style="width:${pct}%"></span></span><span class="pct">${pct}%</span></div>`;
+  };
+  const worstRows=P.worst.length
+    ? P.worst.map(r=>`<div class="dash-route"><span class="badge">${escapeHtml(String(r.label).slice(0,6))}</span><span class="delay">${fmtMinSec(r.avg)} late</span></div>`).join("")
+    : `<p class="dash-empty">Nothing running notably late.</p>`;
+
+  body.innerHTML=`
+    <div class="dash-hero">
+      <span class="num">${P.sessionAvg ?? "—"}</span><span class="unit">%</span>
+      <span class="sub">on time this session<br>${P.n} live · ${sinceMin} min</span>
+    </div>
+    <div class="dash-buckets">
+      <div class="dash-chip early"><div class="c">${P.buckets.early}</div><div class="l">Early</div></div>
+      <div class="dash-chip ontime"><div class="c">${P.buckets.ontime}</div><div class="l">On time</div></div>
+      <div class="dash-chip late"><div class="c">${P.buckets.late}</div><div class="l">Late</div></div>
+    </div>
+    <div class="dash-subhead">By mode (on time now)</div>
+    ${modeRow("bus","Bus")}${modeRow("train","Train")}${modeRow("ferry","Ferry")}
+    <div class="dash-subhead">Running behind</div>
+    ${worstRows}
+  `;
+}
+
+function setDashboardEnabled(on){
+  dashboardEnabled=on;
+  const el=document.getElementById("dashboard");
+  if(el) el.hidden=!on;
+  if(on) renderDashboard();
+}
+
 (function injectExtraStyle(){
   const style=document.createElement("style");
   style.textContent=`.veh-highlight{stroke:#333;stroke-width:3;}`;
@@ -1768,6 +1861,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       if(sep && sep.size) delayMap=sep;
     }
 
+    const punctSamples=[]; // {mode,route,delay} for the on-time dashboard
     vehicles.forEach(v=>{
       const vehicleId=v.vehicle?.vehicle?.id; if(!v.vehicle||!v.vehicle.position||!vehicleId) return; newIds.add(vehicleId);
       const lat=v.vehicle.position.latitude, lon=v.vehicle.position.longitude;
@@ -1890,6 +1984,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       // pick the most relevant delay from the trip update).
       const tu=(typeKey!=="out" && tripId) ? delayMap.get(tripId) : null;
       const delaySec=tu ? delayForTrip(tu, stopSeq) : null;
+      if(typeKey!=="out" && delaySec!=null) punctSamples.push({mode:typeKey, route:routeName, delay:delaySec});
       const scheduleLine=scheduleLineHtml(delaySec);
 
       // Next stop: prefer the trip update's next stop_time_update (gives a name + ETA);
@@ -1955,6 +2050,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     lastPollOkTs=nowTs;
     updateVehicleCount();
     applyRouteFocus(); // keep dimming consistent as vehicles appear/disappear
+    updatePunctuality(punctSamples); // refresh the on-time dashboard from this poll
 
     await fetchTripsBatch([...new Set(allTripIds)]);
 
@@ -2059,6 +2155,7 @@ async function init(){
       const layer=e.target.getAttribute("data-layer");
       if(layer==="overlays"){ setOverlaysEnabled(e.target.checked); }
       else if(layer==="focus"){ setRouteFocusEnabled(e.target.checked); }
+      else if(layer==="dashboard"){ setDashboardEnabled(e.target.checked); }
       else if(layer==="stops"){ setStopsEnabled(e.target.checked); }
       else if(layer==="rail"){ setRailLinesEnabled(e.target.checked); }
       else if(layer==="frequent"){ setFrequentLinesEnabled(e.target.checked); }
@@ -2079,6 +2176,16 @@ async function init(){
   const focusCb=document.querySelector('#filters input[data-layer="focus"]');
   routeFocusEnabled = focusCb ? focusCb.checked : false;
 
+  // On-time dashboard: sync to its switch (default off) and wire its close button.
+  const dashCb=document.querySelector('#filters input[data-layer="dashboard"]');
+  setDashboardEnabled(dashCb ? dashCb.checked : false);
+  const dashClose=document.getElementById("dashboard-close");
+  if(dashClose) dashClose.addEventListener("click",()=>{
+    const cb=document.querySelector('#filters input[data-layer="dashboard"]');
+    if(cb) cb.checked=false;
+    setDashboardEnabled(false);
+  });
+
   // Warm the larger bus_routes.geojson on the idle queue so the first bus click is usually
   // instant, without blocking first paint. Click-time load still covers a cold cache.
   const prefetchBusRoutes=()=>ensureBusRoutesLoaded();
@@ -2098,3 +2205,21 @@ async function init(){
   }, initialJitter);
 }
 init();
+
+// ---- PWA: register the service worker (offline shell + cached route data + tiles) ----
+// Registered after first paint so it never competes with the initial data fetches.
+if("serviceWorker" in navigator){
+  window.addEventListener("load",()=>{
+    navigator.serviceWorker.register("sw.js").then(reg=>{
+      reg.addEventListener("updatefound",()=>{
+        const nw=reg.installing; if(!nw) return;
+        nw.addEventListener("statechange",()=>{
+          // A newer version finished installing while an old one is in control.
+          if(nw.state==="installed" && navigator.serviceWorker.controller){
+            setDebug("Update ready — reload to apply");
+          }
+        });
+      });
+    }).catch(err=>console.warn("[pwa] SW registration failed", err));
+  });
+}
