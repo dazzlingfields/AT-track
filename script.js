@@ -357,6 +357,47 @@ function buildNextStopLine(info, fallbackStopId){
   return `<b>Next stop:</b> ${escapeHtml(name)}${eta?` · ${eta}`:""}`;
 }
 
+// All remaining stops on the trip (at or beyond the vehicle's current sequence), soonest
+// first, from the same trip update. Used for the upcoming-stops list and the station boards.
+function upcomingStus(tu, currentStopSeq, limit){
+  if(!tu) return [];
+  const stus=tu.stop_time_update||tu.stopTimeUpdate||[];
+  const out=[];
+  for(const s of stus){
+    const seq=toNum(s.stop_sequence ?? s.stopSequence);
+    if(currentStopSeq!=null && seq!=null && seq<currentStopSeq) continue; // already passed
+    const arr=s.arrival, dep=s.departure;
+    out.push({
+      stopId: s.stop_id ?? s.stopId ?? null,
+      timeSec: toNum(arr?.time) ?? toNum(dep?.time),
+      delay: toNum(arr?.delay) ?? toNum(dep?.delay),
+      seq
+    });
+  }
+  out.sort((a,b)=>{
+    if(a.seq!=null && b.seq!=null) return a.seq-b.seq;
+    return (a.timeSec??1e15)-(b.timeSec??1e15);
+  });
+  return (limit && out.length>limit) ? out.slice(0,limit) : out;
+}
+
+// The next few stops (name + ETA) for a vehicle popup. Falls back to the single-stop line
+// (using the vehicle's own stop_id) when the trip update carries no stop list.
+function buildNextStopsLine(tu, currentStopSeq, fallbackStopId, limit=4){
+  const ups=upcomingStus(tu, currentStopSeq, limit);
+  const rows=ups.map(u=>{
+    const name=stopNameForId(u.stopId) || (u.stopId!=null?`Stop ${u.stopId}`:"");
+    if(!name) return "";
+    const eta=formatEta(u.timeSec);
+    return `<div style="display:flex;justify-content:space-between;gap:10px;line-height:1.3;">`
+      + `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(name)}</span>`
+      + `<span style="color:var(--text-subtle);white-space:nowrap;">${eta||""}</span></div>`;
+  }).filter(Boolean).join("");
+  if(!rows) return buildNextStopLine(null, fallbackStopId);
+  const label = ups.length>1 ? "Next stops:" : "Next stop:";
+  return `<b>${label}</b><div style="margin-top:2px;">${rows}</div>`;
+}
+
 // Fallback path: only used if the combined realtime feed carries no trip updates.
 let useSeparateTripUpdates=false;
 async function fetchTripUpdatesDelays(){
@@ -728,18 +769,20 @@ function buildArrivalsBoard(key){
   const items = rows.map(({a,eta})=>{
     const badge = escapeHtml(String(a.badge||"?")).slice(0,6);
     const when  = eta==="due" ? "due" : eta.replace("in ","");
+    const dest  = a.dest ? escapeHtml(String(a.dest)) : "";
     let late="";
     if(a.delaySec!=null && Math.abs(a.delaySec)>30){
       const mins=Math.round(a.delaySec/60);
       late = a.delaySec>0 ? ` <span style="color:#d0021b">+${mins||1}m</span>`
                           : ` <span style="color:#0a84ff">${mins||-1}m</span>`;
     }
-    return `<div style="display:flex;justify-content:space-between;gap:10px;margin-top:3px;">
+    return `<div style="display:flex;align-items:center;gap:8px;margin-top:3px;">
         <span style="display:inline-block;min-width:34px;text-align:center;background:${a.color};color:${badgeTextColor(a.color)};border-radius:8px;padding:1px 5px;font-weight:700;font-size:11px;">${badge}</span>
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-subtle);font-size:0.92em;">${dest}</span>
         <span style="text-align:right;white-space:nowrap;">${when}${late}</span>
       </div>`;
   }).join("");
-  return `<div style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>Next arrivals</b>${items}</div>`;
+  return `<div style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>Next services</b>${items}</div>`;
 }
 function buildStopPopup(m){
   const st=STOP_STYLE[m._stopType]||STOP_STYLE[0];
@@ -753,9 +796,17 @@ function makeStopMarker(s){
   m._stopName=s[3]; m._stopCode=s[2]; m._stopType=s[4]; m._stopKey=s[5];
   // Function content => rebuilt on every open, so the arrivals board stays current.
   m.bindPopup(()=>buildStopPopup(m),{maxWidth:240,className:"vehicle-popup"});
+  // Track the open station popup so the poll can refresh its arrivals board live.
+  m.on("popupopen",()=>{ _openStopMarker=m; });
+  m.on("popupclose",()=>{ if(_openStopMarker===m) _openStopMarker=null; });
   // Open on click/tap (bindPopup's default). Works on both desktop and touch and stays open
   // until dismissed, unlike the old hover behaviour which vanished as the cursor moved off.
   return m;
+}
+let _openStopMarker=null;
+function refreshOpenStopPopup(){
+  const m=_openStopMarker;
+  if(m && m.isPopupOpen && m.isPopupOpen()){ try{ m.setPopupContent(buildStopPopup(m)); }catch{} }
 }
 
 function renderStopsForViewport(){
@@ -2116,12 +2167,11 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       if(typeKey!=="out" && delaySec!=null) punctSamples.push({mode:typeKey, route:routeName, delay:delaySec, label:vehicleLabel});
       const scheduleLine=scheduleLineHtml(delaySec);
 
-      // Next stop: prefer the trip update's next stop_time_update (gives a name + ETA);
-      // fall back to the vehicle's own stop_id when its status says it is heading to one.
-      const nsInfo = tu ? nextStopInfo(tu, stopSeq) : null;
+      // Next stops: list the next few from the trip update (name + ETA); fall back to the
+      // vehicle's own stop_id when its status says it is heading to one.
       const upcoming = (csNum===0 || csNum===2); // Approaching / In transit to
       const nextStopLine = (typeKey!=="out")
-        ? buildNextStopLine(nsInfo, upcoming ? stopRef : null)
+        ? buildNextStopsLine(tu, stopSeq, upcoming ? stopRef : null, 4)
         : "";
 
       if(vehicleLabel.startsWith("AM")){
@@ -2131,11 +2181,18 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
       const badgeText=badgeForRoute(typeKey,routeName);
 
-      // Register this service as an inbound arrival at its next stop, for the station popup.
-      if(typeKey!=="out" && nsInfo && nsInfo.stopId!=null){
-        const key = stopKeyById.get(String(nsInfo.stopId)) || String(nsInfo.stopId);
-        let arr=arrivalsByStop.get(key); if(!arr){ arr=[]; arrivalsByStop.set(key,arr); }
-        arr.push({ badge: badgeText || routeName, color, etaSec: nsInfo.timeSec, delaySec });
+      // Register this service against every stop it will reach in the next hour, so a
+      // station/stop popup can show the genuinely soonest services arriving (not only the
+      // ones for which it is the immediate next stop). Keyed by collapsed station.
+      if(typeKey!=="out" && tu){
+        const nowSec=Date.now()/1000;
+        for(const u of upcomingStus(tu, stopSeq, 12)){
+          if(u.stopId==null) continue;
+          if(u.timeSec!=null && (u.timeSec-nowSec)>3600) continue; // only the next hour
+          const key = stopKeyById.get(String(u.stopId)) || String(u.stopId);
+          let arr=arrivalsByStop.get(key); if(!arr){ arr=[]; arrivalsByStop.set(key,arr); }
+          arr.push({ badge: badgeText || routeName, color, dest: destination, etaSec: u.timeSec, delaySec: u.delay });
+        }
       }
 
       addOrUpdateMarker(vehicleId,lat,lon,color,typeKey,tripId,{
@@ -2180,6 +2237,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     updateVehicleCount();
     applyRouteFocus(); // keep dimming consistent as vehicles appear/disappear
     updatePunctuality(punctSamples); // refresh the on-time dashboard from this poll
+    refreshOpenStopPopup(); // keep an open station's arrivals board live
 
     await fetchTripsBatch([...new Set(allTripIds)]);
 
