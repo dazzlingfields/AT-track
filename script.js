@@ -7,9 +7,15 @@ const shapesUrl    = `${proxyBaseUrl}/api/shapes`;
 const tripUpdatesUrl = `${proxyBaseUrl}/api/tripupdates`; // fallback only; see fetchVehicles
 const busTypesUrl  = "busTypes.json";
 
-const light = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",{attribution:"© OpenStreetMap contributors © CARTO",subdomains:"abcd",maxZoom:20});
-const dark  = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{attribution:"© OpenStreetMap contributors © CARTO",subdomains:"abcd",maxZoom:20});
-const osm   = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:"© OpenStreetMap contributors"});
+// CARTO gated their free raster basemap tiles behind an API key in Aug 2026. This key is
+// designed to be embedded in client code (see carto.com/basemaps/apikey) — it's a
+// usage-tracking token tied to a fair-use quota (5M tile requests/month), not a secret.
+const CARTO_API_KEY = "cb1_32qp_1_0540fab17f2d4a81cc939e96";
+const light = L.tileLayer(`https://{s}.basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}{r}.png?key=${CARTO_API_KEY}`,{attribution:"© OpenStreetMap contributors © CARTO",subdomains:"abcd",maxZoom:20});
+const dark  = L.tileLayer(`https://{s}.basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}{r}.png?key=${CARTO_API_KEY}`,{attribution:"© OpenStreetMap contributors © CARTO",subdomains:"abcd",maxZoom:20});
+// Keyless fallback, kept in the layer switcher: if the CARTO key ever hits its fair-use
+// limit or gets revoked, switching basemap needs no code change, just a tap in the UI.
+const osm   = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:"© OpenStreetMap contributors",maxZoom:19});
 const satellite  = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{attribution:"Tiles © Esri"});
 const esriImagery= L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{attribution:"Tiles © Esri, Maxar, Earthstar Geographics",maxZoom:20});
 const esriLabels = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",{attribution:"Labels © Esri",maxZoom:20});
@@ -22,7 +28,7 @@ const map = L.map("map",{center:[-36.8485,174.7633],zoom:12,layers:[light],zoomC
 // redraws left them half-erased by neighbours and made them vanish during tween/zoom. Full
 // redraws cannot ghost or partially-erase; off-screen markers still self-cull in their draw.
 vehicleRenderer._extendRedrawBounds = function(){};
-const baseMaps = {"Light":light,"Dark":dark,"OSM":osm,"Satellite":satellite,"Esri Hybrid":esriHybrid};
+const baseMaps = {"Light":light,"Dark":dark,"OSM (fallback)":osm,"Satellite":satellite,"Esri Hybrid":esriHybrid};
 L.control.layers(baseMaps,null).addTo(map);
 
 const vehicleLayers={bus:L.layerGroup().addTo(map),train:L.layerGroup().addTo(map),ferry:L.layerGroup().addTo(map),out:L.layerGroup().addTo(map)};
