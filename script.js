@@ -63,7 +63,14 @@ map.on("dragstart", ()=> { pinnedFollow=false; });
 map.on("popupclose", ()=> { pinnedFollow=false; });
 
 const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"};
-const trainLineColors={STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8",HUIA:"#8e44ad"};
+// Legacy (pre-CRL) line colours, plus the post-CRL lines that replace them from 13 Sept
+// 2026: South City (SC) and Onehunga West (OW) keep their predecessor's colour since
+// they're largely the same route; East West (EW) gets a new colour since it's a genuine
+// merge of the old Eastern (yellow) and Western (green) lines. See resolveTrainLineCode.
+const trainLineColors={
+  STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8",HUIA:"#8e44ad",
+  SC:"#d0021b",EW:"#f5a623",OW:"#0e76a8"
+};
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 // Ring colours for the optional occupancy overlay, green (empty) -> red (full).
 const OCC_COLORS=["#19a463","#5cb800","#b3a200","#ef9b00","#ef6a00","#e0241b","#7a1410"];
@@ -203,7 +210,27 @@ function parseRetryAfterMs(v){ if(!v) return 0; const s=Number(v); if(!isNaN(s))
 function chunk(a,n){const o=[]; for(let i=0;i<a.length;i+=n)o.push(a.slice(i,i+n)); return o;}
 function buildBusTypeIndex(json){const idx={}; if(!json||typeof json!=="object") return idx; for(const model of Object.keys(json)){const ops=json[model]||{}; for(const op of Object.keys(ops)){const nums=ops[op]||[]; if(!idx[op]) idx[op]={}; for(const n of nums) idx[op][n]=model;}} return idx;}
 function getBusType(op,num){const ix=busTypeIndex[op]; return ix?(ix[num]||""):"";}
-function trainColorForRoute(s){ if(!s) return vehicleColors.train; if(s.includes("STH"))return trainLineColors.STH; if(s.includes("WEST"))return trainLineColors.WEST; if(s.includes("EAST"))return trainLineColors.EAST; if(s.includes("ONE"))return trainLineColors.ONE; return vehicleColors.train; }
+// Central place for recognising which train line a route belongs to, so vehicle colours,
+// marker badges, and the static rail-line overlay all agree. From 13 September 2026 (CRL
+// opening) the Southern/Western/Eastern/Onehunga lines are replaced by South City (S-C),
+// East West (E-W), and Onehunga West (O-W). The legacy codes are checked afterwards as a
+// fallback for any stale cached GTFS data during the changeover (routes are cached for up
+// to 24h — see TTL_ROUTES — so old and new codes may briefly overlap on opening day); they
+// can be deleted once the old codes are no longer seen in production.
+function resolveTrainLineCode(s){
+  const u=(s||"").toString().toUpperCase();
+  if(!u) return null;
+  if(u.includes("S-C")||u.includes("SOUTH CITY")||u.includes("SOUTHCITY")) return "SC";
+  if(u.includes("E-W")||u.includes("EAST WEST")||u.includes("EASTWEST")) return "EW";
+  if(u.includes("O-W")||u.includes("ONEHUNGA WEST")||u.includes("ONEHUNGAWEST")) return "OW";
+  if(u.includes("STH")||u.includes("SOUTH")) return "STH";
+  if(u.includes("WEST")) return "WEST";
+  if(u.includes("EAST")) return "EAST";
+  if(u.includes("ONE")||u.includes("ONEHUNGA")) return "ONE";
+  if(u.includes("HUIA")||u.includes("HAMILTON")) return "HUIA";
+  return null;
+}
+function trainColorForRoute(s){ const code=resolveTrainLineCode(s); return code ? (trainLineColors[code]||vehicleColors.train) : vehicleColors.train; }
 
 // ---- Optional GTFS-RT field helpers -------------------------------------
 // AT's docs claim odometer/bearing are often absent; these are emitted
@@ -962,13 +989,9 @@ try{ map.createPane("railPane"); map.getPane("railPane").style.zIndex=240; }catc
 
 function railLineColor(props){
   const p=props||{};
-  const s=`${p.ROUTENUMBER??p.routenumber??p.ROUTE??""} ${p.ROUTENAME??p.routename??""}`.toUpperCase();
-  if(s.includes("STH")||s.includes("SOUTH")) return trainLineColors.STH;
-  if(s.includes("WEST")) return trainLineColors.WEST;
-  if(s.includes("EAST")) return trainLineColors.EAST;
-  if(s.includes("ONE")||s.includes("ONEHUNGA")) return trainLineColors.ONE;
-  if(s.includes("HUIA")||s.includes("HAMILTON")) return trainLineColors.HUIA;
-  return vehicleColors.train;
+  const s=`${p.ROUTENUMBER??p.routenumber??p.ROUTE??""} ${p.ROUTENAME??p.routename??""}`;
+  const code=resolveTrainLineCode(s);
+  return code ? (trainLineColors[code]||vehicleColors.train) : vehicleColors.train;
 }
 
 async function loadRailLines(){
@@ -1298,13 +1321,12 @@ function refreshOpenPopup(m){
 
 // Short code shown in the pill. Trains collapse to the line code (STH/EAST/WEST/ONE);
 // buses use the route_short_name (the bus number). Ferry/out-of-service get no label.
+const TRAIN_LINE_BADGES={SC:"S-C",EW:"E-W",OW:"O-W",STH:"STH",WEST:"WEST",EAST:"EAST",ONE:"ONE",HUIA:"HUIA"};
 function badgeForRoute(typeKey, routeName){
   if(typeKey==="train"){
+    const code=resolveTrainLineCode(routeName);
+    if(code) return TRAIN_LINE_BADGES[code];
     const s=(routeName||"").toUpperCase();
-    if(s.includes("STH")||s.includes("SOUTH")) return "STH";
-    if(s.includes("WEST")) return "WEST";
-    if(s.includes("EAST")) return "EAST";
-    if(s.includes("ONE")||s.includes("ONEHUNGA")) return "ONE";
     return (s.split(/\s+/)[0]||"").slice(0,4) || "TRN";
   }
   if(typeKey==="bus"){
@@ -1696,7 +1718,46 @@ document.addEventListener("DOMContentLoaded", () => {
   const el = document.getElementById("controls");
   if (el) __controlsRO.observe(el);
   setupControlsCollapse();
+  initCrlCountdown();
 });
+
+// ---- CRL opening countdown -----------------------------------------------
+// Auckland's City Rail Link opens Sunday 13 September 2026, 5:00am NZST. The
+// explicit +12:00 offset pins that exact instant regardless of the viewer's
+// own timezone — NZ is still on standard time (not daylight saving) on this
+// date, since NZDT doesn't resume until 27 September 2026. Once that instant
+// passes, the banner hides itself (and stays hidden on every future load).
+// Safe to delete this block along with the #crl-countdown markup/CSS once
+// CRL has been open a while and the banner has served its purpose.
+const CRL_OPENING = new Date("2026-09-13T05:00:00+12:00");
+let crlCountdownTimer = null;
+
+function updateCrlCountdown(){
+  const timeEl = document.getElementById("crl-countdown-time");
+  if (!timeEl) return;
+  const msLeft = CRL_OPENING.getTime() - Date.now();
+  if (msLeft <= 0) { hideCrlCountdown(); return; }
+  const totalSec = Math.floor(msLeft / 1000);
+  const d = Math.floor(totalSec / 86400);
+  const h = Math.floor((totalSec % 86400) / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  timeEl.textContent = d > 0 ? `${d}d ${h}h ${m}m ${s}s` : `${h}h ${m}m ${s}s`;
+}
+
+function hideCrlCountdown(){
+  const el = document.getElementById("crl-countdown");
+  if (el) el.hidden = true;
+  if (crlCountdownTimer) { clearInterval(crlCountdownTimer); crlCountdownTimer = null; }
+}
+
+function initCrlCountdown(){
+  const el = document.getElementById("crl-countdown");
+  if (!el || Date.now() >= CRL_OPENING.getTime()) return; // already open — stays hidden
+  el.hidden = false;
+  updateCrlCountdown();
+  crlCountdownTimer = setInterval(updateCrlCountdown, 1000);
+}
 
 // Collapse/expand the controls panel from its header. Starts collapsed on phones so the
 // map is unobstructed; one tap reveals the switches.
