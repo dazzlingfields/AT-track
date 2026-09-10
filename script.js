@@ -110,7 +110,7 @@ function applyRateLimitBackoff(retryAfterMs, who){
 }
 
 let vehiclesAbort, vehiclesInFlight=false, pollTimeoutId=null, pageVisible=!document.hidden;
-let hidePauseTimerId=null; const HIDE_PAUSE_DELAY_MS=10000;
+let hidePauseTimerId=null; const HIDE_PAUSE_DELAY_MS=30000; // ~30s grace period before a hidden/blurred tab actually pauses
 
 
 function setDebug(msg){ if(debugBox) debugBox.textContent=msg; }
@@ -2373,9 +2373,14 @@ async function resumeUpdatesNow(){
   }
 }
 
-document.addEventListener("visibilitychange",()=>{ if(document.hidden) pauseUpdatesNow(); else resumeUpdatesNow(); });
+// Tab-hide and window-blur both route through the same debounced pause: a brief
+// switch away (checking another tab, alt-tabbing to reply to a message) shouldn't abort
+// the in-flight fetch and force a jarring catch-up refresh the moment you come back.
+// Only a hide/blur that outlasts HIDE_PAUSE_DELAY_MS actually pauses polling.
+// Coming back visible/focused always cancels any pending pause and resumes immediately.
+document.addEventListener("visibilitychange",()=>{ if(document.hidden) schedulePauseAfterHide(); else resumeUpdatesNow(); });
 window.addEventListener("pageshow",()=>{ resumeUpdatesNow(); });
-window.addEventListener("pagehide",()=>{ pauseUpdatesNow(); });
+window.addEventListener("pagehide",()=>{ pauseUpdatesNow(); }); // page is being torn down/bfcached — stop immediately, no grace period
 window.addEventListener("focus",()=>{ resumeUpdatesNow(); });
 window.addEventListener("blur",()=>{ schedulePauseAfterHide(); });
 
