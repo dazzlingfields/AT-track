@@ -110,7 +110,6 @@ function applyRateLimitBackoff(retryAfterMs, who){
 }
 
 let vehiclesAbort, vehiclesInFlight=false, pollTimeoutId=null, pageVisible=!document.hidden;
-let hidePauseTimerId=null; const HIDE_PAUSE_DELAY_MS=30000; // ~30s grace period before a hidden/blurred tab actually pauses
 
 
 function setDebug(msg){ if(debugBox) debugBox.textContent=msg; }
@@ -2359,10 +2358,7 @@ function pauseUpdatesNow(){
   setDebug("Paused updates: tab not visible");
   // Intentionally NOT killing the loop; the visibility gate stops fetches while hidden.
 }
-function schedulePauseAfterHide(){ if(hidePauseTimerId) return; hidePauseTimerId=setTimeout(()=>{ hidePauseTimerId=null; if(document.hidden) pauseUpdatesNow(); },HIDE_PAUSE_DELAY_MS); }
-function cancelScheduledPause(){ if(hidePauseTimerId){clearTimeout(hidePauseTimerId); hidePauseTimerId=null;} }
 async function resumeUpdatesNow(){
-  cancelScheduledPause();
   const wasHidden=!pageVisible;
   pageVisible=true;
   if(!pollTimeoutId) scheduleNextFetch(); // ensure the loop is alive
@@ -2373,16 +2369,18 @@ async function resumeUpdatesNow(){
   }
 }
 
-// Tab-hide and window-blur both route through the same debounced pause: a brief
-// switch away (checking another tab, alt-tabbing to reply to a message) shouldn't abort
-// the in-flight fetch and force a jarring catch-up refresh the moment you come back.
-// Only a hide/blur that outlasts HIDE_PAUSE_DELAY_MS actually pauses polling.
-// Coming back visible/focused always cancels any pending pause and resumes immediately.
-document.addEventListener("visibilitychange",()=>{ if(document.hidden) schedulePauseAfterHide(); else resumeUpdatesNow(); });
+// Tab-hide/blur pause immediately, and coming back always does an immediate catch-up
+// fetch — no grace period. A delayed pause was tried here and reverted: it meant a short
+// return (under the delay) never flipped pageVisible, so resumeUpdatesNow saw wasHidden
+// as false and skipped the catch-up fetch, leaving stale positions on screen until the
+// ambient ~15-27s poll cycle happened to land. Immediate pause/resume guarantees a fresh
+// fetch the moment the tab becomes visible again, however long it was away.
+document.addEventListener("visibilitychange",()=>{ if(document.hidden) pauseUpdatesNow(); else resumeUpdatesNow(); });
 window.addEventListener("pageshow",()=>{ resumeUpdatesNow(); });
-window.addEventListener("pagehide",()=>{ pauseUpdatesNow(); }); // page is being torn down/bfcached — stop immediately, no grace period
+window.addEventListener("pagehide",()=>{ pauseUpdatesNow(); }); // page is being torn down/bfcached
 window.addEventListener("focus",()=>{ resumeUpdatesNow(); });
-window.addEventListener("blur",()=>{ schedulePauseAfterHide(); });
+window.addEventListener("blur",()=>{ pauseUpdatesNow(); });
+
 
 async function init(){
   // Load persisted trips/shapes (and prune expired) before anything fetches, so the first
