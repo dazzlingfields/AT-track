@@ -383,13 +383,30 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
   outline: none; box-shadow: var(--ring);
 }
 
-  </style>
+#settings-open{position:fixed;right:12px;bottom:calc(24px + env(safe-area-inset-bottom));z-index:1400;min-height:44px;padding:10px 18px;border-radius:14px;background:#fff;color:#172b3a;border:1px solid #d7dfe5;box-shadow:0 3px 16px #0002;font:600 14px system-ui;cursor:pointer;}
+#map-settings{padding:0;border:1px solid #d7dfe5;border-radius:20px;width:min(420px,calc(100vw - 32px));max-width:none;max-height:calc(100dvh - 32px);background:#fff;color:#172b3a;box-shadow:0 18px 70px #0004;}
+#map-settings[open]{display:flex;flex-direction:column;}
+#map-settings::backdrop{background:rgba(15,30,45,.32);}
+.settings-header,.settings-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;flex-shrink:0;}
+.settings-header{border-bottom:1px solid #e5ebef;}
+.settings-header h2{font-size:19px;margin:0;}.settings-header p{font-size:13px;margin:4px 0 0;color:#526674;}
+.settings-scroll{overflow-y:auto;overscroll-behavior:contain;padding:0 20px;min-height:0;}
+.settings-scroll section{padding:18px 0;border-bottom:1px solid #e5ebef;}
+.settings-scroll h3{font-size:14px;margin:0 0 8px;}.settings-scroll p{font-size:12px;line-height:1.5;color:#526674;margin:6px 0;}
+#map-settings .switch-row{min-height:44px;gap:14px;}.settings-help{max-width:34em;}
+#map-settings button{font:600 13px system-ui;min-height:44px;border:1px solid #d7dfe5;border-radius:10px;padding:8px 12px;background:#f4f7f9;color:#172b3a;cursor:pointer;}
+.settings-footer{border-top:1px solid #e5ebef;font-size:11px;color:#526674;}.settings-footer button{white-space:nowrap;}
+.setting-select{display:grid;gap:8px;font-size:13px;}.setting-select select{min-height:44px;font:inherit;border:1px solid #c5d0d8;border-radius:10px;padding:8px;background:white;color:#172b3a;}
+#controls-body{max-height:calc(100dvh - 180px);overflow-y:auto;overscroll-behavior:contain;}
+@media(min-width:701px){#map-settings{margin-right:16px;margin-top:16px;margin-bottom:16px;}}
+@media(max-width:700px){#map-settings{margin:auto 0 0;width:100%;border-radius:20px 20px 0 0;max-height:85dvh;border-bottom:0;}.settings-footer{padding-bottom:calc(12px + env(safe-area-inset-bottom));}.settings-header,.settings-footer{padding-left:16px;padding-right:16px;}.settings-scroll{padding:0 16px;}#controls .switch-row{min-height:44px;}}
+</style>
 </head>
 
 <body>
   <div id="controls">
     <button id="controls-toggle" type="button" aria-expanded="true" aria-controls="controls-body">
-      <span>Map</span>
+      <span>Vehicle filters</span>
       <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
     </button>
     <div id="controls-body">
@@ -402,7 +419,7 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
         <div class="switch-section">Map</div>
         <label class="switch-row"><span class="switch-label">Map overlays</span><span class="switch"><input type="checkbox" data-layer="overlays" checked><span class="track"></span><span class="knob"></span></span></label>
-        <label class="switch-row"><span class="switch-label">Route focus</span><span class="switch"><input type="checkbox" data-layer="focus"><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Dim other routes</span><span class="switch"><input type="checkbox" data-layer="focus"><span class="track"></span><span class="knob"></span></span></label>
         <label class="switch-row"><span class="switch-label">Follow selected vehicle</span><span class="switch"><input type="checkbox" data-layer="follow" checked><span class="track"></span><span class="knob"></span></span></label>
 
         <div class="switch-section">Markers</div>
@@ -421,6 +438,30 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
     </div>
   </div>
 
+  <button id="settings-open" type="button" aria-haspopup="dialog" aria-controls="map-settings" disabled>Settings</button>
+  <dialog id="map-settings" aria-labelledby="settings-title">
+    <header class="settings-header"><div><h2 id="settings-title">Map settings</h2><p>Make the map work your way</p></div><button id="settings-close" type="button" aria-label="Close settings">Close</button></header>
+    <div class="settings-scroll">
+      <section id="settings-selection"><h3>Selected route</h3><p id="route-filter-status" role="status">Select a vehicle to filter its route.</p>
+        <label class="switch-row"><span class="switch-label">Hide other routes</span><span class="switch"><input type="checkbox" data-pref="routeHide"><span class="track"></span><span class="knob"></span></span></label>
+        <p class="settings-help">Hiding takes priority over dimming. Vehicle-type filters still apply.</p>
+        <button id="selection-clear" type="button">Clear selection</button>
+      </section>
+      <section id="settings-overlays"><h3>Map layers</h3>
+        <label class="switch-row"><span class="switch-label">Stops and stations</span><span class="switch"><input type="checkbox" data-pref="stops" checked><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Train lines</span><span class="switch"><input type="checkbox" data-pref="rail" checked><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Frequent bus lines</span><span class="switch"><input type="checkbox" data-pref="frequent" checked><span class="track"></span><span class="knob"></span></span></label>
+      </section>
+      <section id="settings-markers"><h3>Vehicle markers</h3>
+        <label class="switch-row"><span class="switch-label">Route labels</span><span class="switch"><input type="checkbox" data-pref="labels" checked><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Popups on hover</span><span class="switch"><input type="checkbox" data-pref="hover" checked><span class="track"></span><span class="knob"></span></span></label>
+        <p class="settings-help">Click or tap always opens vehicle details.</p>
+        <label class="switch-row"><span class="switch-label">Smooth vehicle movement</span><span class="switch"><input type="checkbox" data-pref="motion" checked><span class="track"></span><span class="knob"></span></span></label>
+      </section>
+      <section id="settings-data"><h3>Data and diagnostics</h3><label class="setting-select" for="background-delay">Pause after tab is hidden<select id="background-delay" data-pref="pause"><option value="0">Immediately</option><option value="15000">15 seconds</option><option value="30000" selected>30 seconds</option><option value="60000">1 minute</option><option value="120000">2 minutes</option></select></label><p class="settings-help">Browsers may suspend background tabs sooner. Updates resume when you return.</p></section>
+    </div>
+    <footer class="settings-footer"><span>Preferences saved on this device</span><button id="settings-reset" type="button">Reset settings</button></footer>
+  </dialog>
   <div id="map"></div>
 
   <div id="mobile-last-update">Last update: —</div>
@@ -431,4 +472,3 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
 </body>
 </html>
-

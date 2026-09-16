@@ -52,6 +52,10 @@ let followSelectedEnabled=true;
 // the selected route is dimmed so a single line stands out. focusedRouteKey is the
 // normalised route_short_name currently isolated (null = nothing isolated yet).
 let routeFocusEnabled=false;
+let routeHideEnabled=false;
+let vehicleLabelsEnabled=true;
+let hoverPopupsEnabled=true;
+let smoothMotionEnabled=true;
 let focusedRouteKey=null;
 
 // Optional marker decorations (drawn on the vehicle canvas, only when zoomed in enough).
@@ -63,7 +67,7 @@ map.on("click",()=>{
   if(pinnedPopup){ pinnedPopup.closePopup(); pinnedPopup=null; pinnedFollow=false; }
   clearRouteHighlights();
   clearRouteOutline();
-  if(routeFocusEnabled && focusedRouteKey){ focusedRouteKey=null; applyRouteFocus(); }
+  if(focusedRouteKey){ focusedRouteKey=null; applyRouteFocus(); }
 });
 
 
@@ -595,7 +599,7 @@ let tweenRafId = null;
 // the next one arrives. Pure interpolation, never extrapolation.
 function queuePositionTween(id, marker, eLat, eLon){
   const cur = marker.getLatLng();
-  if(prefersReducedMotion || !isPageVisible() ||
+  if(!smoothMotionEnabled || prefersReducedMotion || !isPageVisible() ||
      haversineM(cur.lat,cur.lng,eLat,eLon) > TWEEN_SNAP_M){
     activeTweens.delete(id);
     marker.setLatLng([eLat,eLon]);
@@ -1411,11 +1415,15 @@ function setOverlaysEnabled(on){
 // written to all markers, then the shared vehicle canvas is repainted once (cheap) — far
 // better than a per-marker redraw, which would repaint the whole canvas hundreds of times.
 function applyRouteFocus(){
-  const active=routeFocusEnabled && !!focusedRouteKey;
+  const active=(routeFocusEnabled || routeHideEnabled) && !!focusedRouteKey;
+  const status=document.getElementById('route-filter-status');
+  if(status) status.textContent=active ? `Selected route: ${pinnedPopup?.routeName || focusedRouteKey}. Tap the map to clear.` : 'Select a vehicle to filter its route. All routes are currently shown.';
   let changed=false;
   for(const id in vehicleMarkers){
     const m=vehicleMarkers[id];
-    const on=!active || normalizeRouteKey(m.routeName)===focusedRouteKey;
+    const on=!active || vehicleRouteKey(m)===focusedRouteKey;
+    const hidden=!on && routeHideEnabled;
+    if(m._routeHidden!==hidden){ m._routeHidden=hidden; changed=true; }
     const op=on?1:0.12, fop=on?0.9:0.10;
     if(m.options.opacity!==op || m.options.fillOpacity!==fop){
       L.setOptions(m,{opacity:op, fillOpacity:fop});
@@ -1433,17 +1441,17 @@ function applyRouteFocus(){
 }
 // Click/select a vehicle while focus is on -> isolate that vehicle's route.
 function focusOnMarkerIfEnabled(m){
-  if(!routeFocusEnabled || !m) return;
-  focusedRouteKey=normalizeRouteKey(m.routeName)||null;
+  if(!m) return;
+  focusedRouteKey=vehicleRouteKey(m);
   applyRouteFocus();
 }
 function setRouteFocusEnabled(on){
   routeFocusEnabled=on;
   if(on){
-    if(pinnedPopup) focusedRouteKey=normalizeRouteKey(pinnedPopup.routeName)||null;
+    if(pinnedPopup) focusedRouteKey=vehicleRouteKey(pinnedPopup);
     if(!focusedRouteKey) setDebug("Route focus on — tap a vehicle to isolate its route");
   }else{
-    focusedRouteKey=null;
+    if(!routeHideEnabled) focusedRouteKey=null;
   }
   applyRouteFocus();
 }
@@ -1554,13 +1562,14 @@ function badgeMetrics(text){
 
 
 const LabeledCircleMarker = L.CircleMarker.extend({
-  _labelled:function(){ return !!(this.badgeText && this._map && this._map.getZoom()>=LABEL_MIN_ZOOM); },
+  _labelled:function(){ return !!(vehicleLabelsEnabled && this.badgeText && this._map && this._map.getZoom()>=LABEL_MIN_ZOOM); },
   // Cache pill geometry, recomputing only when the text changes.
   _badgeMetrics:function(){
     if(this._bm_text!==this.badgeText){ this._bm_text=this.badgeText; this._bm=this.badgeText?badgeMetrics(this.badgeText):null; }
     return this._bm;
   },
   _updatePath:function(){
+    if(this._routeHidden) return;
     if(this._labelled()) this._drawBadge();
     else { this._badgeBox=null; this._renderer._updateCircle(this); }
     this._drawDecor();
@@ -1639,6 +1648,7 @@ const LabeledCircleMarker = L.CircleMarker.extend({
     ctx.restore();
   },
   _containsPoint:function(point){
+    if(this._routeHidden) return false;
     if(this._badgeBox){
       const b=this._badgeBox, t=this._clickTolerance();
       return Math.abs(point.x-this._point.x)<=b.hw+t && Math.abs(point.y-this._point.y)<=b.hh+t;
@@ -1678,7 +1688,7 @@ function addOrUpdateMarker(id,lat,lon,color,type,tripId,fields={}){
 
     if(!marker._eventsBound){
       marker.on("popupopen",function(){ this.setPopupContent(buildPopupForMarker(this)); });
-      marker.on("mouseover",function(){ if(pinnedPopup!==this) this.openPopup(); });
+      marker.on("mouseover",function(){ if(hoverPopupsEnabled && pinnedPopup!==this) this.openPopup(); });
       marker.on("mouseout", function(){ if(pinnedPopup!==this) this.closePopup(); });
       marker.on("click",    function(e){
         if(pinnedPopup&&pinnedPopup!==this) pinnedPopup.closePopup();
@@ -1767,7 +1777,85 @@ function setupControlsCollapse(){
 }
 
 function normalizeFleetLabel(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
+// Existing quick-filter handlers stay attached when their controls move into the dialog.
+function setupSettingsMenu(){
+  const dialog=document.getElementById('map-settings');
+  const opener=document.getElementById('settings-open');
+  if(!dialog || dialog._wired) return;
+  dialog._wired=true;
+  const destinations={focus:'selection',follow:'selection',bearing:'markers',occupancy:'markers',debug:'data'};
+  for(const [layer,section] of Object.entries(destinations)){
+    const row=document.querySelector(`#filters input[data-layer="${layer}"]`)?.closest('label');
+    if(row) document.getElementById('settings-'+section).append(row);
+  }
+  document.querySelector('#filters input[data-layer="overlays"]')?.closest('label')?.remove();
+  document.querySelectorAll('#filters .switch-section').forEach((el,i)=>{ if(i>0) el.remove(); });
+  const debugPanel=document.getElementById('debug-panel');
+  if(debugPanel) document.getElementById('settings-data').append(debugPanel);
+  const controls=[...document.querySelectorAll('#filters input[data-layer], #map-settings input, #map-settings select')];
+  const defaults=new Map(controls.map(el=>[el,el.type==='checkbox'?el.defaultChecked:el.value]));
+  const key=el=>el.dataset.layer || el.dataset.pref;
+  const save=()=>{
+    const prefs=Object.fromEntries(controls.map(el=>[key(el),el.type==='checkbox'?el.checked:el.value]));
+    try{localStorage.setItem('atMapPreferences.v1',JSON.stringify(prefs));}catch{}
+  };
+  const apply=el=>{
+    const on=el.checked;
+    switch(el.dataset.pref){
+      case 'routeHide': routeHideEnabled=on; focusedRouteKey=vehicleRouteKey(pinnedPopup); applyRouteFocus(); break;
+      case 'stops': setStopsEnabled(on); break;
+      case 'rail': setRailLinesEnabled(on); break;
+      case 'frequent': setFrequentLinesEnabled(on); break;
+      case 'labels': vehicleLabelsEnabled=on; repaintVehicles(); break;
+      case 'hover': hoverPopupsEnabled=on; break;
+      case 'motion':
+        smoothMotionEnabled=on;
+        if(!on){
+          activeTweens.forEach((tw,id)=>vehicleMarkers[id]?.setLatLng([tw.eLat,tw.eLon]));
+          activeTweens.clear();
+        }
+        break;
+      case 'pause':
+        HIDDEN_PAUSE_DELAY_MS=Number(el.value);
+        if(document.hidden && pageVisible) scheduleHiddenPause();
+        break;
+    }
+  };
+  for(const el of controls) el.addEventListener('change',()=>{apply(el);save();});
+  let saved={};
+  try{saved=JSON.parse(localStorage.getItem('atMapPreferences.v1')||'{}')||{};}catch{}
+  for(const el of controls){
+    const value=saved[key(el)];
+    if(el.type==='checkbox' && typeof value==='boolean') el.checked=value;
+    if(el.tagName==='SELECT' && [...el.options].some(o=>o.value===String(value))) el.value=String(value);
+    el.dispatchEvent(new Event('change',{bubbles:true}));
+  }
+  const close=()=>dialog.close();
+  opener.disabled=false;
+  opener.addEventListener('click',()=>dialog.showModal());
+  document.getElementById('settings-close').addEventListener('click',close);
+  dialog.addEventListener('close',()=>opener.focus({preventScroll:true}));
+  dialog.addEventListener('click',e=>{
+    const rect=dialog.getBoundingClientRect();
+    if(e.target===dialog && (e.clientX<rect.left||e.clientX>rect.right||e.clientY<rect.top||e.clientY>rect.bottom)) close();
+  });
+  document.getElementById('selection-clear').addEventListener('click',()=>{
+    pinnedPopup?.closePopup(); pinnedPopup=null; pinnedFollow=false; focusedRouteKey=null;
+    clearRouteHighlights(); clearRouteOutline(); applyRouteFocus();
+  });
+  document.getElementById('settings-reset').addEventListener('click',()=>{
+    for(const el of controls){
+      if(el.type==='checkbox') el.checked=defaults.get(el); else el.value=defaults.get(el);
+      el.dispatchEvent(new Event('change',{bubbles:true}));
+    }
+  });
+  applyRouteFocus();
+}
 function normalizeRouteKey(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
+function vehicleRouteKey(m){
+  if(!m || m.currentType==='out' || !m.routeName || m.routeName==='Unknown') return null;
+  return m.currentType+':'+(m.currentType==='train' ? resolveTrainLineCode(m.routeName)||normalizeRouteKey(m.routeName) : normalizeRouteKey(m.routeName));
+}
 function onlyDigits(s){return (s||"").replace(/\D/g,"");}
 function clearRouteHighlights(){
   Object.values(vehicleMarkers).forEach(m=>{
@@ -2274,7 +2362,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
-        if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; clearRouteOutline(); }
+        if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; focusedRouteKey=null; clearRouteOutline(); }
         map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; motionState.delete(id); activeTweens.delete(id);
       }
     });
@@ -2356,7 +2444,7 @@ async function resumeUpdatesNow(){
 
 // Keep polling briefly after a tab becomes hidden. This avoids stopping trip updates for
 // short tab switches while still saving network work when the page stays in the background.
-const HIDDEN_PAUSE_DELAY_MS=30000;
+let HIDDEN_PAUSE_DELAY_MS=30000;
 let hiddenPauseTimer=null;
 function scheduleHiddenPause(){
   clearTimeout(hiddenPauseTimer);
@@ -2450,6 +2538,7 @@ async function init(){
   if(window.requestIdleCallback) requestIdleCallback(prefetchBusRoutes,{timeout:8000});
   else setTimeout(prefetchBusRoutes,4000);
 
+  setupSettingsMenu();
   updateControlsHeight();
 
   // Sync the cached flag to reality at startup, then start everything unconditionally.
