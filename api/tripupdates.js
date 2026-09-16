@@ -8,7 +8,7 @@ export default async function handler(req, res) {
   const TTL_MS = 9000;
   const STALE_FALLBACK_MAX_MS = 120000;
   const UPSTREAM_TIMEOUT_MS = 8000;
-  const UPSTREAM_URL = "https://api.at.govt.nz/realtime/legacy/tripupdates";
+const UPSTREAM_URL = "https://api.at.govt.nz/gtfs/v3/tripupdates";
 
   const now = Date.now();
   globalThis.__AT_TU_CACHE__ ||= { data: null, ts: 0, etag: null };
@@ -25,10 +25,13 @@ export default async function handler(req, res) {
   try {
     if (!globalThis.__AT_TU_PENDING__) {
       globalThis.__AT_TU_PENDING__ = (async () => {
-        const r = await fetchWithTimeout(UPSTREAM_URL, {
-          headers: { "Ocp-Apim-Subscription-Key": process.env.AT_API_KEY },
-          cache: "no-store",
-        }, UPSTREAM_TIMEOUT_MS);
+   const r = await fetchWithTimeout(UPSTREAM_URL, {
+  headers: { 
+    "Ocp-Apim-Subscription-Key": process.env.AT_API_KEY,
+    "Accept": "application/json"
+  },
+  cache: "no-store",
+}, UPSTREAM_TIMEOUT_MS);
         if (!r.ok) {
           const body = await safeBody(r);
           const err = new Error(`Upstream error: ${r.status}`);
