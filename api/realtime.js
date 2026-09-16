@@ -9,7 +9,10 @@ export default async function handler(req, res) {
   const TTL_MS = 9000;                   // shared snapshot lifetime
   const STALE_FALLBACK_MAX_MS = 120000;  // serve stale up to 2 min on errors
   const UPSTREAM_TIMEOUT_MS = 8000;      // abort a hung upstream call (< Vercel 10s)
-const UPSTREAM_URL = "https://api.at.govt.nz/realtime/legacy/vehiclepositions";
+  // The legacy base path is not itself a feed and returns 404. Vehicle positions
+  // are exposed by the vehiclelocations child endpoint. Trip updates are fetched
+  // separately by /api/tripupdates when the client needs schedule information.
+  const UPSTREAM_URL = "https://api.at.govt.nz/realtime/legacy/vehiclelocations";
 
   const now = Date.now();
   globalThis.__AT_CACHE__ ||= { data: null, ts: 0, etag: null };
@@ -28,13 +31,11 @@ const UPSTREAM_URL = "https://api.at.govt.nz/realtime/legacy/vehiclepositions";
     // Single-flight: at most one upstream fetch per instance at a time.
     if (!globalThis.__AT_PENDING__) {
       globalThis.__AT_PENDING__ = (async () => {
-  const upstreamRes = await fetchWithTimeout(UPSTREAM_URL, {
-  headers: { 
-    "Ocp-Apim-Subscription-Key": process.env.AT_API_KEY,
-    "Accept": "application/json"
-  },
-  cache: "no-store",
-}, UPSTREAM_TIMEOUT_MS);
+        const upstreamRes = await fetchWithTimeout(UPSTREAM_URL, {
+          headers: { "Ocp-Apim-Subscription-Key": process.env.AT_API_KEY },
+          cache: "no-store",
+        }, UPSTREAM_TIMEOUT_MS);
+
         if (!upstreamRes.ok) {
           const body = await safeBody(upstreamRes);
           const err = new Error(`Upstream error: ${upstreamRes.status}`);
@@ -93,7 +94,7 @@ function fetchWithTimeout(url, opts, timeoutMs) {
 }
 function setSWRHeaders(res, ttlMs) {
   const sMax = Math.max(1, Math.floor(ttlMs / 1000));
-  res.setHeader("Cache-Control", `public, max-age=0, s-maxage=${sMax}, stale-while-revalidate=10`);
+  res.setHeader("Cache-Control", `public, max-age=0, s-maxage=${sMax}, stale-while-revalidate=60`);
 }
 async function safeBody(r) { try { return await r.text(); } catch { return ""; } }
 function truncate(s, n) { return !s ? "" : s.length > n ? s.slice(0, n) + "…" : s; }
