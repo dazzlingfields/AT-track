@@ -42,6 +42,7 @@ const oosIndexByFleet=new Map();
 const markersByTrip=new Map();        // tripId -> [markers], rebuilt each poll for O(1) trip lookups
 const debugBox=document.getElementById("debug");
 const mobileUpdateEl=document.getElementById("mobile-last-update");
+const debugLastUpdateEl=document.getElementById("debug-last-update");
 
 let pinnedPopup=null;           
 let pinnedFollow=false;            
@@ -114,12 +115,13 @@ let vehiclesAbort, vehiclesInFlight=false, pollTimeoutId=null, pageVisible=!docu
 
 function setDebug(msg){ if(debugBox) debugBox.textContent=msg; }
 function setLastUpdateTs(ts){
-  if (!mobileUpdateEl) return;
   const t = new Date(ts);
   const hh = String(t.getHours()).padStart(2,"0");
   const mm = String(t.getMinutes()).padStart(2,"0");
   const ss = String(t.getSeconds()).padStart(2,"0");
-  mobileUpdateEl.textContent = `Last update: ${hh}:${mm}:${ss}`;
+  const text = `Last update: ${hh}:${mm}:${ss}`;
+  if (mobileUpdateEl) mobileUpdateEl.textContent = text;
+  if (debugLastUpdateEl) debugLastUpdateEl.textContent = text;
 }
 
 // Persist the fleet snapshot at most every 45s, on the idle queue, so a full-fleet
@@ -1698,6 +1700,17 @@ function setDashboardEnabled(on){
   if(on) renderDashboard();
 }
 
+// Debug info panel: last poll time, live vehicle counts, and the rolling status/error
+// line normally only useful during development. Off by default, toggled from the
+// controls panel like every other switch (see setDebug/setLastUpdateTs/updateVehicleCount
+// for what feeds it), and no longer force-hidden on small screens — see #debug-panel CSS.
+let debugPanelEnabled=false;
+function setDebugPanelEnabled(on){
+  debugPanelEnabled=on;
+  const el=document.getElementById("debug-panel");
+  if(el) el.hidden=!on;
+}
+
 // Repaint the shared vehicle canvas once (used by the marker-decoration toggles).
 function repaintVehicles(){
   try{
@@ -2379,6 +2392,7 @@ async function init(){
       if(layer==="overlays"){ setOverlaysEnabled(e.target.checked); }
       else if(layer==="focus"){ setRouteFocusEnabled(e.target.checked); }
       else if(layer==="dashboard"){ setDashboardEnabled(e.target.checked); }
+      else if(layer==="debug"){ setDebugPanelEnabled(e.target.checked); }
       else if(layer==="occupancy"){ setOccupancyRingsEnabled(e.target.checked); }
       else if(layer==="bearing"){ setBearingTicksEnabled(e.target.checked); }
       else if(layer==="stops"){ setStopsEnabled(e.target.checked); }
@@ -2421,6 +2435,10 @@ async function init(){
   const bearingCb=document.querySelector('#filters input[data-layer="bearing"]');
   occupancyRingsEnabled = !!document.querySelector('#filters input[data-layer="occupancy"]')?.checked;
   bearingTicksEnabled = bearingCb ? bearingCb.checked : true;
+
+  // Debug info panel: sync to its switch (default off).
+  const debugCb=document.querySelector('#filters input[data-layer="debug"]');
+  setDebugPanelEnabled(debugCb ? debugCb.checked : false);
 
   // Warm the larger bus_routes.geojson on the idle queue so the first bus click is usually
   // instant, without blocking first paint. Click-time load still covers a cold cache.

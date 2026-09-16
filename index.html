@@ -119,7 +119,7 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
 .switch-row {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 4px 8px; border-radius: var(--r-md);
+  padding: 3px 8px; border-radius: var(--r-md);
   font-size: 13px; color: var(--text-strong);
   cursor: pointer; user-select: none;
   transition: background-color 120ms ease;
@@ -127,15 +127,19 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 .switch-row:hover { background: var(--accent-weak); }
 .switch-label { line-height: 1.15; }
 
-/* iOS-style toggle (native checkbox sits invisible on top for a11y + label clicks) */
-.switch { position: relative; flex: 0 0 auto; width: 34px; height: 20px; }
+/* iOS-style toggle (native checkbox sits invisible on top for a11y + label clicks).
+   Sized a couple of px smaller than a native iOS switch — the whole row is the tap
+   target (it's a <label>), so the visual switch itself can be compact without hurting
+   touch accuracy. Knob travel = track width - knob width - 2*inset, so it self-cancels
+   with the sizes below; recompute translateX if either changes. */
+.switch { position: relative; flex: 0 0 auto; width: 32px; height: 18px; }
 .switch input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; z-index: 2; }
 .switch .track {
   position: absolute; inset: 0; border-radius: 999px;
   background: rgba(120,120,128,0.30); transition: background-color 180ms ease;
 }
 .switch .knob {
-  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
   border-radius: 50%; background: #fff;
   box-shadow: 0 1px 3px rgba(0,0,0,0.3), 0 0 1px rgba(0,0,0,0.2);
   transition: transform 180ms ease;
@@ -246,12 +250,15 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
   .dash-route-extra{ display: none; }                /* keep mobile to the top 3 routes */
 }
 
-#debug, #vehicle-count {
+/* Debug info panel: last poll time, live vehicle counts, rolling status line. Hidden by
+   default and toggled from its own switch (data-layer="debug") rather than forced off on
+   small screens, so it now works the same on phones as on desktop. */
+#debug-panel{
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 10.5px; color: var(--text-subtle); line-height: 1.3;
-  padding: 0 6px;
+  padding: 4px 6px 2px;
 }
-#debug { margin-top: 4px; }
+#debug-panel:not([hidden]){ display: grid; gap: 2px; }
 
 /* Leaflet popups */
 .leaflet-popup-content { font-size: 14px; line-height: 1.28; color: var(--text-strong); }
@@ -388,11 +395,11 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
     box-shadow: var(--elev-2);
   }
   #controls-toggle{ padding: 10px 12px; font-size: 14px; }
-  #controls-body{ padding: 0 8px 8px; gap: 8px; }
-  .switch-row{ padding: 9px 8px; font-size: 14px; }   /* taller rows = easier taps */
-  .switch{ width: 42px; height: 25px; }
-  .switch .knob{ width: 21px; height: 21px; }
-  .switch input:checked ~ .knob{ transform: translateX(17px); }
+  #controls-body{ padding: 0 8px 8px; gap: 6px; }
+  .switch-row{ padding: 7px 8px; font-size: 14px; }   /* still an easy tap, just tighter now there are more rows */
+  .switch{ width: 38px; height: 22px; }
+  .switch .knob{ width: 18px; height: 18px; }
+  .switch input:checked ~ .knob{ transform: translateX(16px); }
 
   .leaflet-popup-content{ font-size: 13.5px; line-height: 1.35; }
 
@@ -426,10 +433,6 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
     max-width: min(50vw, 340px);
     max-height: min(48vh, 320px);
   }
-
-  /* hide debug on phones */
-  #debug, #vehicle-count { display: none !important; }
-  #vehicle-count::before { display: none !important; content: none; }
 
   /* show last update badge on phones */
   #mobile-last-update{ display: block; }
@@ -503,10 +506,14 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
         <div class="switch-section">Data</div>
         <label class="switch-row"><span class="switch-label">On-time dashboard</span><span class="switch"><input type="checkbox" data-layer="dashboard"><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Debug info</span><span class="switch"><input type="checkbox" data-layer="debug"><span class="track"></span><span class="knob"></span></span></label>
       </div>
 
-      <div id="debug">Realtime status...</div>
-      <div id="vehicle-count">Vehicles: 0 | Last refresh: N/A</div>
+      <div id="debug-panel" hidden>
+        <div id="debug-last-update">Last update: —</div>
+        <div id="vehicle-count">Vehicles: 0 | Last refresh: N/A</div>
+        <div id="debug">Realtime status...</div>
+      </div>
     </div>
   </div>
 
