@@ -1418,26 +1418,30 @@ function roundRectPath(ctx,x,y,w,h,r){
   ctx.closePath();
 }
 
-// Badge geometry is computed independently of the render context (off-screen measuring
-// canvas) so it is available in _updateBounds, which runs on project/zoom before any draw.
-// Font auto-shrinks a step for longer codes so the text always fits the pill.
+// Badge geometry is measured off-screen and sized from the actual route text. Short route
+// labels stay almost circular; longer labels expand into fully rounded capsules.
 const _badgeMeasureCtx = document.createElement("canvas").getContext("2d");
-// Fixed pill size for visual consistency: every badge is the same width/height regardless of
-// code length. Longer codes (e.g. "WEST") get a slightly smaller font so they still fit,
-// while short codes (e.g. "70") keep the base size, centred in the same pill.
-const BADGE_W=36, BADGE_H=16, BADGE_PADX=5, BADGE_FONT_MAX=11, BADGE_FONT_MIN=8;
+const BADGE_H=22, BADGE_MIN_W=22, BADGE_MAX_W=50;
+const BADGE_PADX=5, BADGE_FONT_MAX=11, BADGE_FONT_MIN=9;
 function badgeFontStr(fs){ return `700 ${fs}px -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif`; }
 function badgeMetrics(text){
   const t=text||"";
-  const inner=BADGE_W-BADGE_PADX*2;
   let fs=BADGE_FONT_MAX;
+  let tw=t.length*BADGE_FONT_MAX*0.62;
   if(_badgeMeasureCtx){
-    for(; fs>BADGE_FONT_MIN; fs--){ _badgeMeasureCtx.font=badgeFontStr(fs); if(_badgeMeasureCtx.measureText(t).width<=inner) break; }
+    for(; fs>BADGE_FONT_MIN; fs--){
+      _badgeMeasureCtx.font=badgeFontStr(fs);
+      tw=_badgeMeasureCtx.measureText(t).width;
+      if(tw+BADGE_PADX*2<=BADGE_MAX_W) break;
+    }
+    _badgeMeasureCtx.font=badgeFontStr(fs);
+    tw=_badgeMeasureCtx.measureText(t).width;
   }else{
-    const est=t.length*BADGE_FONT_MAX*0.62;            // rough fallback if no 2D context
-    if(est>inner) fs=Math.max(BADGE_FONT_MIN, Math.floor(BADGE_FONT_MAX*inner/est));
+    const maxInner=BADGE_MAX_W-BADGE_PADX*2;
+    if(tw>maxInner){ fs=Math.max(BADGE_FONT_MIN,Math.floor(BADGE_FONT_MAX*maxInner/tw)); tw=t.length*fs*0.62; }
   }
-  return {W:BADGE_W,H:BADGE_H,hw:BADGE_W/2,hh:BADGE_H/2,fontSize:fs};
+  const W=Math.max(BADGE_MIN_W,Math.min(BADGE_MAX_W,Math.ceil(tw+BADGE_PADX*2)));
+  return {W,H:BADGE_H,hw:W/2,hh:BADGE_H/2,fontSize:fs};
 }
 
 
@@ -1593,160 +1597,6 @@ function updateVehicleCount(){
     }
   }
   const el=document.getElementById("vehicle-count"); if(el) el.textContent=`Buses: ${busCount}, Trains: ${trainCount}, Ferries: ${ferryCount}`;
-}
-
-// ===================== Session on-time dashboard ====================================
-// Aggregates the per-vehicle schedule delay (already computed each poll for the popups)
-// into a live punctuality readout: a headline on-time %, an Early / On time / Late split,
-// an on-time % per mode, and the routes running most behind. "On time" = no more than 90s
-// early and no more than 5 min late (a common transit punctuality window). The headline
-// "session" figure is a running average of each poll's network on-time %, so it reads as
-// performance over the time the map has been open rather than a single instant. Sampling
-// runs every poll regardless of whether the panel is visible, so opening it shows the full
-// session so far.
-const ONTIME_EARLY_S = -90;    // earlier than this  => "Early" bucket
-const ONTIME_LATE_S  = 300;    // later than this    => "Late" bucket
-const DASH_MIN_SAMPLES = 5;    // ignore polls with too few schedule readings to be meaningful
-const SESSION_HISTORY_MAX = 80;// sparkline length (oldest points roll off)
-let dashboardEnabled=false;
-let sessionPolls=0, sessionScoreSum=0;
-let sessionStart=Date.now();
-const sessionHistory=[];       // per-poll graded punctuality score over the session (desktop trend)
-let lastPunctuality=null;
-
-function bucketForDelay(d){ return d<ONTIME_EARLY_S ? "early" : (d>ONTIME_LATE_S ? "late" : "ontime"); }
-
-// Graded punctuality: 1.0 = on time, decaying smoothly with how far off schedule a vehicle
-// is, so a few seconds late counts as essentially on time and only sizeable delays pull the
-// score down. A short grace window stays at 1.0, then an exponential decay (lateness is
-// penalised a little more gently than running early, which strands passengers).
-function punctualityScore(d){
-  const graceLate=60, graceEarly=30, tauLate=300, tauEarly=180;
-  if(d>graceLate)   return Math.exp(-(d-graceLate)/tauLate);
-  if(d<-graceEarly) return Math.exp(-(-d-graceEarly)/tauEarly);
-  return 1;
-}
-
-function updatePunctuality(samples){
-  const buckets={early:0,ontime:0,late:0};
-  const byMode={bus:{n:0,sc:0,sum:0},train:{n:0,sc:0,sum:0},ferry:{n:0,sc:0,sum:0}};
-  const late=[];
-  let n=0, sum=0, scoreSum=0;
-  for(const s of (samples||[])){
-    const d=s.delay; if(d==null) continue;
-    n++; sum+=d;
-    const sc=punctualityScore(d); scoreSum+=sc;
-    buckets[bucketForDelay(d)]++;
-    const m=byMode[s.mode]; if(m){ m.n++; m.sc+=sc; m.sum+=d; }
-    if(d>60) late.push({ route:s.route||"?", label:(s.label && s.label!=="N/A") ? s.label : "", delay:d });
-  }
-  const pollScore = n ? Math.round(100*scoreSum/n) : null;   // graded, not a hard on-time %
-  const avgDelay  = n ? sum/n : null;
-  if(n>=DASH_MIN_SAMPLES && pollScore!=null){
-    sessionPolls++; sessionScoreSum+=pollScore;
-    sessionHistory.push(pollScore);
-    if(sessionHistory.length>SESSION_HISTORY_MAX) sessionHistory.shift();
-  }
-  const sessionAvg = sessionPolls ? Math.round(sessionScoreSum/sessionPolls) : pollScore;
-
-  // The individual vehicles running most behind right now (each row names the vehicle).
-  const worst=late.sort((a,b)=>b.delay-a.delay).slice(0,6);
-
-  lastPunctuality={ n, buckets, pollScore, sessionAvg, avgDelay, byMode, worst };
-  renderDashboard();
-  savePunctuality();
-}
-
-function fmtMinSec(sec){
-  const a=Math.abs(Math.round(sec)), m=Math.floor(a/60), s=a%60;
-  return a<60 ? `${a}s` : (s?`${m}m ${s}s`:`${m}m`);
-}
-
-// ---- Persistent session history (survives reloads within PUNCT_MAX_AGE) -------------
-const PUNCT_KEY="punctuality:v1";
-const PUNCT_MAX_AGE_MS=8*60*60*1000;     // older than this on load => start a fresh session
-let _punctSaveTs=0;
-function savePunctuality(){
-  const now=Date.now();
-  if(now-_punctSaveTs<15000) return;     // throttle IDB writes to ~once / 15s
-  _punctSaveTs=now;
-  idbPutMany([[PUNCT_KEY,{ history:sessionHistory.slice(-SESSION_HISTORY_MAX), polls:sessionPolls, sum:sessionScoreSum, start:sessionStart, savedAt:now }]]);
-}
-async function loadPunctuality(){
-  let rec=null; try{ rec=await idbGet(PUNCT_KEY); }catch{}
-  if(!rec || !rec.savedAt || (Date.now()-rec.savedAt)>PUNCT_MAX_AGE_MS) return;
-  if(Array.isArray(rec.history)){ sessionHistory.length=0; for(const v of rec.history) if(typeof v==="number") sessionHistory.push(v); }
-  if(typeof rec.polls==="number") sessionPolls=rec.polls;
-  if(typeof rec.sum==="number")   sessionScoreSum=rec.sum;
-  if(typeof rec.start==="number") sessionStart=rec.start;
-}
-
-// Inline SVG sparkline of the session's punctuality score (0–100 domain). Desktop only.
-function sparklineSVG(vals, w=300, h=40){
-  if(!vals || vals.length<2) return "";
-  const nn=vals.length;
-  const x=i=>(i/(nn-1))*w;
-  const y=v=>h-(Math.max(0,Math.min(100,v))/100)*h;
-  const line=vals.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
-  const area=`0,${h} ${line} ${w},${h}`;
-  return `<svg class="dash-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">`
-    + `<polyline class="spark-area" points="${area}"/>`
-    + `<polyline class="spark-line" points="${line}"/></svg>`;
-}
-
-function renderDashboard(){
-  const body=document.getElementById("dashboard-body");
-  if(!body || !dashboardEnabled) return;
-  const P=lastPunctuality;
-  if(!P || !P.n){ body.innerHTML=`<p class="dash-empty">Waiting for schedule data…</p>`; return; }
-
-  const sinceMin=Math.max(1,Math.round((Date.now()-sessionStart)/60000));
-  const total=(P.buckets.early+P.buckets.ontime+P.buckets.late)||1;
-  const pctOf=k=>Math.round(100*P.buckets[k]/total);
-  const avgTxt = P.avgDelay==null ? "—"
-    : (Math.abs(P.avgDelay)<=30 ? "on time"
-      : (P.avgDelay>0 ? `${fmtMinSec(P.avgDelay)} late` : `${fmtMinSec(P.avgDelay)} early`));
-
-  const modeRow=(key,name)=>{
-    const m=P.byMode[key]; if(!m || !m.n) return "";
-    const pct=Math.round(100*m.sc/m.n);              // graded score per mode
-    return `<div class="dash-mode"><span class="name">${name}</span><span class="bar"><span style="width:${pct}%"></span></span><span class="pct">${pct}</span></div>`;
-  };
-  const worstRows=P.worst.length
-    ? P.worst.map((r,i)=>`<div class="dash-route${i>=3?" dash-route-extra":""}"><span class="badge">${escapeHtml(String(r.route).slice(0,6))}</span><span class="veh">${r.label?escapeHtml(String(r.label)):"—"}</span><span class="delay">${fmtMinSec(r.delay)} late</span></div>`).join("")
-    : `<p class="dash-empty">Nothing running notably late.</p>`;
-  const trendBlock = sessionHistory.length>=2
-    ? `<div class="dash-subhead dash-desktop-only">Session trend</div><div class="dash-desktop-only">${sparklineSVG(sessionHistory)}</div>`
-    : "";
-
-  body.innerHTML=`
-    <div class="dash-hero">
-      <span class="num">${P.sessionAvg ?? "—"}</span><span class="unit">/100</span>
-      <span class="sub">session punctuality<br>${P.n} live · ${sinceMin} min · avg ${avgTxt}</span>
-    </div>
-    ${trendBlock}
-    <div class="dash-split" role="img" aria-label="Early ${pctOf("early")}%, on time ${pctOf("ontime")}%, late ${pctOf("late")}%">
-      <span class="seg early" style="width:${pctOf("early")}%"></span>
-      <span class="seg ontime" style="width:${pctOf("ontime")}%"></span>
-      <span class="seg late" style="width:${pctOf("late")}%"></span>
-    </div>
-    <div class="dash-buckets">
-      <div class="dash-chip early"><div class="c">${P.buckets.early}</div><div class="l">Early</div></div>
-      <div class="dash-chip ontime"><div class="c">${P.buckets.ontime}</div><div class="l">On time</div></div>
-      <div class="dash-chip late"><div class="c">${P.buckets.late}</div><div class="l">Late</div></div>
-    </div>
-    <div class="dash-subhead">By mode (punctuality /100)</div>
-    ${modeRow("bus","Bus")}${modeRow("train","Train")}${modeRow("ferry","Ferry")}
-    <div class="dash-subhead">Running behind</div>
-    ${worstRows}
-  `;
-}
-
-function setDashboardEnabled(on){
-  dashboardEnabled=on;
-  const el=document.getElementById("dashboard");
-  if(el) el.hidden=!on;
-  if(on) renderDashboard();
 }
 
 // Debug info panel: last poll time, live vehicle counts, and the rolling status/error
@@ -2133,7 +1983,6 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       if(sep && sep.size) delayMap=sep;
     }
 
-    const punctSamples=[]; // {mode,route,delay} for the on-time dashboard
     vehicles.forEach(v=>{
       const vehicleId=v.vehicle?.vehicle?.id; if(!v.vehicle||!v.vehicle.position||!vehicleId) return; newIds.add(vehicleId);
       const lat=v.vehicle.position.latitude, lon=v.vehicle.position.longitude;
@@ -2258,7 +2107,6 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       // pick the most relevant delay from the trip update).
       const tu=(typeKey!=="out" && tripId) ? delayMap.get(tripId) : null;
       const delaySec=tu ? delayForTrip(tu, stopSeq) : null;
-      if(typeKey!=="out" && delaySec!=null) punctSamples.push({mode:typeKey, route:routeName, delay:delaySec, label:vehicleLabel});
       const scheduleLine=scheduleLineHtml(delaySec);
 
       // Next stops: list the next few from the trip update (name + ETA); fall back to the
@@ -2330,7 +2178,6 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     lastPollOkTs=nowTs;
     updateVehicleCount();
     applyRouteFocus(); // keep dimming consistent as vehicles appear/disappear
-    updatePunctuality(punctSamples); // refresh the on-time dashboard from this poll
     refreshOpenStopPopup(); // keep an open station's arrivals board live
 
     await fetchTripsBatch([...new Set(allTripIds)]);
@@ -2440,7 +2287,6 @@ async function init(){
       const layer=e.target.getAttribute("data-layer");
       if(layer==="overlays"){ setOverlaysEnabled(e.target.checked); }
       else if(layer==="focus"){ setRouteFocusEnabled(e.target.checked); }
-      else if(layer==="dashboard"){ setDashboardEnabled(e.target.checked); }
       else if(layer==="debug"){ setDebugPanelEnabled(e.target.checked); }
       else if(layer==="occupancy"){ setOccupancyRingsEnabled(e.target.checked); }
       else if(layer==="bearing"){ setBearingTicksEnabled(e.target.checked); }
@@ -2463,22 +2309,6 @@ async function init(){
   // Route focus starts from the switch's initial state (default off).
   const focusCb=document.querySelector('#filters input[data-layer="focus"]');
   routeFocusEnabled = focusCb ? focusCb.checked : false;
-
-  // On-time dashboard: restore any persisted session history, sync to its switch (default
-  // off) and wire its close button.
-  const dashCb=document.querySelector('#filters input[data-layer="dashboard"]');
-  await loadPunctuality();
-  setDashboardEnabled(dashCb ? dashCb.checked : false);
-  const dashClose=document.getElementById("dashboard-close");
-  if(dashClose) dashClose.addEventListener("click",()=>{
-    const cb=document.querySelector('#filters input[data-layer="dashboard"]');
-    if(cb) cb.checked=false;
-    setDashboardEnabled(false);
-  });
-  // Flush the session history when the tab is hidden/closed so nothing is lost.
-  const flushPunct=()=>{ _punctSaveTs=0; savePunctuality(); };
-  window.addEventListener("pagehide", flushPunct);
-  document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="hidden") flushPunct(); });
 
   // Optional marker decorations: heading arrows (default on) and occupancy rings (default off).
   const bearingCb=document.querySelector('#filters input[data-layer="bearing"]');

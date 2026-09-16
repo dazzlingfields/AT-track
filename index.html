@@ -148,108 +148,6 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 .switch input:checked ~ .knob { transform: translateX(14px); }
 .switch input:focus-visible ~ .track { box-shadow: var(--ring); }
 
-/* On-time performance dashboard */
-#dashboard{
-  position: absolute;
-  right: 12px;
-  bottom: calc(12px + env(safe-area-inset-bottom));
-  z-index: 1200;
-  width: 320px;
-  max-width: calc(100vw - 24px);
-  max-height: calc(100vh - 24px);
-  background: var(--panel-bg);
-  backdrop-filter: var(--panel-backdrop);
-  -webkit-backdrop-filter: var(--panel-backdrop);
-  border: 1px solid var(--panel-border);
-  border-radius: var(--r-xl);
-  box-shadow: var(--elev-2);
-  overflow: hidden;
-  display: flex; flex-direction: column;
-}
-#dashboard[hidden]{ display: none; }
-.dash-head{
-  display: flex; align-items: center; gap: 8px;
-  padding: 11px 12px 9px;
-}
-.dash-dot{
-  width: 8px; height: 8px; border-radius: 50%;
-  background: #1a8f3c; flex: 0 0 auto;
-  box-shadow: 0 0 0 0 rgba(26,143,60,0.5);
-  animation: dashpulse 2.4s ease-out infinite;
-}
-@keyframes dashpulse{
-  0%{ box-shadow: 0 0 0 0 rgba(26,143,60,0.45); }
-  70%{ box-shadow: 0 0 0 7px rgba(26,143,60,0); }
-  100%{ box-shadow: 0 0 0 0 rgba(26,143,60,0); }
-}
-.dash-title{ font-weight: 700; font-size: 14px; letter-spacing: 0.2px; flex: 1 1 auto; }
-.dash-close{
-  -webkit-appearance: none; appearance: none;
-  border: 0; background: transparent; cursor: pointer;
-  color: var(--text-subtle); font-size: 15px; line-height: 1;
-  width: 24px; height: 24px; border-radius: 8px;
-}
-.dash-close:hover{ background: var(--accent-weak); color: var(--text-strong); }
-#dashboard-body{ padding: 4px 12px 12px; overflow-y: auto; }
-.dash-empty{ margin: 4px 0 8px; color: var(--text-subtle); font-size: 13px; }
-
-/* Headline punctuality score */
-.dash-hero{ display: flex; align-items: baseline; gap: 8px; margin: 2px 0 10px; }
-.dash-hero .num{ font-size: 40px; font-weight: 800; letter-spacing: -0.5px; line-height: 1; }
-.dash-hero .unit{ font-size: 16px; font-weight: 700; opacity: 0.6; }
-.dash-hero .sub{ font-size: 11px; color: var(--text-subtle); margin-left: auto; text-align: right; line-height: 1.3; }
-
-/* Session trend sparkline (desktop) */
-.dash-spark{ display: block; width: 100%; height: 40px; margin: 0 0 10px; }
-.dash-spark .spark-area{ fill: var(--accent-weak); stroke: none; }
-.dash-spark .spark-line{ fill: none; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke-linecap: round; }
-
-/* Proportional Early / On time / Late bar */
-.dash-split{ display: flex; height: 8px; border-radius: 999px; overflow: hidden; margin: 2px 0 10px; background: rgba(120,120,128,0.18); }
-.dash-split .seg{ height: 100%; }
-.dash-split .seg.early{ background: #0a84ff; }
-.dash-split .seg.ontime{ background: #1a8f3c; }
-.dash-split .seg.late{ background: #d0021b; }
-
-/* Early / On time / Late chips */
-.dash-buckets{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 10px; }
-.dash-chip{
-  border-radius: var(--r-md); padding: 7px 6px; text-align: center;
-  background: rgba(120,120,128,0.10);
-}
-.dash-chip .c{ font-size: 16px; font-weight: 800; line-height: 1; }
-.dash-chip .l{ font-size: 10px; color: var(--text-subtle); margin-top: 3px; letter-spacing: 0.2px; text-transform: uppercase; }
-.dash-chip.early .c{ color: #0a84ff; }
-.dash-chip.ontime .c{ color: #1a8f3c; }
-.dash-chip.late .c{ color: #d0021b; }
-
-.dash-subhead{ font-size: 11px; font-weight: 600; letter-spacing: 0.3px; text-transform: uppercase; color: var(--text-subtle); margin: 4px 0 5px; }
-
-/* By-mode mini bars */
-.dash-mode{ display: grid; grid-template-columns: 46px 1fr 34px; align-items: center; gap: 8px; margin: 5px 0; font-size: 12px; }
-.dash-mode .name{ color: var(--text-strong); }
-.dash-mode .bar{ height: 6px; border-radius: 999px; background: rgba(120,120,128,0.18); overflow: hidden; }
-.dash-mode .bar > span{ display: block; height: 100%; border-radius: 999px; background: var(--accent); }
-.dash-mode .pct{ text-align: right; color: var(--text-subtle); font-variant-numeric: tabular-nums; }
-
-/* Most-delayed individual vehicles: route badge · vehicle number · delay */
-.dash-route{ display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; margin: 5px 0; font-size: 12px; }
-.dash-route .badge{
-  display: inline-block; min-width: 30px; text-align: center;
-  background: var(--accent); color: #fff; border-radius: 8px;
-  padding: 2px 6px; font-weight: 700; font-size: 11px;
-}
-.dash-route .veh{ color: var(--text-subtle); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dash-route .delay{ color: #d0021b; font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
-
-@media (prefers-reduced-motion: reduce){ .dash-dot{ animation: none; } }
-@media (max-width: 600px){
-  #dashboard{ width: 216px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); border-radius: 16px; }
-  .dash-hero .num{ font-size: 30px; }
-  .dash-desktop-only{ display: none !important; }   /* sparkline + trend label */
-  .dash-route-extra{ display: none; }                /* keep mobile to the top 3 routes */
-}
-
 /* Debug info panel: last poll time, live vehicle counts, rolling status line. Hidden by
    default and toggled from its own switch (data-layer="debug") rather than forced off on
    small screens, so it now works the same on phones as on desktop. */
@@ -505,7 +403,6 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
         <label class="switch-row"><span class="switch-label">Occupancy rings</span><span class="switch"><input type="checkbox" data-layer="occupancy"><span class="track"></span><span class="knob"></span></span></label>
 
         <div class="switch-section">Data</div>
-        <label class="switch-row"><span class="switch-label">On-time dashboard</span><span class="switch"><input type="checkbox" data-layer="dashboard"><span class="track"></span><span class="knob"></span></span></label>
         <label class="switch-row"><span class="switch-label">Debug info</span><span class="switch"><input type="checkbox" data-layer="debug"><span class="track"></span><span class="knob"></span></span></label>
       </div>
 
@@ -521,23 +418,12 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
   <div id="mobile-last-update">Last update: —</div>
 
-  <section id="dashboard" hidden aria-label="On-time performance">
-    <header class="dash-head">
-      <span class="dash-dot" aria-hidden="true"></span>
-      <span class="dash-title">On-time performance</span>
-      <button id="dashboard-close" class="dash-close" type="button" title="Hide dashboard" aria-label="Hide dashboard">✕</button>
-    </header>
-    <div id="dashboard-body">
-      <p class="dash-empty">Waiting for schedule data…</p>
-    </div>
-  </section>
   <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
   <script src="script.js"></script>
 
 </body>
 </html>
-
 
 
 
