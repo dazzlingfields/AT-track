@@ -310,9 +310,8 @@ function buildPopup(routeName,destination,nextStopLine,vehicleLabel,busType,lice
 }
 
 // ---- Schedule adherence (late / early) from GTFS-RT trip updates --------------------
-// Delay lives in trip_update entities, not in vehicle positions. AT's legacy feed is a
-// combined feed, so these usually arrive in the SAME response we already fetch (no extra
-// calls). buildDelayMap indexes them by trip_id; delayForTrip picks the most relevant
+// Delay lives in trip_update entities, not in the vehicle-position feed.
+// buildDelayMap indexes trip updates by trip_id; delayForTrip picks the most relevant
 // stop's delay; formatDelay renders a coloured "X late / early / On time" line.
 function buildDelayMap(entities){
   const map=new Map();
@@ -437,7 +436,8 @@ function buildNextStopsLine(tu, currentStopSeq, fallbackStopId, limit=4){
   return `<b>${label}</b><div style="margin-top:2px;">${rows}</div>`;
 }
 
-// Fallback path: only used if the combined realtime feed carries no trip updates.
+// The vehicle-position feed normally carries no trip updates, so this switches to the
+// separately cached /api/tripupdates endpoint after the first vehicle response.
 let useSeparateTripUpdates=false;
 async function fetchTripUpdatesDelays(){
   const json=await safeFetch(tripUpdatesUrl);
@@ -2074,8 +2074,8 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     const newIds=new Set(), inServiceAM=[], outOfServiceAM=[], allTripIds=[], cachedState=[];
     vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear(); markersByTrip.clear(); arrivalsByStop.clear();
 
-    // Schedule adherence: prefer trip_update entities already in the combined feed (free).
-    // If the feed carries vehicles but no trip updates, fall back to the dedicated feed.
+    // Schedule adherence comes from trip updates. If none are present alongside the
+    // vehicle entities, use the separately cached trip-update feed.
     let delayMap=buildDelayMap(vehicles);
     const hasVehicles=vehicles.some(e=>e.vehicle);
     if(delayMap.size===0 && hasVehicles) useSeparateTripUpdates=true;
