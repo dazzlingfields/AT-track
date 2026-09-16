@@ -169,6 +169,12 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
   border-radius: var(--r-lg);
   box-shadow: var(--elev-1);
 }
+.station-name-tooltip{
+  background:rgba(255,255,255,0.94); color:var(--text-strong);
+  border:1px solid var(--panel-border); border-radius:8px;
+  box-shadow:var(--elev-1); padding:4px 7px; font-weight:600;
+}
+.station-name-tooltip::before{ border-top-color:rgba(255,255,255,0.94); }
 
 /* Search control wrapper sits beneath #controls, in the left stack */
 .leaflet-control.search-wrapper{
@@ -397,6 +403,7 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
         <div class="switch-section">Map</div>
         <label class="switch-row"><span class="switch-label">Map overlays</span><span class="switch"><input type="checkbox" data-layer="overlays" checked><span class="track"></span><span class="knob"></span></span></label>
         <label class="switch-row"><span class="switch-label">Route focus</span><span class="switch"><input type="checkbox" data-layer="focus"><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Follow selected vehicle</span><span class="switch"><input type="checkbox" data-layer="follow" checked><span class="track"></span><span class="knob"></span></span></label>
 
         <div class="switch-section">Markers</div>
         <label class="switch-row"><span class="switch-label">Heading arrows</span><span class="switch"><input type="checkbox" data-layer="bearing" checked><span class="track"></span><span class="knob"></span></span></label>
@@ -424,6 +431,4 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
 </body>
 </html>
-
-
 

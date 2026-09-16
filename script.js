@@ -45,7 +45,8 @@ const mobileUpdateEl=document.getElementById("mobile-last-update");
 const debugLastUpdateEl=document.getElementById("debug-last-update");
 
 let pinnedPopup=null;           
-let pinnedFollow=false;            
+let pinnedFollow=false;
+let followSelectedEnabled=true;
 
 // Route focus mode: when the switch is on and a vehicle is selected, every vehicle NOT on
 // the selected route is dimmed so a single line stands out. focusedRouteKey is the
@@ -71,12 +72,11 @@ map.on("popupclose", ()=> { pinnedFollow=false; });
 
 const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"};
 // Legacy (pre-CRL) line colours, plus the post-CRL lines that replace them from 13 Sept
-// 2026: South City (SC) and Onehunga West (OW) keep their predecessor's colour since
-// they're largely the same route; East West (EW) gets a new colour since it's a genuine
-// merge of the old Eastern (yellow) and Western (green) lines. See resolveTrainLineCode.
+// 2026: South City (SC), East West (EW), and Onehunga West (OW) use the red, green, and
+// blue identities of their principal predecessor corridors. See resolveTrainLineCode.
 const trainLineColors={
   STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8",HUIA:"#8e44ad",
-  SC:"#d0021b",EW:"#f5a623",OW:"#0e76a8"
+  SC:"#d0021b",EW:"#7fbf6a",OW:"#0e76a8"
 };
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 // Ring colours for the optional occupancy overlay, green (empty) -> red (full).
@@ -232,9 +232,10 @@ function getBusType(op,num){const ix=busTypeIndex[op]; return ix?(ix[num]||""):"
 function resolveTrainLineCode(s){
   const u=(s||"").toString().toUpperCase();
   if(!u) return null;
-  if(u.includes("S-C")||u.includes("SOUTH-CITY")||u.includes("SOUTH CITY")||u.includes("SOUTHCITY")) return "SC";
-  if(u.includes("E-W")||u.includes("EAST-WEST")||u.includes("EAST WEST")||u.includes("EASTWEST")) return "EW";
-  if(u.includes("O-W")||u.includes("ONEHUNGA-WEST")||u.includes("ONEHUNGA WEST")||u.includes("ONEHUNGAWEST")) return "OW";
+  const words=new Set(u.split(/[^A-Z0-9]+/).filter(Boolean));
+  if(words.has("SC")||u.includes("S-C")||u.includes("SOUTH-CITY")||u.includes("SOUTH CITY")||u.includes("SOUTHCITY")) return "SC";
+  if(words.has("EW")||u.includes("E-W")||u.includes("EAST-WEST")||u.includes("EAST WEST")||u.includes("EASTWEST")) return "EW";
+  if(words.has("OW")||u.includes("O-W")||u.includes("ONEHUNGA-WEST")||u.includes("ONEHUNGA WEST")||u.includes("ONEHUNGAWEST")) return "OW";
   if(u.includes("STH")||u.includes("SOUTHERN")||u.includes("SOUTH")) return "STH";
   if(u.includes("WESTERN")||u.includes("WEST")) return "WEST";
   if(u.includes("EASTERN")||u.includes("EAST")) return "EAST";
@@ -302,7 +303,8 @@ function buildPopup(routeName,destination,nextStopLine,vehicleLabel,busType,lice
       <b>Vehicle:</b> ${vehicleLabel}<br>
       ${busType?`<b>Bus model:</b> ${busType}<br>`:""}
       <b>Number plate:</b> ${licensePlate}<br>
-      <b>Speed:</b> ${speedStr}${scheduleLine||""}<br>
+      <b>Speed:</b> ${speedStr}<br>
+      ${scheduleLine||"<b>Delay:</b> N/A<br>"}
       <b>Occupancy:</b> ${occupancy}
       ${bikesLine||""}
       ${extraLines||""}
@@ -372,7 +374,7 @@ function scheduleLineHtml(sec){
   if(sec==null) return "";
   const txt=formatDelay(sec);
   const col = txt==="On time" ? "#1a8f3c" : (sec>0 ? "#d0021b" : "#0a84ff");
-  return `<br><b>Schedule:</b> <span style="color:${col}">${txt}</span>`;
+  return `<b>Delay:</b> <span style="color:${col}">${txt}</span><br>`;
 }
 
 // ---- Next stop (vehicle popup) ------------------------------------------------------
@@ -553,13 +555,26 @@ function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg){
 // Keep the followed vehicle roughly centred. Called once per poll after positions update,
 // and per-frame while a tween is running so following stays smooth.
 function followPinnedIfNeeded(animate){
-  if(!(pinnedPopup && pinnedFollow)) return;
+  if(!(followSelectedEnabled && pinnedPopup && pinnedFollow)) return;
   try{
     const ll=pinnedPopup.getLatLng();
     const c=map.latLngToLayerPoint(map.getCenter());
     const p=map.latLngToLayerPoint(ll);
     if(Math.abs(c.x-p.x)>6 || Math.abs(c.y-p.y)>6) map.panTo(ll,{animate});
   }catch{}
+}
+
+function setFollowSelectedEnabled(on){
+  followSelectedEnabled=!!on;
+  if(!followSelectedEnabled){
+    pinnedFollow=false;
+    return;
+  }
+  if(pinnedPopup){
+    pinnedFollow=true;
+    const ll=pinnedPopup.getLatLng();
+    map.setView(ll,Math.max(map.getZoom(),14),{animate:true});
+  }
 }
 
 // ===================== Position tween (between consecutive reported fixes) ============
@@ -803,15 +818,20 @@ function nearestStop(lat,lon,maxKm){
 // Arrivals board shown inside a station/stop popup. Lists inbound services for which THIS
 // station is the next stop, soonest first. Built from arrivalsByStop (refreshed each poll);
 // content is materialised on each popup open, so reopening reflects the latest poll.
-function buildArrivalsBoard(key){
+function buildArrivalsBoard(key, stopType){
+  const label=stopType===1?"Next trains":(stopType===2?"Next ferries":"Next services");
   const list = key ? arrivalsByStop.get(key) : null;
-  if(!list || !list.length) return "";
+  if(!list || !list.length){
+    if(stopType!==1 && stopType!==2) return "";
+    return `<div data-arrivals-preview="true" style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>${label}</b><div style="margin-top:3px;color:var(--text-subtle);font-size:0.92em;">Waiting for live predictions…</div></div>`;
+  }
   const rows = list
+    .filter(a=>stopType===1 ? a.typeKey==="train" : (stopType===2 ? a.typeKey==="ferry" : true))
     .map(a=>({a, eta:formatEta(a.etaSec)}))
     .filter(x=>x.eta!=="")                 // drop stale predictions
     .sort((x,y)=>(toNum(x.a.etaSec)??1e15)-(toNum(y.a.etaSec)??1e15))
     .slice(0,6);
-  if(!rows.length) return "";
+  if(!rows.length) return `<div data-arrivals-preview="true" style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>${label}</b><div style="margin-top:3px;color:var(--text-subtle);font-size:0.92em;">No live arrivals available</div></div>`;
   const items = rows.map(({a,eta})=>{
     const badge = escapeHtml(String(a.badge||"?")).slice(0,6);
     const when  = eta==="due" ? "due" : eta.replace("in ","");
@@ -828,18 +848,19 @@ function buildArrivalsBoard(key){
         <span style="text-align:right;white-space:nowrap;">${when}${late}</span>
       </div>`;
   }).join("");
-  return `<div style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>Next services</b>${items}</div>`;
+  return `<div data-arrivals-preview="true" style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>${label}</b>${items}</div>`;
 }
 function buildStopPopup(m){
   const st=STOP_STYLE[m._stopType]||STOP_STYLE[0];
   const head=`<b>${escapeHtml(m._stopName)}</b><br><span style="color:var(--text-subtle);font-size:0.92em;">Stop ${escapeHtml(String(m._stopCode||"—"))} &middot; ${st.label}</span>`;
-  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${buildArrivalsBoard(m._stopKey)}</div>`;
+  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${buildArrivalsBoard(m._stopKey,m._stopType)}</div>`;
 }
 
 function makeStopMarker(s){
   const st=STOP_STYLE[s[4]]||STOP_STYLE[0];
   const m=L.circleMarker([s[0],s[1]],{renderer:stopsRenderer,radius:st.radius,color:st.color,weight:st.weight,fillColor:st.fill,fillOpacity:0.95,opacity:1,interactive:true,bubblingMouseEvents:false});
   m._stopName=s[3]; m._stopCode=s[2]; m._stopType=s[4]; m._stopKey=s[5];
+  if(s[4]===1) m.bindTooltip(escapeHtml(s[3]),{direction:"top",offset:[0,-7],opacity:0.95,className:"station-name-tooltip"});
   // Function content => rebuilt on every open, so the arrivals board stays current.
   m.bindPopup(()=>buildStopPopup(m),{maxWidth:240,className:"vehicle-popup"});
   // Track the open station popup so the poll can refresh its arrivals board live.
@@ -1003,13 +1024,14 @@ async function loadStops(){
 const RAIL_LINES_FILE="train_routes.geojson";
 let railLinesLayer=null, railLinesEnabled=true;
 const railRouteIndex=new Map(); // line code -> [{pattern,name,segs}]
+const nativeRailCodes=new Set(); // codes physically present in the loaded GeoJSON
 const RAIL_DEDUPE_BY_LINE=true; // keep only the longest pattern per line code (clean overview)
 
 try{ map.createPane("railPane"); map.getPane("railPane").style.zIndex=240; }catch{}
 
 function railLineColor(props){
   const p=props||{};
-  const s=`${p.ROUTENUMBER??p.routenumber??p.ROUTE??""} ${p.ROUTENAME??p.routename??""}`;
+  const s=`${p.ROUTENUMBER??p.routenumber??p.ROUTE_SHORT_NAME??p.route_short_name??p.ROUTE??p.route??""} ${p.ROUTENAME??p.routename??p.ROUTE_LONG_NAME??p.route_long_name??""}`;
   const code=resolveTrainLineCode(s);
   return code ? (trainLineColors[code]||vehicleColors.train) : vehicleColors.train;
 }
@@ -1019,19 +1041,70 @@ function railLineColor(props){
 // be chosen. Geometry comes from the same local file, so no /api/shapes call is required.
 function indexRailRoutesGeoJSON(gj){
   railRouteIndex.clear();
+  nativeRailCodes.clear();
   for(const ft of (gj?.features||[])){
     const p=ft?.properties||{};
     const mode=String(p.MODE??p.mode??"").toLowerCase();
     if(mode && !mode.includes("train") && !mode.includes("rail")) continue;
-    const lineText=`${p.ROUTENUMBER??p.routenumber??p.ROUTE??""} ${p.ROUTENAME??p.routename??""}`;
+    const lineText=`${p.ROUTENUMBER??p.routenumber??p.ROUTE_SHORT_NAME??p.route_short_name??p.ROUTE??p.route??""} ${p.ROUTENAME??p.routename??p.ROUTE_LONG_NAME??p.route_long_name??""}`;
     const code=resolveTrainLineCode(lineText); if(!code) continue;
     const segs=featureSegsLatLon(ft).filter(s=>s.length>=2); if(!segs.length) continue;
+    nativeRailCodes.add(code);
     let arr=railRouteIndex.get(code); if(!arr){ arr=[]; railRouteIndex.set(code,arr); }
     arr.push({
       pattern:String(p.ROUTEPATTERN??p.routepattern??p.OBJECTID??p.objectid??arr.length),
       name:String(p.ROUTENAME??p.routename??code),
       segs
     });
+  }
+  addLegacyCrlFallbacks();
+}
+
+// A stale rail export may contain only the pre-CRL STH/WEST/EAST/ONE routes. Build the
+// three current service shapes from those physical corridors so selecting a new CRL line
+// still works without falling through to the unreliable /api/shapes endpoint. These are
+// used only when the GeoJSON does not already contain a native SC, EW, or OW shape.
+const CRL_POINTS={
+  waitemata:[-36.8444,174.7671], waihorotiu:[-36.8517,174.7635], karangahape:[-36.8588,174.7576],
+  maungawhau:[-36.8664,174.7573], newmarket:[-36.8697,174.7793], henderson:[-36.8809,174.6302]
+};
+const CRL_TUNNEL=[CRL_POINTS.waitemata,CRL_POINTS.waihorotiu,CRL_POINTS.karangahape,CRL_POINTS.maungawhau];
+function longestRailPattern(code){
+  const ps=railRouteIndex.get(code)||[];
+  return ps.reduce((best,p)=>!best||p.segs.reduce((n,s)=>n+s.length,0)>best.segs.reduce((n,s)=>n+s.length,0)?p:best,null);
+}
+function clipPatternNear(pattern,a,b){
+  if(!pattern) return [];
+  let best=null;
+  for(const seg of pattern.segs){
+    if(seg.length<2) continue;
+    let ai=0,bi=0,ad=Infinity,bd=Infinity;
+    seg.forEach((pt,i)=>{
+      const da=haversineM(pt[0],pt[1],a[0],a[1]), db=haversineM(pt[0],pt[1],b[0],b[1]);
+      if(da<ad){ad=da;ai=i;} if(db<bd){bd=db;bi=i;}
+    });
+    const score=ad+bd;
+    if(!best||score<best.score){
+      const lo=Math.min(ai,bi), hi=Math.max(ai,bi);
+      best={score,pts:seg.slice(lo,hi+1)};
+    }
+  }
+  return best?.pts?.length>=2?[best.pts]:[];
+}
+function addLegacyCrlFallbacks(){
+  const south=longestRailPattern("STH"), west=longestRailPattern("WEST");
+  const east=longestRailPattern("EAST"), one=longestRailPattern("ONE");
+  if(!railRouteIndex.has("SC") && south){
+    const link=clipPatternNear(west,CRL_POINTS.maungawhau,CRL_POINTS.newmarket);
+    railRouteIndex.set("SC",[{pattern:"SC-legacy-compat",name:"South-City Line",segs:[...south.segs,CRL_TUNNEL,...link]}]);
+  }
+  if(!railRouteIndex.has("EW") && east && west){
+    const western=clipPatternNear(west,CRL_POINTS.maungawhau,[-36.8670,174.5742]);
+    railRouteIndex.set("EW",[{pattern:"EW-legacy-compat",name:"East-West Line",segs:[...east.segs,CRL_TUNNEL,...western]}]);
+  }
+  if(!railRouteIndex.has("OW") && one && west){
+    const western=clipPatternNear(west,CRL_POINTS.newmarket,CRL_POINTS.henderson);
+    railRouteIndex.set("OW",[{pattern:"OW-legacy-compat",name:"Onehunga-West Line",segs:[...one.segs,...western]}]);
   }
 }
 
@@ -1064,6 +1137,27 @@ async function loadRailLines(){
   indexRailRoutesGeoJSON(gj);
   if(railLinesLayer){ try{ map.removeLayer(railLinesLayer); }catch{} railLinesLayer=null; }
 
+  // If this is a legacy export, render the composed post-CRL service patterns instead of
+  // displaying the retired four-line network. A current export continues through the
+  // normal GeoJSON path below and retains every native geometry detail.
+  const hasCurrentCrl=["SC","EW","OW"].every(code=>nativeRailCodes.has(code));
+  if(!hasCurrentCrl){
+    const layers=[];
+    for(const code of ["SC","EW","OW","HUIA"]){
+      const pattern=longestRailPattern(code); if(!pattern) continue;
+      for(const pts of pattern.segs){
+        if(pts.length<2) continue;
+        const line=L.polyline(pts,{pane:"railPane",color:trainLineColors[code]||vehicleColors.train,weight:3,opacity:0.65,lineJoin:"round",lineCap:"round"});
+        line.bindTooltip(pattern.name||code,{sticky:true});
+        layers.push(line);
+      }
+    }
+    railLinesLayer=L.layerGroup(layers);
+    if(railLinesEnabled) railLinesLayer.addTo(map);
+    setDebug(`Rail lines loaded (${layers.length} CRL-compatible segments)`);
+    return;
+  }
+
   // AT's export carries every pattern variant (dozens of overlapping Southern Line copies),
   // so for a clean network overview keep only the longest pattern per line code. Works the
   // same whether the file is the slim shipped one or a raw multi-pattern AT export.
@@ -1073,7 +1167,7 @@ async function loadRailLines(){
     const longest=new Map(); // line code -> {len, id}
     feats.forEach(f=>{
       const p=f.properties||{};
-      const code=String(p.ROUTENUMBER??p.routenumber??p.OBJECTID??Math.random()).toUpperCase();
+      const code=String(p.ROUTENUMBER??p.routenumber??p.ROUTE_SHORT_NAME??p.route_short_name??p.OBJECTID??Math.random()).toUpperCase();
       const len=Number(p.Shape__Length??p.shape__length??0)||0;
       const id=p.OBJECTID??p.objectid??f;
       const cur=longest.get(code);
@@ -1090,7 +1184,7 @@ async function loadRailLines(){
       style:f=>({color:railLineColor(f.properties),weight:3,opacity:0.65,lineJoin:"round",lineCap:"round"}),
       onEachFeature:(f,layer)=>{
         const p=f.properties||{};
-        const nm=p.ROUTENAME||p.routename||p.ROUTENUMBER||p.routenumber||"Train route";
+        const nm=p.ROUTENAME||p.routename||p.ROUTE_LONG_NAME||p.route_long_name||p.ROUTENUMBER||p.routenumber||p.ROUTE_SHORT_NAME||p.route_short_name||"Train route";
         layer.bindTooltip(String(nm),{sticky:true});
       },
     });
@@ -1380,10 +1474,16 @@ function refreshOpenPopup(m){
 // pipeline (setLatLng -> canvas _draw -> layer._updatePath). At low zoom we fall back to
 // the plain dot to avoid clutter.
 
-// Short code shown in the pill. Trains collapse to the line code (STH/EAST/WEST/ONE);
-// buses use the route_short_name (the bus number). Ferry/out-of-service get no label.
+// Short code shown in the pill. Trains collapse to their line code, buses use the route
+// number, and ferries use a stable three-letter destination/service abbreviation.
 const TRAIN_LINE_BADGES={SC:"S-C",EW:"E-W",OW:"O-W",STH:"STH",WEST:"WEST",EAST:"EAST",ONE:"ONE",HUIA:"HUIA"};
-function badgeForRoute(typeKey, routeName){
+const FERRY_BADGE_RULES=[
+  [/DEVONPORT|\bDEV\b/,"DEV"],[/WAIHEKE|\bWAI\b/,"WAI"],[/BIRKENHEAD|\bBIR\b/,"BIR"],
+  [/BAYSWATER|\bBAY\b/,"BAY"],[/HALF\s*MOON|\bHMB\b/,"HMB"],[/PINE\s*HARBOU?R|\bPNE\b/,"PNE"],
+  [/WEST\s*HARBOU?R|\bWST\b/,"WST"],[/HOBSONVILLE|\bHOB\b/,"HOB"],[/RAKINO|\bRAK\b/,"RAK"],
+  [/GREAT\s*BARRIER|\bGBI\b/,"GBI"],[/GULF\s*HARBOU?R|\bGUL\b/,"GUL"]
+];
+function badgeForRoute(typeKey, routeName, destination=""){
   if(typeKey==="train"){
     const code=resolveTrainLineCode(routeName);
     if(code) return TRAIN_LINE_BADGES[code];
@@ -1395,7 +1495,15 @@ function badgeForRoute(typeKey, routeName){
     if(!s || s==="Unknown" || s==="Out of service") return "";
     return s.length>6 ? s.slice(0,6) : s; // guard against a route_long_name fallback
   }
-  return ""; // ferry / out -> plain dot
+  if(typeKey==="ferry"){
+    const s=`${routeName||""} ${destination||""}`.toUpperCase();
+    for(const [re,badge] of FERRY_BADGE_RULES) if(re.test(s)) return badge;
+    const raw=(!routeName||routeName==="Unknown")?destination:routeName;
+    const compact=(raw||"").toUpperCase().replace(/[^A-Z0-9]/g,"");
+    if(!compact||compact==="UNKNOWN") return "FER";
+    return compact.slice(0,3)||"FER";
+  }
+  return "";
 }
 
 // Pick black or white text for legibility over the pill's fill colour.
@@ -1574,7 +1682,8 @@ function addOrUpdateMarker(id,lat,lon,color,type,tripId,fields={}){
       marker.on("mouseout", function(){ if(pinnedPopup!==this) this.closePopup(); });
       marker.on("click",    function(e){
         if(pinnedPopup&&pinnedPopup!==this) pinnedPopup.closePopup();
-        pinnedPopup=this; pinnedFollow=true;
+        pinnedPopup=this; pinnedFollow=followSelectedEnabled;
+        if(followSelectedEnabled) map.setView(this.getLatLng(),Math.max(map.getZoom(),14),{animate:true});
         this.openPopup();
         showRouteOutlineFor(this);
         focusOnMarkerIfEnabled(this);
@@ -1748,13 +1857,14 @@ const SearchControl=L.Control.extend({
 
       if (pinnedPopup && pinnedPopup !== m) pinnedPopup.closePopup();
       pinnedPopup = m;
-      pinnedFollow = true;
+      pinnedFollow = followSelectedEnabled;
       showRouteOutlineFor(m);
       focusOnMarkerIfEnabled(m);
 
-      const needMove =
+      const needMove = followSelectedEnabled && (
         map.getZoom() < targetZoom ||
-        !map.getBounds().pad(-0.25).contains(ll);
+        !map.getBounds().pad(-0.25).contains(ll)
+      );
 
       const doOpen = () => {
         try {
@@ -1904,7 +2014,7 @@ async function fetchTripsBatch(tripIds){
         const r=routes[trip.route_id]||{};
         const routeName=r.route_short_name||r.route_long_name||"Unknown";
         const destination=trip.trip_headsign||r.route_long_name||"Unknown";
-        ms.forEach(m=>{ m.routeName=routeName; m.destination=destination; m.badgeText=badgeForRoute(m.currentType,routeName); m.redraw(); refreshOpenPopup(m); });
+        ms.forEach(m=>{ m.routeName=routeName; m.destination=destination; m.badgeText=badgeForRoute(m.currentType,routeName,destination); m.redraw(); refreshOpenPopup(m); });
       });
     }
   }
@@ -1933,7 +2043,7 @@ function pairAMTrains(inSvc,outOfService){
 function renderFromCache(c){
   if(!c) return;
   c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.color,v.typeKey,v.tripId,{
-    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",nextStopLine:v.nextStopLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||"",routeName:v.routeName||"Unknown",destination:v.destination||"Unknown",extraLines:v.extraLines||"",badgeText:v.badgeText??badgeForRoute(v.typeKey,v.routeName||"")
+    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",nextStopLine:v.nextStopLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||"",routeName:v.routeName||"Unknown",destination:v.destination||"Unknown",extraLines:v.extraLines||"",badgeText:v.badgeText??badgeForRoute(v.typeKey,v.routeName||"",v.destination||"")
   }));
   const ts = c[0]?.ts || Date.now();
   setDebug(`Showing cached data (last update: ${new Date(ts).toLocaleTimeString()})`);
@@ -1945,7 +2055,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
   const ignoreBackoff = !!opts.ignoreBackoff;
   const now = Date.now();
   const realtimeBlocked = (!ignoreBackoff && backoff.realtime.until && now < backoff.realtime.until);
-  if(!isPageVisible() || vehiclesInFlight || realtimeBlocked) return;
+  if(!pageVisible || vehiclesInFlight || realtimeBlocked) return;
   vehiclesInFlight=true;
 
   const watchdogMs = 10000;
@@ -2121,7 +2231,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         else outOfServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel});
       }
 
-      const badgeText=badgeForRoute(typeKey,routeName);
+      const badgeText=badgeForRoute(typeKey,routeName,destination);
 
       // Register this service against every stop it will reach in the next hour, so a
       // station/stop popup can show the genuinely soonest services arriving (not only the
@@ -2133,7 +2243,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
           if(u.timeSec!=null && (u.timeSec-nowSec)>3600) continue; // only the next hour
           const key = stopKeyById.get(String(u.stopId)) || String(u.stopId);
           let arr=arrivalsByStop.get(key); if(!arr){ arr=[]; arrivalsByStop.set(key,arr); }
-          arr.push({ badge: badgeText || routeName, color, dest: destination, etaSec: u.timeSec, delaySec: u.delay });
+          arr.push({ badge: badgeText || routeName, color, dest: destination, etaSec: u.timeSec, delaySec: u.delay, typeKey });
         }
       }
 
@@ -2208,7 +2318,7 @@ function scheduleNextFetch(){
   const delay=Math.max(base, waitRealtime);
   pollTimeoutId=setTimeout(async()=>{
     pollTimeoutId=null;
-    try{ if(isPageVisible()) await fetchVehicles(); }
+    try{ if(pageVisible) await fetchVehicles(); }
     finally{ scheduleNextFetch(); } // reschedule no matter what happened
   }, delay);
 }
@@ -2219,7 +2329,7 @@ let heartbeatId=null;
 function startHeartbeat(){
   if(heartbeatId) return;
   heartbeatId=setInterval(()=>{
-    if(!isPageVisible()) return;
+    if(!pageVisible) return;
     const stale=!lastPollOkTs || (Date.now()-lastPollOkTs)>STALE_REFRESH_MS;
     if(stale && !vehiclesInFlight && backoff.realtime.until<=Date.now()){
       fetchVehicles({ ignoreBackoff:true });
@@ -2244,17 +2354,27 @@ async function resumeUpdatesNow(){
   }
 }
 
-// Tab-hide/blur pause immediately, and coming back always does an immediate catch-up
-// fetch — no grace period. A delayed pause was tried here and reverted: it meant a short
-// return (under the delay) never flipped pageVisible, so resumeUpdatesNow saw wasHidden
-// as false and skipped the catch-up fetch, leaving stale positions on screen until the
-// ambient ~15-27s poll cycle happened to land. Immediate pause/resume guarantees a fresh
-// fetch the moment the tab becomes visible again, however long it was away.
-document.addEventListener("visibilitychange",()=>{ if(document.hidden) pauseUpdatesNow(); else resumeUpdatesNow(); });
-window.addEventListener("pageshow",()=>{ resumeUpdatesNow(); });
-window.addEventListener("pagehide",()=>{ pauseUpdatesNow(); }); // page is being torn down/bfcached
-window.addEventListener("focus",()=>{ resumeUpdatesNow(); });
-window.addEventListener("blur",()=>{ pauseUpdatesNow(); });
+// Keep polling briefly after a tab becomes hidden. This avoids stopping trip updates for
+// short tab switches while still saving network work when the page stays in the background.
+const HIDDEN_PAUSE_DELAY_MS=30000;
+let hiddenPauseTimer=null;
+function scheduleHiddenPause(){
+  clearTimeout(hiddenPauseTimer);
+  if(!pageVisible) return;
+  setDebug(`Tab hidden. Pausing updates in ${HIDDEN_PAUSE_DELAY_MS/1000}s`);
+  hiddenPauseTimer=setTimeout(()=>{
+    hiddenPauseTimer=null;
+    if(document.hidden) pauseUpdatesNow();
+  },HIDDEN_PAUSE_DELAY_MS);
+}
+function cancelHiddenPause(){ clearTimeout(hiddenPauseTimer); hiddenPauseTimer=null; }
+document.addEventListener("visibilitychange",()=>{
+  if(document.hidden) scheduleHiddenPause();
+  else { cancelHiddenPause(); resumeUpdatesNow(); }
+});
+window.addEventListener("pageshow",()=>{ cancelHiddenPause(); resumeUpdatesNow(); });
+window.addEventListener("pagehide",()=>{ cancelHiddenPause(); pauseUpdatesNow(); }); // torn down/bfcached
+window.addEventListener("focus",()=>{ if(!document.hidden){ cancelHiddenPause(); resumeUpdatesNow(); } });
 
 
 async function init(){
@@ -2287,6 +2407,7 @@ async function init(){
       const layer=e.target.getAttribute("data-layer");
       if(layer==="overlays"){ setOverlaysEnabled(e.target.checked); }
       else if(layer==="focus"){ setRouteFocusEnabled(e.target.checked); }
+      else if(layer==="follow"){ setFollowSelectedEnabled(e.target.checked); }
       else if(layer==="debug"){ setDebugPanelEnabled(e.target.checked); }
       else if(layer==="occupancy"){ setOccupancyRingsEnabled(e.target.checked); }
       else if(layer==="bearing"){ setBearingTicksEnabled(e.target.checked); }
@@ -2309,6 +2430,10 @@ async function init(){
   // Route focus starts from the switch's initial state (default off).
   const focusCb=document.querySelector('#filters input[data-layer="focus"]');
   routeFocusEnabled = focusCb ? focusCb.checked : false;
+
+  // When enabled, selecting a vehicle centres it and keeps the map following its updates.
+  const followCb=document.querySelector('#filters input[data-layer="follow"]');
+  followSelectedEnabled = followCb ? followCb.checked : true;
 
   // Optional marker decorations: heading arrows (default on) and occupancy rings (default off).
   const bearingCb=document.querySelector('#filters input[data-layer="bearing"]');
@@ -2333,7 +2458,7 @@ async function init(){
 
   const initialJitter=300+Math.random()*1200;
   setTimeout(async()=>{
-    if(isPageVisible()) await fetchVehicles({ ignoreBackoff:true });
+    if(pageVisible) await fetchVehicles({ ignoreBackoff:true });
     scheduleNextFetch(); // start the self-perpetuating loop regardless of visibility
   }, initialJitter);
 }
