@@ -694,7 +694,14 @@ async function showRouteOutlineFor(marker){
     if(handled) return;
   }
 
-  // Trains / ferries (and any bus not found in the file): API GTFS shape via shape_id.
+  // Train geometry is already available in train_routes.geojson. Use that local
+  // source for selected trains instead of AT's incomplete per-shape REST endpoint.
+  if(marker.currentType==="train"){
+    const handled=await showTrainRouteFromFile(marker);
+    if(handled) return;
+  }
+
+  // Ferries (and any route absent from its local GeoJSON): API GTFS shape via shape_id.
   if(!marker.tripId){ clearRouteOutline(); marker._progressHtml=""; return; }
   const sid=tripCache[marker.tripId]?.shape_id;
   if(!sid){ clearRouteOutline(); marker._progressHtml=""; console.warn("[shapes] no shape_id for trip", marker.tripId); setDebug("No shape_id for this trip (check /api/trips passes shape_id)"); return; }
@@ -995,6 +1002,7 @@ async function loadStops(){
 // their own pane beneath everything else. Absent file -> layer simply never appears.
 const RAIL_LINES_FILE="train_routes.geojson";
 let railLinesLayer=null, railLinesEnabled=true;
+const railRouteIndex=new Map(); // line code -> [{pattern,name,segs}]
 const RAIL_DEDUPE_BY_LINE=true; // keep only the longest pattern per line code (clean overview)
 
 try{ map.createPane("railPane"); map.getPane("railPane").style.zIndex=240; }catch{}
@@ -1006,6 +1014,46 @@ function railLineColor(props){
   return code ? (trainLineColors[code]||vehicleColors.train) : vehicleColors.train;
 }
 
+// Index every train pattern for click-time route highlighting. Unlike the overview layer,
+// this keeps all patterns so the one matching the selected train's position and heading can
+// be chosen. Geometry comes from the same local file, so no /api/shapes call is required.
+function indexRailRoutesGeoJSON(gj){
+  railRouteIndex.clear();
+  for(const ft of (gj?.features||[])){
+    const p=ft?.properties||{};
+    const mode=String(p.MODE??p.mode??"").toLowerCase();
+    if(mode && !mode.includes("train") && !mode.includes("rail")) continue;
+    const lineText=`${p.ROUTENUMBER??p.routenumber??p.ROUTE??""} ${p.ROUTENAME??p.routename??""}`;
+    const code=resolveTrainLineCode(lineText); if(!code) continue;
+    const segs=featureSegsLatLon(ft).filter(s=>s.length>=2); if(!segs.length) continue;
+    let arr=railRouteIndex.get(code); if(!arr){ arr=[]; railRouteIndex.set(code,arr); }
+    arr.push({
+      pattern:String(p.ROUTEPATTERN??p.routepattern??p.OBJECTID??p.objectid??arr.length),
+      name:String(p.ROUTENAME??p.routename??code),
+      segs
+    });
+  }
+}
+
+async function showTrainRouteFromFile(marker){
+  if(!railRouteIndex.size) await loadRailLines();
+  if(pinnedPopup!==marker) return true; // selection changed while the file loaded
+
+  const code=resolveTrainLineCode(`${marker.routeName||""} ${marker.destination||""}`);
+  const patterns=code ? railRouteIndex.get(code) : null;
+  if(!patterns?.length) return false; // retain the API fallback for an unknown/new line
+
+  const chosen=pickDirectionalPattern(marker,patterns);
+  const routeKey=`rail:${code}`;
+  if(!(routeOutline && routeOutline.routeKey===routeKey && routeOutline.patternKey===(chosen?.pattern??null))){
+    drawBusRoute(routeKey,patterns,chosen,trainLineColors[code]||vehicleColors.train);
+  }
+  const ll=marker.getLatLng();
+  marker._progressHtml=buildProgressHtml(null,ll.lat,ll.lng);
+  refreshOpenPopup(marker);
+  return true;
+}
+
 async function loadRailLines(){
   let gj=null;
   try{
@@ -1013,6 +1061,7 @@ async function loadRailLines(){
     if(!res.ok) return;
     gj=await res.json();
   }catch{ return; }
+  indexRailRoutesGeoJSON(gj);
   if(railLinesLayer){ try{ map.removeLayer(railLinesLayer); }catch{} railLinesLayer=null; }
 
   // AT's export carries every pattern variant (dozens of overlapping Southern Line copies),
