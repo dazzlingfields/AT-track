@@ -1,4 +1,6 @@
 // /api/tripupdates  -> GTFS-RT trip updates (schedule delays).
+// Only fetched by the client when the combined realtime feed carries no trip updates.
+// Short shared cache like realtime so it stays cheap on the AT quota.
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
@@ -8,7 +10,7 @@ export default async function handler(req, res) {
   const TTL_MS = 9000;
   const STALE_FALLBACK_MAX_MS = 120000;
   const UPSTREAM_TIMEOUT_MS = 8000;
-const UPSTREAM_URL = "https://api.at.govt.nz/gtfs/v3/tripupdates";
+  const UPSTREAM_URL = "https://api.at.govt.nz/realtime/legacy/tripupdates";
 
   const now = Date.now();
   globalThis.__AT_TU_CACHE__ ||= { data: null, ts: 0, etag: null };
@@ -25,13 +27,10 @@ const UPSTREAM_URL = "https://api.at.govt.nz/gtfs/v3/tripupdates";
   try {
     if (!globalThis.__AT_TU_PENDING__) {
       globalThis.__AT_TU_PENDING__ = (async () => {
-   const r = await fetchWithTimeout(UPSTREAM_URL, {
-  headers: { 
-    "Ocp-Apim-Subscription-Key": process.env.AT_API_KEY,
-    "Accept": "application/json"
-  },
-  cache: "no-store",
-}, UPSTREAM_TIMEOUT_MS);
+        const r = await fetchWithTimeout(UPSTREAM_URL, {
+          headers: { "Ocp-Apim-Subscription-Key": process.env.AT_API_KEY },
+          cache: "no-store",
+        }, UPSTREAM_TIMEOUT_MS);
         if (!r.ok) {
           const body = await safeBody(r);
           const err = new Error(`Upstream error: ${r.status}`);
@@ -60,10 +59,10 @@ const UPSTREAM_URL = "https://api.at.govt.nz/gtfs/v3/tripupdates";
       return res.status(200).json(cache.data);
     }
     if (e?.status === 429) {
-      const ra = /^\d+$/.test(String(e.retryAfter)) ? String(e.retryAfter) : "10";
+      const ra = e.retryAfter || "10";
       res.setHeader("Retry-After", ra);
       res.setHeader("Cache-Control", "no-store");
-      return res.status(429).json({ error: "Upstream rate limited", retryAfter: Number(ra) });
+      return res.status(429).json({ error: "Upstream rate limited", retryAfter: /^\d+$/.test(ra) ? Number(ra) : null });
     }
     const status = e?.status ? 502 : 500;
     res.setHeader("Cache-Control", "no-store");
@@ -71,13 +70,24 @@ const UPSTREAM_URL = "https://api.at.govt.nz/gtfs/v3/tripupdates";
   }
 }
 
-function fetchWithTimeout(url, opts, ms) {
-  const c = new AbortController();
-  const t = setTimeout(() => c.abort(), ms);
-  return fetch(url, { ...opts, signal: c.signal }).finally(() => clearTimeout(t));
+async function fetchWithTimeout(url, opts, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const response = await fetch(url, { ...opts, signal: controller.signal });
+    // Keep the abort timer active until the entire body has arrived.
+    const body = await response.text();
+    return {
+      ok: response.ok, status: response.status, headers: response.headers,
+      text: async () => body,
+      json: async () => JSON.parse(body),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 function setSWRHeaders(res, ttlMs) {
   const sMax = Math.max(1, Math.floor(ttlMs / 1000));
-  res.setHeader("Cache-Control", `public, max-age=0, s-maxage=${sMax}, stale-while-revalidate=10`);
+  res.setHeader("Cache-Control", `public, max-age=0, s-maxage=${sMax}, stale-while-revalidate=60`);
 }
 async function safeBody(r) { try { return await r.text(); } catch { return ""; } }

@@ -9,10 +9,7 @@ export default async function handler(req, res) {
   const TTL_MS = 9000;                   // shared snapshot lifetime
   const STALE_FALLBACK_MAX_MS = 120000;  // serve stale up to 2 min on errors
   const UPSTREAM_TIMEOUT_MS = 8000;      // abort a hung upstream call (< Vercel 10s)
-  // The legacy base path is not itself a feed and returns 404. Vehicle positions
-  // are exposed by the vehiclelocations child endpoint. Trip updates are fetched
-  // separately by /api/tripupdates when the client needs schedule information.
-  const UPSTREAM_URL = "https://api.at.govt.nz/realtime/legacy/vehiclelocations";
+  const UPSTREAM_URL = "https://api.at.govt.nz/realtime/legacy";
 
   const now = Date.now();
   globalThis.__AT_CACHE__ ||= { data: null, ts: 0, etag: null };
@@ -74,10 +71,10 @@ export default async function handler(req, res) {
     // No usable cache. If upstream rate-limited us, pass 429 + Retry-After through so
     // the client's existing backoff engages instead of polling straight back.
     if (e?.status === 429) {
-      const ra = /^\d+$/.test(String(e.retryAfter)) ? String(e.retryAfter) : "10";
+      const ra = e.retryAfter || "10";
       res.setHeader("Retry-After", ra);
       res.setHeader("Cache-Control", "no-store"); // never CDN-cache an error
-      return res.status(429).json({ error: "Upstream rate limited", retryAfter: Number(ra) });
+      return res.status(429).json({ error: "Upstream rate limited", retryAfter: /^\d+$/.test(ra) ? Number(ra) : null });
     }
 
     const status = e?.status ? 502 : 500;
@@ -87,10 +84,21 @@ export default async function handler(req, res) {
 }
 
 // fetch with a hard timeout so a hung AT call can't block awaiters or hit the function limit.
-function fetchWithTimeout(url, opts, timeoutMs) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeoutMs);
-  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(id));
+async function fetchWithTimeout(url, opts, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const response = await fetch(url, { ...opts, signal: controller.signal });
+    // Keep the abort timer active until the entire body has arrived.
+    const body = await response.text();
+    return {
+      ok: response.ok, status: response.status, headers: response.headers,
+      text: async () => body,
+      json: async () => JSON.parse(body),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 function setSWRHeaders(res, ttlMs) {
   const sMax = Math.max(1, Math.floor(ttlMs / 1000));
