@@ -12,7 +12,7 @@
  * and re-fetch the shell. Data files self-update via stale-while-revalidate, so a new
  * geojson commit is picked up on the next load or two without a version bump.
  */
-const CACHE_VERSION = "v1";
+const CACHE_VERSION = "v3";
 const SHELL_CACHE = `at-shell-${CACHE_VERSION}`;
 const DATA_CACHE  = `at-data-${CACHE_VERSION}`;
 const TILE_CACHE  = `at-tiles-${CACHE_VERSION}`;
@@ -29,7 +29,6 @@ const SHELL_ASSETS = [
   "./apple-touch-icon.png",
   "https://unpkg.com/leaflet@1.7.1/dist/leaflet.css",
   "https://unpkg.com/leaflet@1.7.1/dist/leaflet.js",
-  "https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js",
 ];
 
 // Host of the realtime proxy — must always hit the network.
@@ -45,7 +44,7 @@ const TILE_HOSTS = [
 const isTile = (url) => TILE_HOSTS.some((h) => url.hostname.endsWith(h));
 const isData = (url) =>
   url.origin === self.location.origin &&
-  /\.(geojson|csv)$/i.test(url.pathname);
+  /\.(geojson|csv|json)$/i.test(url.pathname);
 const isShell = (url) =>
   SHELL_ASSETS.includes(url.href) ||
   (url.origin === self.location.origin &&
@@ -71,7 +70,7 @@ self.addEventListener("activate", (event) => {
     (async () => {
       const keep = new Set([SHELL_CACHE, DATA_CACHE, TILE_CACHE]);
       const keys = await caches.keys();
-      await Promise.all(keys.filter((k) => !keep.has(k)).map((k) => caches.delete(k)));
+      await Promise.all(keys.filter((k) => /^at-(shell|data|tiles)-/.test(k) && !keep.has(k)).map((k) => caches.delete(k)));
       await self.clients.claim();
     })()
   );
@@ -93,22 +92,24 @@ self.addEventListener("fetch", (event) => {
   if (url.hostname.endsWith(REALTIME_HOST)) return;
 
   if (isTile(url)) { event.respondWith(tileFirst(req)); return; }
-  if (isData(url)) { event.respondWith(staleWhileRevalidate(req, DATA_CACHE)); return; }
-  if (isShell(url)) { event.respondWith(staleWhileRevalidate(req, SHELL_CACHE)); return; }
+  if (isData(url)) { event.respondWith(staleWhileRevalidate(req, DATA_CACHE, event)); return; }
+  if (isShell(url)) { event.respondWith(staleWhileRevalidate(req, SHELL_CACHE, event)); return; }
   // Everything else: default to the network.
 });
 
 // Serve from cache immediately, refresh in the background for next time.
-async function staleWhileRevalidate(req, cacheName) {
+async function staleWhileRevalidate(req, cacheName, event) {
   const cache = await caches.open(cacheName);
   const cached = await cache.match(req);
   const network = fetch(req)
-    .then((res) => {
-      if (res && (res.ok || res.type === "opaque")) cache.put(req, res.clone()).catch(() => {});
+    .then(async (res) => {
+      if (res && (res.ok || res.type === "opaque")) await cache.put(req, res.clone()).catch(() => {});
       return res;
     })
     .catch(() => cached);
-  return cached || network;
+  // Cached responses finish quickly; keep the worker alive for the background refresh.
+  event.waitUntil(network);
+  return cached || network.then(res => res || Response.error());
 }
 
 // Tiles: cache-first with a simple FIFO cap so storage doesn't grow unbounded.

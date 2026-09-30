@@ -30,6 +30,20 @@ const map = L.map("map",{center:[-36.8485,174.7633],zoom:12,layers:[light],zoomC
 vehicleRenderer._extendRedrawBounds = function(){};
 const baseMaps = {"Light":light,"Dark":dark,"OSM (fallback)":osm,"Satellite":satellite,"Esri Hybrid":esriHybrid};
 L.control.layers(baseMaps,null).addTo(map);
+L.control.zoom({position:"topright"}).addTo(map);
+const HomeControl=L.Control.extend({
+  options:{position:"topright"},
+  onAdd(){
+    const container=L.DomUtil.create("div","leaflet-bar");
+    const button=L.DomUtil.create("button","map-home",container);
+    button.type="button"; button.textContent="⌂";
+    button.title="Show Auckland"; button.setAttribute("aria-label","Show Auckland");
+    L.DomEvent.disableClickPropagation(container);
+    button.addEventListener("click",()=>{ pinnedFollow=false; map.setView([-36.8485,174.7633],12); });
+    return container;
+  }
+});
+new HomeControl().addTo(map);
 
 const vehicleLayers={bus:L.layerGroup().addTo(map),train:L.layerGroup().addTo(map),ferry:L.layerGroup().addTo(map),out:L.layerGroup().addTo(map)};
 
@@ -41,21 +55,16 @@ const routeIndex=new Map();
 const oosIndexByFleet=new Map();
 const markersByTrip=new Map();        // tripId -> [markers], rebuilt each poll for O(1) trip lookups
 const debugBox=document.getElementById("debug");
-const mobileUpdateEl=document.getElementById("mobile-last-update");
+const mobileUpdateEl=document.getElementById("status-update");
 const debugLastUpdateEl=document.getElementById("debug-last-update");
 
 let pinnedPopup=null;           
-let pinnedFollow=false;
-let followSelectedEnabled=true;
+let pinnedFollow=false;            
 
 // Route focus mode: when the switch is on and a vehicle is selected, every vehicle NOT on
 // the selected route is dimmed so a single line stands out. focusedRouteKey is the
 // normalised route_short_name currently isolated (null = nothing isolated yet).
 let routeFocusEnabled=false;
-let routeHideEnabled=false;
-let vehicleLabelsEnabled=true;
-let hoverPopupsEnabled=true;
-let smoothMotionEnabled=true;
 let focusedRouteKey=null;
 
 // Optional marker decorations (drawn on the vehicle canvas, only when zoomed in enough).
@@ -67,7 +76,7 @@ map.on("click",()=>{
   if(pinnedPopup){ pinnedPopup.closePopup(); pinnedPopup=null; pinnedFollow=false; }
   clearRouteHighlights();
   clearRouteOutline();
-  if(focusedRouteKey){ focusedRouteKey=null; applyRouteFocus(); }
+  if(routeFocusEnabled && focusedRouteKey){ focusedRouteKey=null; applyRouteFocus(); }
 });
 
 
@@ -76,11 +85,12 @@ map.on("popupclose", ()=> { pinnedFollow=false; });
 
 const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"};
 // Legacy (pre-CRL) line colours, plus the post-CRL lines that replace them from 13 Sept
-// 2026: South City (SC), East West (EW), and Onehunga West (OW) use the red, green, and
-// blue identities of their principal predecessor corridors. See resolveTrainLineCode.
+// 2026: South City (SC) and Onehunga West (OW) keep their predecessor's colour since
+// they're largely the same route; East West (EW) gets a new colour since it's a genuine
+// merge of the old Eastern (yellow) and Western (green) lines. See resolveTrainLineCode.
 const trainLineColors={
   STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8",HUIA:"#8e44ad",
-  SC:"#d0021b",EW:"#7fbf6a",OW:"#0e76a8"
+  SC:"#d0021b",EW:"#f5a623",OW:"#0e76a8"
 };
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 // Ring colours for the optional occupancy overlay, green (empty) -> red (full).
@@ -109,16 +119,36 @@ function applyRateLimitBackoff(retryAfterMs, who){
   const b = backoff[who] || backoff.realtime;
   let retry = retryAfterMs ? Math.max(0, retryAfterMs)
                            : (b.ms ? Math.min(BACKOFF_MAX_MS, b.ms*2) : BACKOFF_START_MS);
-  if (who === "realtime") retry = Math.min(retry, 15000);
-  b.ms = retry; b.until = Date.now()+retry;
+  b.ms = retry; b.until = Math.max(b.until, Date.now()+retry);
   setDebug(`Rate limited by ${who}. Backing off ${Math.round(retry/1000)} s`);
 }
 
 let vehiclesAbort, vehiclesInFlight=false, pollTimeoutId=null, pageVisible=!document.hidden;
+let appReady=false, statusLatestTs=0, statusFailed=false, statusCached=false;
+function updateLiveStatus(){
+  const panel=document.getElementById("live-status");
+  const label=document.getElementById("status-label");
+  const refresh=document.getElementById("refresh-vehicles");
+  if(!panel || !label) return;
+  const now=Date.now(), waiting=backoff.realtime.until>now;
+  let state="loading", text="Loading vehicles…";
+  if(navigator.onLine===false){ state="offline"; text=statusLatestTs ? "Offline · saved positions" : "Offline · no saved data"; }
+  else if(waiting){ state="waiting"; text=`Retrying in ${Math.ceil((backoff.realtime.until-now)/1000)}s`; }
+  else if(statusFailed){ state="error"; text="Connection interrupted"; }
+  else if(statusLatestTs){
+    const stale=now-statusLatestTs>60000;
+    state=statusCached || stale ? "stale" : "live";
+    text=statusCached ? "Saved positions" : stale ? "Waiting for fresh data" : "Live vehicles";
+  }
+  panel.dataset.state=state;
+  if(label.textContent!==text) label.textContent=text;
+  if(refresh) refresh.disabled=!appReady || vehiclesInFlight || waiting || navigator.onLine===false;
+}
 
 
 function setDebug(msg){ if(debugBox) debugBox.textContent=msg; }
 function setLastUpdateTs(ts){
+  statusLatestTs=ts;
   const t = new Date(ts);
   const hh = String(t.getHours()).padStart(2,"0");
   const mm = String(t.getMinutes()).padStart(2,"0");
@@ -126,6 +156,7 @@ function setLastUpdateTs(ts){
   const text = `Last update: ${hh}:${mm}:${ss}`;
   if (mobileUpdateEl) mobileUpdateEl.textContent = text;
   if (debugLastUpdateEl) debugLastUpdateEl.textContent = text;
+  updateLiveStatus();
 }
 
 // Persist the fleet snapshot at most every 45s, on the idle queue, so a full-fleet
@@ -210,13 +241,20 @@ function idbPutShape(id, data){
   idbPutMany([[`shape:${id}`,{t:Date.now(),data}]]);
 }
 
-function parseRetryAfterMs(v){ if(!v) return 0; const s=Number(v); if(!isNaN(s)) return Math.max(0,Math.floor(s*1000)); const t=Date.parse(v); return isNaN(t)?0:Math.max(0,t-Date.now()); }async function safeFetch(url,opts={}){
+function parseRetryAfterMs(v){ if(!v) return 0; const s=Number(v); if(!isNaN(s)) return Math.max(0,Math.floor(s*1000)); const t=Date.parse(v); return isNaN(t)?0:Math.max(0,t-Date.now()); }
+async function safeFetch(url,opts={}){
+  const controller=new AbortController();
+  const abort=()=>controller.abort();
+  if(opts.signal?.aborted) abort();
+  else opts.signal?.addEventListener("abort",abort,{once:true});
+  const timer=setTimeout(abort,10000);
   try{
-    const res=await fetch(url,{cache:"no-store",...opts});
+    const res=await fetch(url,{cache:"no-store",...opts,signal:controller.signal});
     if(res.status===429){const retryAfterMs=parseRetryAfterMs(res.headers.get("Retry-After")); return {_rateLimited:true,retryAfterMs};}
     if(!res.ok){let body=""; try{body=await res.text();}catch{} throw new Error(`${res.status} ${res.statusText}${body?` | ${body.slice(0,200)}`:""}`);}
     return await res.json();
   }catch(err){console.error("Fetch error:",err); setDebug(`Fetch error: ${err.message}`); return null;}
+  finally{ clearTimeout(timer); opts.signal?.removeEventListener("abort",abort); }
 }
 function chunk(a,n){const o=[]; for(let i=0;i<a.length;i+=n)o.push(a.slice(i,i+n)); return o;}
 function buildBusTypeIndex(json){const idx={}; if(!json||typeof json!=="object") return idx; for(const model of Object.keys(json)){const ops=json[model]||{}; for(const op of Object.keys(ops)){const nums=ops[op]||[]; if(!idx[op]) idx[op]={}; for(const n of nums) idx[op][n]=model;}} return idx;}
@@ -236,10 +274,9 @@ function getBusType(op,num){const ix=busTypeIndex[op]; return ix?(ix[num]||""):"
 function resolveTrainLineCode(s){
   const u=(s||"").toString().toUpperCase();
   if(!u) return null;
-  const words=new Set(u.split(/[^A-Z0-9]+/).filter(Boolean));
-  if(words.has("SC")||u.includes("S-C")||u.includes("SOUTH-CITY")||u.includes("SOUTH CITY")||u.includes("SOUTHCITY")) return "SC";
-  if(words.has("EW")||u.includes("E-W")||u.includes("EAST-WEST")||u.includes("EAST WEST")||u.includes("EASTWEST")) return "EW";
-  if(words.has("OW")||u.includes("O-W")||u.includes("ONEHUNGA-WEST")||u.includes("ONEHUNGA WEST")||u.includes("ONEHUNGAWEST")) return "OW";
+  if(u.includes("S-C")||u.includes("SOUTH-CITY")||u.includes("SOUTH CITY")||u.includes("SOUTHCITY")) return "SC";
+  if(u.includes("E-W")||u.includes("EAST-WEST")||u.includes("EAST WEST")||u.includes("EASTWEST")) return "EW";
+  if(u.includes("O-W")||u.includes("ONEHUNGA-WEST")||u.includes("ONEHUNGA WEST")||u.includes("ONEHUNGAWEST")) return "OW";
   if(u.includes("STH")||u.includes("SOUTHERN")||u.includes("SOUTH")) return "STH";
   if(u.includes("WESTERN")||u.includes("WEST")) return "WEST";
   if(u.includes("EASTERN")||u.includes("EAST")) return "EAST";
@@ -301,23 +338,23 @@ function buildExtraLines(ex){
 
 function buildPopup(routeName,destination,nextStopLine,vehicleLabel,busType,licensePlate,speedStr,scheduleLine,occupancy,bikesLine,extraLines){
   return `<div style="font-size:0.9em;line-height:1.3;">
-      <b>Route:</b> ${routeName}<br>
-      <b>Destination:</b> ${destination}<br>
+      <b>Route:</b> ${escapeHtml(routeName)}<br>
+      <b>Destination:</b> ${escapeHtml(destination)}<br>
       ${nextStopLine?`${nextStopLine}<br>`:""}
-      <b>Vehicle:</b> ${vehicleLabel}<br>
-      ${busType?`<b>Bus model:</b> ${busType}<br>`:""}
-      <b>Number plate:</b> ${licensePlate}<br>
-      <b>Speed:</b> ${speedStr}<br>
-      ${scheduleLine||"<b>Delay:</b> N/A<br>"}
-      <b>Occupancy:</b> ${occupancy}
+      <b>Vehicle:</b> ${escapeHtml(vehicleLabel)}<br>
+      ${busType?`<b>Bus model:</b> ${escapeHtml(busType)}<br>`:""}
+      <b>Number plate:</b> ${escapeHtml(licensePlate)}<br>
+      <b>Speed:</b> ${escapeHtml(speedStr)}${scheduleLine||""}<br>
+      <b>Occupancy:</b> ${escapeHtml(occupancy)}
       ${bikesLine||""}
       ${extraLines||""}
     </div>`;
 }
 
 // ---- Schedule adherence (late / early) from GTFS-RT trip updates --------------------
-// Delay lives in trip_update entities, not in the vehicle-position feed.
-// buildDelayMap indexes trip updates by trip_id; delayForTrip picks the most relevant
+// Delay lives in trip_update entities, not in vehicle positions. AT's legacy feed is a
+// combined feed, so these usually arrive in the SAME response we already fetch (no extra
+// calls). buildDelayMap indexes them by trip_id; delayForTrip picks the most relevant
 // stop's delay; formatDelay renders a coloured "X late / early / On time" line.
 function buildDelayMap(entities){
   const map=new Map();
@@ -378,7 +415,7 @@ function scheduleLineHtml(sec){
   if(sec==null) return "";
   const txt=formatDelay(sec);
   const col = txt==="On time" ? "#1a8f3c" : (sec>0 ? "#d0021b" : "#0a84ff");
-  return `<b>Delay:</b> <span style="color:${col}">${txt}</span><br>`;
+  return `<br><b>Schedule:</b> <span style="color:${col}">${txt}</span>`;
 }
 
 // ---- Next stop (vehicle popup) ------------------------------------------------------
@@ -442,8 +479,7 @@ function buildNextStopsLine(tu, currentStopSeq, fallbackStopId, limit=4){
   return `<b>${label}</b><div style="margin-top:2px;">${rows}</div>`;
 }
 
-// The vehicle-position feed normally carries no trip updates, so this switches to the
-// separately cached /api/tripupdates endpoint after the first vehicle response.
+// Fallback path: only used if the combined realtime feed carries no trip updates.
 let useSeparateTripUpdates=false;
 async function fetchTripUpdatesDelays(){
   const json=await safeFetch(tripUpdatesUrl);
@@ -559,26 +595,13 @@ function updateMotion(id,lat,lon,fixTsMs,feedSpeedMs,feedBearingDeg){
 // Keep the followed vehicle roughly centred. Called once per poll after positions update,
 // and per-frame while a tween is running so following stays smooth.
 function followPinnedIfNeeded(animate){
-  if(!(followSelectedEnabled && pinnedPopup && pinnedFollow)) return;
+  if(!(pinnedPopup && pinnedFollow)) return;
   try{
     const ll=pinnedPopup.getLatLng();
     const c=map.latLngToLayerPoint(map.getCenter());
     const p=map.latLngToLayerPoint(ll);
     if(Math.abs(c.x-p.x)>6 || Math.abs(c.y-p.y)>6) map.panTo(ll,{animate});
   }catch{}
-}
-
-function setFollowSelectedEnabled(on){
-  followSelectedEnabled=!!on;
-  if(!followSelectedEnabled){
-    pinnedFollow=false;
-    return;
-  }
-  if(pinnedPopup){
-    pinnedFollow=true;
-    const ll=pinnedPopup.getLatLng();
-    map.setView(ll,Math.max(map.getZoom(),14),{animate:true});
-  }
 }
 
 // ===================== Position tween (between consecutive reported fixes) ============
@@ -599,7 +622,7 @@ let tweenRafId = null;
 // the next one arrives. Pure interpolation, never extrapolation.
 function queuePositionTween(id, marker, eLat, eLon){
   const cur = marker.getLatLng();
-  if(!smoothMotionEnabled || prefersReducedMotion || !isPageVisible() ||
+  if(prefersReducedMotion || !isPageVisible() ||
      haversineM(cur.lat,cur.lng,eLat,eLon) > TWEEN_SNAP_M){
     activeTweens.delete(id);
     marker.setLatLng([eLat,eLon]);
@@ -649,7 +672,8 @@ function clearRouteOutline(){
 // distance-to-end, and a travelled/remaining split for the drawn outline.
 function buildTurfLine(shape){
   if(shape._turf!==undefined) return shape._turf;
-  if(typeof turf==="undefined" || !shape.pts || shape.pts.length<2){ shape._turf=null; return null; }
+  if(typeof turf==="undefined") return null;
+  if(!shape.pts || shape.pts.length<2){ shape._turf=null; return null; }
   try{ shape._turf=turf.lineString(shape.pts.map(p=>[p[1],p[0]])); }
   catch{ shape._turf=null; }
   return shape._turf;
@@ -700,6 +724,20 @@ function buildProgressHtml(proj, lat, lon){
   return bits.length ? bits.join("<br>") : "";
 }
 
+let turfPromise=null;
+function ensureTurfLoaded(){
+  if(typeof turf!=="undefined") return Promise.resolve(true);
+  if(turfPromise) return turfPromise;
+  turfPromise=new Promise(resolve=>{
+    const script=document.createElement("script");
+    script.src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js";
+    const timer=setTimeout(()=>{ script.remove(); turfPromise=null; resolve(false); },10000);
+    script.onload=()=>{ clearTimeout(timer); resolve(typeof turf!=="undefined"); };
+    script.onerror=()=>{ clearTimeout(timer); script.remove(); turfPromise=null; resolve(false); };
+    document.head.appendChild(script);
+  });
+  return turfPromise;
+}
 async function showRouteOutlineFor(marker){
   if(!marker || marker.currentType==="out"){ clearRouteOutline(); if(marker) marker._progressHtml=""; return; }
 
@@ -713,14 +751,7 @@ async function showRouteOutlineFor(marker){
     if(handled) return;
   }
 
-  // Train geometry is already available in train_routes.geojson. Use that local
-  // source for selected trains instead of AT's incomplete per-shape REST endpoint.
-  if(marker.currentType==="train"){
-    const handled=await showTrainRouteFromFile(marker);
-    if(handled) return;
-  }
-
-  // Ferries (and any route absent from its local GeoJSON): API GTFS shape via shape_id.
+  // Trains / ferries (and any bus not found in the file): API GTFS shape via shape_id.
   if(!marker.tripId){ clearRouteOutline(); marker._progressHtml=""; return; }
   const sid=tripCache[marker.tripId]?.shape_id;
   if(!sid){ clearRouteOutline(); marker._progressHtml=""; console.warn("[shapes] no shape_id for trip", marker.tripId); setDebug("No shape_id for this trip (check /api/trips passes shape_id)"); return; }
@@ -729,6 +760,12 @@ async function showRouteOutlineFor(marker){
   const shape=shapeCache.get(sid);
   if(!shape){ clearRouteOutline(); marker._progressHtml=""; console.warn("[shapes] empty/failed shape", sid, "- check /api/shapes?ids="+sid); setDebug("Route shape unavailable (open /api/shapes?ids="+sid+" to see _diag)"); return; }
   const ll=marker.getLatLng();
+  // Geometry is useful immediately, even if the optional progress library is slow/offline.
+  drawRouteOutline(sid, marker.options?.fillColor || vehicleColors.bus, null);
+  marker._progressHtml=buildProgressHtml(null, ll.lat, ll.lng);
+  refreshOpenPopup(marker);
+  await ensureTurfLoaded();
+  if(pinnedPopup!==marker) return;
   const proj=projectOnRoute(shape, ll.lat, ll.lng);
   drawRouteOutline(sid, marker.options?.fillColor || vehicleColors.bus, proj);
   marker._progressHtml=buildProgressHtml(proj, ll.lat, ll.lng);
@@ -737,6 +774,7 @@ async function showRouteOutlineFor(marker){
 
 // ---- Lazy shape fetching (deduped, viewport-limited, capped) -------------------------
 async function fetchShapes(ids){
+  if(Date.now()<backoff.shapes.until) return;
   const want=[...new Set(ids)].filter(id=>id && !shapeCache.has(id) && !shapePending.has(id));
   if(!want.length) return;
   want.forEach(id=>shapePending.add(id));
@@ -745,7 +783,10 @@ async function fetchShapes(ids){
     group.forEach(id=>shapePending.delete(id));
     if(!json || json._rateLimited){ if(json&&json._rateLimited) applyRateLimitBackoff(json.retryAfterMs,"shapes"); continue; }
     const shapes=json.shapes||{};
-    group.forEach(id=>ingestShape(id, shapes[id])); // null marks "tried, none" so we don't refetch
+    group.forEach(id=>{
+      // Only complete successful lookups are safe to retain. Failed lookups retry later.
+      if(!json._diag?.[id]?.error && Object.hasOwn(shapes,id)) ingestShape(id, shapes[id]);
+    });
   }
 }
 function ensureShapesForViewport(){
@@ -761,7 +802,7 @@ function ensureShapesForViewport(){
     for(const id in vehicleMarkers){
       if(ids.length>=SHAPE_FETCH_CAP) break;
       const m=vehicleMarkers[id];
-      if(m.currentType==="out" || !m.tripId) continue;
+      if(m.currentType==="out" || m.currentType==="bus" || !m.tripId) continue;
       if(!b.contains(m.getLatLng())) continue;
       const sid=tripCache[m.tripId]?.shape_id;
       if(sid && !seen.has(sid) && !shapeCache.has(sid) && !shapePending.has(sid)){ seen.add(sid); ids.push(sid); }
@@ -822,20 +863,15 @@ function nearestStop(lat,lon,maxKm){
 // Arrivals board shown inside a station/stop popup. Lists inbound services for which THIS
 // station is the next stop, soonest first. Built from arrivalsByStop (refreshed each poll);
 // content is materialised on each popup open, so reopening reflects the latest poll.
-function buildArrivalsBoard(key, stopType){
-  const label=stopType===1?"Next trains":(stopType===2?"Next ferries":"Next services");
+function buildArrivalsBoard(key){
   const list = key ? arrivalsByStop.get(key) : null;
-  if(!list || !list.length){
-    if(stopType!==1 && stopType!==2) return "";
-    return `<div data-arrivals-preview="true" style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>${label}</b><div style="margin-top:3px;color:var(--text-subtle);font-size:0.92em;">Waiting for live predictions…</div></div>`;
-  }
+  if(!list || !list.length) return "";
   const rows = list
-    .filter(a=>stopType===1 ? a.typeKey==="train" : (stopType===2 ? a.typeKey==="ferry" : true))
     .map(a=>({a, eta:formatEta(a.etaSec)}))
     .filter(x=>x.eta!=="")                 // drop stale predictions
     .sort((x,y)=>(toNum(x.a.etaSec)??1e15)-(toNum(y.a.etaSec)??1e15))
     .slice(0,6);
-  if(!rows.length) return `<div data-arrivals-preview="true" style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>${label}</b><div style="margin-top:3px;color:var(--text-subtle);font-size:0.92em;">No live arrivals available</div></div>`;
+  if(!rows.length) return "";
   const items = rows.map(({a,eta})=>{
     const badge = escapeHtml(String(a.badge||"?")).slice(0,6);
     const when  = eta==="due" ? "due" : eta.replace("in ","");
@@ -852,19 +888,18 @@ function buildArrivalsBoard(key, stopType){
         <span style="text-align:right;white-space:nowrap;">${when}${late}</span>
       </div>`;
   }).join("");
-  return `<div data-arrivals-preview="true" style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>${label}</b>${items}</div>`;
+  return `<div style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>Next services</b>${items}</div>`;
 }
 function buildStopPopup(m){
   const st=STOP_STYLE[m._stopType]||STOP_STYLE[0];
   const head=`<b>${escapeHtml(m._stopName)}</b><br><span style="color:var(--text-subtle);font-size:0.92em;">Stop ${escapeHtml(String(m._stopCode||"—"))} &middot; ${st.label}</span>`;
-  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${buildArrivalsBoard(m._stopKey,m._stopType)}</div>`;
+  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${buildArrivalsBoard(m._stopKey)}</div>`;
 }
 
 function makeStopMarker(s){
   const st=STOP_STYLE[s[4]]||STOP_STYLE[0];
   const m=L.circleMarker([s[0],s[1]],{renderer:stopsRenderer,radius:st.radius,color:st.color,weight:st.weight,fillColor:st.fill,fillOpacity:0.95,opacity:1,interactive:true,bubblingMouseEvents:false});
   m._stopName=s[3]; m._stopCode=s[2]; m._stopType=s[4]; m._stopKey=s[5];
-  if(s[4]===1) m.bindTooltip(escapeHtml(s[3]),{direction:"top",offset:[0,-7],opacity:0.95,className:"station-name-tooltip"});
   // Function content => rebuilt on every open, so the arrivals board stays current.
   m.bindPopup(()=>buildStopPopup(m),{maxWidth:240,className:"vehicle-popup"});
   // Track the open station popup so the poll can refresh its arrivals board live.
@@ -1027,108 +1062,15 @@ async function loadStops(){
 // their own pane beneath everything else. Absent file -> layer simply never appears.
 const RAIL_LINES_FILE="train_routes.geojson";
 let railLinesLayer=null, railLinesEnabled=true;
-const railRouteIndex=new Map(); // line code -> [{pattern,name,segs}]
-const nativeRailCodes=new Set(); // codes physically present in the loaded GeoJSON
 const RAIL_DEDUPE_BY_LINE=true; // keep only the longest pattern per line code (clean overview)
 
 try{ map.createPane("railPane"); map.getPane("railPane").style.zIndex=240; }catch{}
 
 function railLineColor(props){
   const p=props||{};
-  const s=`${p.ROUTENUMBER??p.routenumber??p.ROUTE_SHORT_NAME??p.route_short_name??p.ROUTE??p.route??""} ${p.ROUTENAME??p.routename??p.ROUTE_LONG_NAME??p.route_long_name??""}`;
+  const s=`${p.ROUTENUMBER??p.routenumber??p.ROUTE??""} ${p.ROUTENAME??p.routename??""}`;
   const code=resolveTrainLineCode(s);
   return code ? (trainLineColors[code]||vehicleColors.train) : vehicleColors.train;
-}
-
-// Index every train pattern for click-time route highlighting. Unlike the overview layer,
-// this keeps all patterns so the one matching the selected train's position and heading can
-// be chosen. Geometry comes from the same local file, so no /api/shapes call is required.
-function indexRailRoutesGeoJSON(gj){
-  railRouteIndex.clear();
-  nativeRailCodes.clear();
-  for(const ft of (gj?.features||[])){
-    const p=ft?.properties||{};
-    const mode=String(p.MODE??p.mode??"").toLowerCase();
-    if(mode && !mode.includes("train") && !mode.includes("rail")) continue;
-    const lineText=`${p.ROUTENUMBER??p.routenumber??p.ROUTE_SHORT_NAME??p.route_short_name??p.ROUTE??p.route??""} ${p.ROUTENAME??p.routename??p.ROUTE_LONG_NAME??p.route_long_name??""}`;
-    const code=resolveTrainLineCode(lineText); if(!code) continue;
-    const segs=featureSegsLatLon(ft).filter(s=>s.length>=2); if(!segs.length) continue;
-    nativeRailCodes.add(code);
-    let arr=railRouteIndex.get(code); if(!arr){ arr=[]; railRouteIndex.set(code,arr); }
-    arr.push({
-      pattern:String(p.ROUTEPATTERN??p.routepattern??p.OBJECTID??p.objectid??arr.length),
-      name:String(p.ROUTENAME??p.routename??code),
-      segs
-    });
-  }
-  addLegacyCrlFallbacks();
-}
-
-// A stale rail export may contain only the pre-CRL STH/WEST/EAST/ONE routes. Build the
-// three current service shapes from those physical corridors so selecting a new CRL line
-// still works without falling through to the unreliable /api/shapes endpoint. These are
-// used only when the GeoJSON does not already contain a native SC, EW, or OW shape.
-const CRL_POINTS={
-  waitemata:[-36.8444,174.7671], waihorotiu:[-36.8517,174.7635], karangahape:[-36.8588,174.7576],
-  maungawhau:[-36.8664,174.7573], newmarket:[-36.8697,174.7793], henderson:[-36.8809,174.6302]
-};
-const CRL_TUNNEL=[CRL_POINTS.waitemata,CRL_POINTS.waihorotiu,CRL_POINTS.karangahape,CRL_POINTS.maungawhau];
-function longestRailPattern(code){
-  const ps=railRouteIndex.get(code)||[];
-  return ps.reduce((best,p)=>!best||p.segs.reduce((n,s)=>n+s.length,0)>best.segs.reduce((n,s)=>n+s.length,0)?p:best,null);
-}
-function clipPatternNear(pattern,a,b){
-  if(!pattern) return [];
-  let best=null;
-  for(const seg of pattern.segs){
-    if(seg.length<2) continue;
-    let ai=0,bi=0,ad=Infinity,bd=Infinity;
-    seg.forEach((pt,i)=>{
-      const da=haversineM(pt[0],pt[1],a[0],a[1]), db=haversineM(pt[0],pt[1],b[0],b[1]);
-      if(da<ad){ad=da;ai=i;} if(db<bd){bd=db;bi=i;}
-    });
-    const score=ad+bd;
-    if(!best||score<best.score){
-      const lo=Math.min(ai,bi), hi=Math.max(ai,bi);
-      best={score,pts:seg.slice(lo,hi+1)};
-    }
-  }
-  return best?.pts?.length>=2?[best.pts]:[];
-}
-function addLegacyCrlFallbacks(){
-  const south=longestRailPattern("STH"), west=longestRailPattern("WEST");
-  const east=longestRailPattern("EAST"), one=longestRailPattern("ONE");
-  if(!railRouteIndex.has("SC") && south){
-    const link=clipPatternNear(west,CRL_POINTS.maungawhau,CRL_POINTS.newmarket);
-    railRouteIndex.set("SC",[{pattern:"SC-legacy-compat",name:"South-City Line",segs:[...south.segs,CRL_TUNNEL,...link]}]);
-  }
-  if(!railRouteIndex.has("EW") && east && west){
-    const western=clipPatternNear(west,CRL_POINTS.maungawhau,[-36.8670,174.5742]);
-    railRouteIndex.set("EW",[{pattern:"EW-legacy-compat",name:"East-West Line",segs:[...east.segs,CRL_TUNNEL,...western]}]);
-  }
-  if(!railRouteIndex.has("OW") && one && west){
-    const western=clipPatternNear(west,CRL_POINTS.newmarket,CRL_POINTS.henderson);
-    railRouteIndex.set("OW",[{pattern:"OW-legacy-compat",name:"Onehunga-West Line",segs:[...one.segs,...western]}]);
-  }
-}
-
-async function showTrainRouteFromFile(marker){
-  if(!railRouteIndex.size) await loadRailLines();
-  if(pinnedPopup!==marker) return true; // selection changed while the file loaded
-
-  const code=resolveTrainLineCode(`${marker.routeName||""} ${marker.destination||""}`);
-  const patterns=code ? railRouteIndex.get(code) : null;
-  if(!patterns?.length) return false; // retain the API fallback for an unknown/new line
-
-  const chosen=pickDirectionalPattern(marker,patterns);
-  const routeKey=`rail:${code}`;
-  if(!(routeOutline && routeOutline.routeKey===routeKey && routeOutline.patternKey===(chosen?.pattern??null))){
-    drawBusRoute(routeKey,patterns,chosen,trainLineColors[code]||vehicleColors.train);
-  }
-  const ll=marker.getLatLng();
-  marker._progressHtml=buildProgressHtml(null,ll.lat,ll.lng);
-  refreshOpenPopup(marker);
-  return true;
 }
 
 async function loadRailLines(){
@@ -1138,29 +1080,7 @@ async function loadRailLines(){
     if(!res.ok) return;
     gj=await res.json();
   }catch{ return; }
-  indexRailRoutesGeoJSON(gj);
   if(railLinesLayer){ try{ map.removeLayer(railLinesLayer); }catch{} railLinesLayer=null; }
-
-  // If this is a legacy export, render the composed post-CRL service patterns instead of
-  // displaying the retired four-line network. A current export continues through the
-  // normal GeoJSON path below and retains every native geometry detail.
-  const hasCurrentCrl=["SC","EW","OW"].every(code=>nativeRailCodes.has(code));
-  if(!hasCurrentCrl){
-    const layers=[];
-    for(const code of ["SC","EW","OW","HUIA"]){
-      const pattern=longestRailPattern(code); if(!pattern) continue;
-      for(const pts of pattern.segs){
-        if(pts.length<2) continue;
-        const line=L.polyline(pts,{pane:"railPane",color:trainLineColors[code]||vehicleColors.train,weight:3,opacity:0.65,lineJoin:"round",lineCap:"round"});
-        line.bindTooltip(pattern.name||code,{sticky:true});
-        layers.push(line);
-      }
-    }
-    railLinesLayer=L.layerGroup(layers);
-    if(railLinesEnabled) railLinesLayer.addTo(map);
-    setDebug(`Rail lines loaded (${layers.length} CRL-compatible segments)`);
-    return;
-  }
 
   // AT's export carries every pattern variant (dozens of overlapping Southern Line copies),
   // so for a clean network overview keep only the longest pattern per line code. Works the
@@ -1171,7 +1091,7 @@ async function loadRailLines(){
     const longest=new Map(); // line code -> {len, id}
     feats.forEach(f=>{
       const p=f.properties||{};
-      const code=String(p.ROUTENUMBER??p.routenumber??p.ROUTE_SHORT_NAME??p.route_short_name??p.OBJECTID??Math.random()).toUpperCase();
+      const code=String(p.ROUTENUMBER??p.routenumber??p.OBJECTID??Math.random()).toUpperCase();
       const len=Number(p.Shape__Length??p.shape__length??0)||0;
       const id=p.OBJECTID??p.objectid??f;
       const cur=longest.get(code);
@@ -1188,7 +1108,7 @@ async function loadRailLines(){
       style:f=>({color:railLineColor(f.properties),weight:3,opacity:0.65,lineJoin:"round",lineCap:"round"}),
       onEachFeature:(f,layer)=>{
         const p=f.properties||{};
-        const nm=p.ROUTENAME||p.routename||p.ROUTE_LONG_NAME||p.route_long_name||p.ROUTENUMBER||p.routenumber||p.ROUTE_SHORT_NAME||p.route_short_name||"Train route";
+        const nm=p.ROUTENAME||p.routename||p.ROUTENUMBER||p.routenumber||"Train route";
         layer.bindTooltip(String(nm),{sticky:true});
       },
     });
@@ -1415,15 +1335,11 @@ function setOverlaysEnabled(on){
 // written to all markers, then the shared vehicle canvas is repainted once (cheap) — far
 // better than a per-marker redraw, which would repaint the whole canvas hundreds of times.
 function applyRouteFocus(){
-  const active=(routeFocusEnabled || routeHideEnabled) && !!focusedRouteKey;
-  const status=document.getElementById('route-filter-status');
-  if(status) status.textContent=active ? `Selected route: ${pinnedPopup?.routeName || focusedRouteKey}. Tap the map to clear.` : 'Select a vehicle to filter its route. All routes are currently shown.';
+  const active=routeFocusEnabled && !!focusedRouteKey;
   let changed=false;
   for(const id in vehicleMarkers){
     const m=vehicleMarkers[id];
-    const on=!active || vehicleRouteKey(m)===focusedRouteKey;
-    const hidden=!on && routeHideEnabled;
-    if(m._routeHidden!==hidden){ m._routeHidden=hidden; changed=true; }
+    const on=!active || normalizeRouteKey(m.routeName)===focusedRouteKey;
     const op=on?1:0.12, fop=on?0.9:0.10;
     if(m.options.opacity!==op || m.options.fillOpacity!==fop){
       L.setOptions(m,{opacity:op, fillOpacity:fop});
@@ -1441,17 +1357,17 @@ function applyRouteFocus(){
 }
 // Click/select a vehicle while focus is on -> isolate that vehicle's route.
 function focusOnMarkerIfEnabled(m){
-  if(!m) return;
-  focusedRouteKey=vehicleRouteKey(m);
+  if(!routeFocusEnabled || !m) return;
+  focusedRouteKey=normalizeRouteKey(m.routeName)||null;
   applyRouteFocus();
 }
 function setRouteFocusEnabled(on){
   routeFocusEnabled=on;
   if(on){
-    if(pinnedPopup) focusedRouteKey=vehicleRouteKey(pinnedPopup);
+    if(pinnedPopup) focusedRouteKey=normalizeRouteKey(pinnedPopup.routeName)||null;
     if(!focusedRouteKey) setDebug("Route focus on — tap a vehicle to isolate its route");
   }else{
-    if(!routeHideEnabled) focusedRouteKey=null;
+    focusedRouteKey=null;
   }
   applyRouteFocus();
 }
@@ -1482,16 +1398,10 @@ function refreshOpenPopup(m){
 // pipeline (setLatLng -> canvas _draw -> layer._updatePath). At low zoom we fall back to
 // the plain dot to avoid clutter.
 
-// Short code shown in the pill. Trains collapse to their line code, buses use the route
-// number, and ferries use a stable three-letter destination/service abbreviation.
+// Short code shown in the pill. Trains collapse to the line code (STH/EAST/WEST/ONE);
+// buses use the route_short_name (the bus number). Ferry/out-of-service get no label.
 const TRAIN_LINE_BADGES={SC:"S-C",EW:"E-W",OW:"O-W",STH:"STH",WEST:"WEST",EAST:"EAST",ONE:"ONE",HUIA:"HUIA"};
-const FERRY_BADGE_RULES=[
-  [/DEVONPORT|\bDEV\b/,"DEV"],[/WAIHEKE|\bWAI\b/,"WAI"],[/BIRKENHEAD|\bBIR\b/,"BIR"],
-  [/BAYSWATER|\bBAY\b/,"BAY"],[/HALF\s*MOON|\bHMB\b/,"HMB"],[/PINE\s*HARBOU?R|\bPNE\b/,"PNE"],
-  [/WEST\s*HARBOU?R|\bWST\b/,"WST"],[/HOBSONVILLE|\bHOB\b/,"HOB"],[/RAKINO|\bRAK\b/,"RAK"],
-  [/GREAT\s*BARRIER|\bGBI\b/,"GBI"],[/GULF\s*HARBOU?R|\bGUL\b/,"GUL"]
-];
-function badgeForRoute(typeKey, routeName, destination=""){
+function badgeForRoute(typeKey, routeName){
   if(typeKey==="train"){
     const code=resolveTrainLineCode(routeName);
     if(code) return TRAIN_LINE_BADGES[code];
@@ -1503,15 +1413,7 @@ function badgeForRoute(typeKey, routeName, destination=""){
     if(!s || s==="Unknown" || s==="Out of service") return "";
     return s.length>6 ? s.slice(0,6) : s; // guard against a route_long_name fallback
   }
-  if(typeKey==="ferry"){
-    const s=`${routeName||""} ${destination||""}`.toUpperCase();
-    for(const [re,badge] of FERRY_BADGE_RULES) if(re.test(s)) return badge;
-    const raw=(!routeName||routeName==="Unknown")?destination:routeName;
-    const compact=(raw||"").toUpperCase().replace(/[^A-Z0-9]/g,"");
-    if(!compact||compact==="UNKNOWN") return "FER";
-    return compact.slice(0,3)||"FER";
-  }
-  return "";
+  return ""; // ferry / out -> plain dot
 }
 
 // Pick black or white text for legibility over the pill's fill colour.
@@ -1534,42 +1436,37 @@ function roundRectPath(ctx,x,y,w,h,r){
   ctx.closePath();
 }
 
-// Badge geometry is measured off-screen and sized from the actual route text. Short route
-// labels stay almost circular; longer labels expand into fully rounded capsules.
+// Badge geometry is computed independently of the render context (off-screen measuring
+// canvas) so it is available in _updateBounds, which runs on project/zoom before any draw.
+// Font auto-shrinks a step for longer codes so the text always fits the pill.
 const _badgeMeasureCtx = document.createElement("canvas").getContext("2d");
-const BADGE_H=22, BADGE_MIN_W=22, BADGE_MAX_W=50;
-const BADGE_PADX=5, BADGE_FONT_MAX=11, BADGE_FONT_MIN=9;
+// Fixed pill size for visual consistency: every badge is the same width/height regardless of
+// code length. Longer codes (e.g. "WEST") get a slightly smaller font so they still fit,
+// while short codes (e.g. "70") keep the base size, centred in the same pill.
+const BADGE_W=36, BADGE_H=16, BADGE_PADX=5, BADGE_FONT_MAX=11, BADGE_FONT_MIN=8;
 function badgeFontStr(fs){ return `700 ${fs}px -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif`; }
 function badgeMetrics(text){
   const t=text||"";
+  const inner=BADGE_W-BADGE_PADX*2;
   let fs=BADGE_FONT_MAX;
-  let tw=t.length*BADGE_FONT_MAX*0.62;
   if(_badgeMeasureCtx){
-    for(; fs>BADGE_FONT_MIN; fs--){
-      _badgeMeasureCtx.font=badgeFontStr(fs);
-      tw=_badgeMeasureCtx.measureText(t).width;
-      if(tw+BADGE_PADX*2<=BADGE_MAX_W) break;
-    }
-    _badgeMeasureCtx.font=badgeFontStr(fs);
-    tw=_badgeMeasureCtx.measureText(t).width;
+    for(; fs>BADGE_FONT_MIN; fs--){ _badgeMeasureCtx.font=badgeFontStr(fs); if(_badgeMeasureCtx.measureText(t).width<=inner) break; }
   }else{
-    const maxInner=BADGE_MAX_W-BADGE_PADX*2;
-    if(tw>maxInner){ fs=Math.max(BADGE_FONT_MIN,Math.floor(BADGE_FONT_MAX*maxInner/tw)); tw=t.length*fs*0.62; }
+    const est=t.length*BADGE_FONT_MAX*0.62;            // rough fallback if no 2D context
+    if(est>inner) fs=Math.max(BADGE_FONT_MIN, Math.floor(BADGE_FONT_MAX*inner/est));
   }
-  const W=Math.max(BADGE_MIN_W,Math.min(BADGE_MAX_W,Math.ceil(tw+BADGE_PADX*2)));
-  return {W,H:BADGE_H,hw:W/2,hh:BADGE_H/2,fontSize:fs};
+  return {W:BADGE_W,H:BADGE_H,hw:BADGE_W/2,hh:BADGE_H/2,fontSize:fs};
 }
 
 
 const LabeledCircleMarker = L.CircleMarker.extend({
-  _labelled:function(){ return !!(vehicleLabelsEnabled && this.badgeText && this._map && this._map.getZoom()>=LABEL_MIN_ZOOM); },
+  _labelled:function(){ return !!(this.badgeText && this._map && this._map.getZoom()>=LABEL_MIN_ZOOM); },
   // Cache pill geometry, recomputing only when the text changes.
   _badgeMetrics:function(){
     if(this._bm_text!==this.badgeText){ this._bm_text=this.badgeText; this._bm=this.badgeText?badgeMetrics(this.badgeText):null; }
     return this._bm;
   },
   _updatePath:function(){
-    if(this._routeHidden) return;
     if(this._labelled()) this._drawBadge();
     else { this._badgeBox=null; this._renderer._updateCircle(this); }
     this._drawDecor();
@@ -1648,7 +1545,6 @@ const LabeledCircleMarker = L.CircleMarker.extend({
     ctx.restore();
   },
   _containsPoint:function(point){
-    if(this._routeHidden) return false;
     if(this._badgeBox){
       const b=this._badgeBox, t=this._clickTolerance();
       return Math.abs(point.x-this._point.x)<=b.hw+t && Math.abs(point.y-this._point.y)<=b.hh+t;
@@ -1688,12 +1584,11 @@ function addOrUpdateMarker(id,lat,lon,color,type,tripId,fields={}){
 
     if(!marker._eventsBound){
       marker.on("popupopen",function(){ this.setPopupContent(buildPopupForMarker(this)); });
-      marker.on("mouseover",function(){ if(hoverPopupsEnabled && pinnedPopup!==this) this.openPopup(); });
+      marker.on("mouseover",function(){ if(pinnedPopup!==this) this.openPopup(); });
       marker.on("mouseout", function(){ if(pinnedPopup!==this) this.closePopup(); });
       marker.on("click",    function(e){
         if(pinnedPopup&&pinnedPopup!==this) pinnedPopup.closePopup();
-        pinnedPopup=this; pinnedFollow=followSelectedEnabled;
-        if(followSelectedEnabled) map.setView(this.getLatLng(),Math.max(map.getZoom(),14),{animate:true});
+        pinnedPopup=this; pinnedFollow=true;
         this.openPopup();
         showRouteOutlineFor(this);
         focusOnMarkerIfEnabled(this);
@@ -1716,6 +1611,164 @@ function updateVehicleCount(){
     }
   }
   const el=document.getElementById("vehicle-count"); if(el) el.textContent=`Buses: ${busCount}, Trains: ${trainCount}, Ferries: ${ferryCount}`;
+  for(const [mode,count] of [["bus",busCount],["train",trainCount],["ferry",ferryCount]]){
+    const badge=document.querySelector(`[data-count="${mode}"]`);
+    if(badge) badge.textContent=count;
+  }
+}
+
+// ===================== Session on-time dashboard ====================================
+// Aggregates the per-vehicle schedule delay (already computed each poll for the popups)
+// into a live punctuality readout: a headline on-time %, an Early / On time / Late split,
+// an on-time % per mode, and the routes running most behind. "On time" = no more than 90s
+// early and no more than 5 min late (a common transit punctuality window). The headline
+// "session" figure is a running average of each poll's network on-time %, so it reads as
+// performance over the time the map has been open rather than a single instant. Sampling
+// runs every poll regardless of whether the panel is visible, so opening it shows the full
+// session so far.
+const ONTIME_EARLY_S = -90;    // earlier than this  => "Early" bucket
+const ONTIME_LATE_S  = 300;    // later than this    => "Late" bucket
+const DASH_MIN_SAMPLES = 5;    // ignore polls with too few schedule readings to be meaningful
+const SESSION_HISTORY_MAX = 80;// sparkline length (oldest points roll off)
+let dashboardEnabled=false;
+let sessionPolls=0, sessionScoreSum=0;
+let sessionStart=Date.now();
+const sessionHistory=[];       // per-poll graded punctuality score over the session (desktop trend)
+let lastPunctuality=null;
+
+function bucketForDelay(d){ return d<ONTIME_EARLY_S ? "early" : (d>ONTIME_LATE_S ? "late" : "ontime"); }
+
+// Graded punctuality: 1.0 = on time, decaying smoothly with how far off schedule a vehicle
+// is, so a few seconds late counts as essentially on time and only sizeable delays pull the
+// score down. A short grace window stays at 1.0, then an exponential decay (lateness is
+// penalised a little more gently than running early, which strands passengers).
+function punctualityScore(d){
+  const graceLate=60, graceEarly=30, tauLate=300, tauEarly=180;
+  if(d>graceLate)   return Math.exp(-(d-graceLate)/tauLate);
+  if(d<-graceEarly) return Math.exp(-(-d-graceEarly)/tauEarly);
+  return 1;
+}
+
+function updatePunctuality(samples){
+  const buckets={early:0,ontime:0,late:0};
+  const byMode={bus:{n:0,sc:0,sum:0},train:{n:0,sc:0,sum:0},ferry:{n:0,sc:0,sum:0}};
+  const late=[];
+  let n=0, sum=0, scoreSum=0;
+  for(const s of (samples||[])){
+    const d=s.delay; if(d==null) continue;
+    n++; sum+=d;
+    const sc=punctualityScore(d); scoreSum+=sc;
+    buckets[bucketForDelay(d)]++;
+    const m=byMode[s.mode]; if(m){ m.n++; m.sc+=sc; m.sum+=d; }
+    if(d>60) late.push({ route:s.route||"?", label:(s.label && s.label!=="N/A") ? s.label : "", delay:d });
+  }
+  const pollScore = n ? Math.round(100*scoreSum/n) : null;   // graded, not a hard on-time %
+  const avgDelay  = n ? sum/n : null;
+  if(n>=DASH_MIN_SAMPLES && pollScore!=null){
+    sessionPolls++; sessionScoreSum+=pollScore;
+    sessionHistory.push(pollScore);
+    if(sessionHistory.length>SESSION_HISTORY_MAX) sessionHistory.shift();
+  }
+  const sessionAvg = sessionPolls ? Math.round(sessionScoreSum/sessionPolls) : pollScore;
+
+  // The individual vehicles running most behind right now (each row names the vehicle).
+  const worst=late.sort((a,b)=>b.delay-a.delay).slice(0,6);
+
+  lastPunctuality={ n, buckets, pollScore, sessionAvg, avgDelay, byMode, worst };
+  renderDashboard();
+  savePunctuality();
+}
+
+function fmtMinSec(sec){
+  const a=Math.abs(Math.round(sec)), m=Math.floor(a/60), s=a%60;
+  return a<60 ? `${a}s` : (s?`${m}m ${s}s`:`${m}m`);
+}
+
+// ---- Persistent session history (survives reloads within PUNCT_MAX_AGE) -------------
+const PUNCT_KEY="punctuality:v1";
+const PUNCT_MAX_AGE_MS=8*60*60*1000;     // older than this on load => start a fresh session
+let _punctSaveTs=0;
+function savePunctuality(){
+  const now=Date.now();
+  if(now-_punctSaveTs<15000) return;     // throttle IDB writes to ~once / 15s
+  _punctSaveTs=now;
+  idbPutMany([[PUNCT_KEY,{ history:sessionHistory.slice(-SESSION_HISTORY_MAX), polls:sessionPolls, sum:sessionScoreSum, start:sessionStart, savedAt:now }]]);
+}
+async function loadPunctuality(){
+  let rec=null; try{ rec=await idbGet(PUNCT_KEY); }catch{}
+  if(!rec || !rec.savedAt || (Date.now()-rec.savedAt)>PUNCT_MAX_AGE_MS) return;
+  if(Array.isArray(rec.history)){ sessionHistory.length=0; for(const v of rec.history) if(typeof v==="number") sessionHistory.push(v); }
+  if(typeof rec.polls==="number") sessionPolls=rec.polls;
+  if(typeof rec.sum==="number")   sessionScoreSum=rec.sum;
+  if(typeof rec.start==="number") sessionStart=rec.start;
+}
+
+// Inline SVG sparkline of the session's punctuality score (0–100 domain). Desktop only.
+function sparklineSVG(vals, w=300, h=40){
+  if(!vals || vals.length<2) return "";
+  const nn=vals.length;
+  const x=i=>(i/(nn-1))*w;
+  const y=v=>h-(Math.max(0,Math.min(100,v))/100)*h;
+  const line=vals.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const area=`0,${h} ${line} ${w},${h}`;
+  return `<svg class="dash-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">`
+    + `<polyline class="spark-area" points="${area}"/>`
+    + `<polyline class="spark-line" points="${line}"/></svg>`;
+}
+
+function renderDashboard(){
+  const body=document.getElementById("dashboard-body");
+  if(!body || !dashboardEnabled) return;
+  const P=lastPunctuality;
+  if(!P || !P.n){ body.innerHTML=`<p class="dash-empty">Waiting for schedule data…</p>`; return; }
+
+  const sinceMin=Math.max(1,Math.round((Date.now()-sessionStart)/60000));
+  const total=(P.buckets.early+P.buckets.ontime+P.buckets.late)||1;
+  const pctOf=k=>Math.round(100*P.buckets[k]/total);
+  const avgTxt = P.avgDelay==null ? "—"
+    : (Math.abs(P.avgDelay)<=30 ? "on time"
+      : (P.avgDelay>0 ? `${fmtMinSec(P.avgDelay)} late` : `${fmtMinSec(P.avgDelay)} early`));
+
+  const modeRow=(key,name)=>{
+    const m=P.byMode[key]; if(!m || !m.n) return "";
+    const pct=Math.round(100*m.sc/m.n);              // graded score per mode
+    return `<div class="dash-mode"><span class="name">${name}</span><span class="bar"><span style="width:${pct}%"></span></span><span class="pct">${pct}</span></div>`;
+  };
+  const worstRows=P.worst.length
+    ? P.worst.map((r,i)=>`<div class="dash-route${i>=3?" dash-route-extra":""}"><span class="badge">${escapeHtml(String(r.route).slice(0,6))}</span><span class="veh">${r.label?escapeHtml(String(r.label)):"—"}</span><span class="delay">${fmtMinSec(r.delay)} late</span></div>`).join("")
+    : `<p class="dash-empty">Nothing running notably late.</p>`;
+  const trendBlock = sessionHistory.length>=2
+    ? `<div class="dash-subhead dash-desktop-only">Session trend</div><div class="dash-desktop-only">${sparklineSVG(sessionHistory)}</div>`
+    : "";
+
+  body.innerHTML=`
+    <div class="dash-hero">
+      <span class="num">${P.sessionAvg ?? "—"}</span><span class="unit">/100</span>
+      <span class="sub">session punctuality<br>${P.n} live · ${sinceMin} min · avg ${avgTxt}</span>
+    </div>
+    ${trendBlock}
+    <div class="dash-split" role="img" aria-label="Early ${pctOf("early")}%, on time ${pctOf("ontime")}%, late ${pctOf("late")}%">
+      <span class="seg early" style="width:${pctOf("early")}%"></span>
+      <span class="seg ontime" style="width:${pctOf("ontime")}%"></span>
+      <span class="seg late" style="width:${pctOf("late")}%"></span>
+    </div>
+    <div class="dash-buckets">
+      <div class="dash-chip early"><div class="c">${P.buckets.early}</div><div class="l">Early</div></div>
+      <div class="dash-chip ontime"><div class="c">${P.buckets.ontime}</div><div class="l">On time</div></div>
+      <div class="dash-chip late"><div class="c">${P.buckets.late}</div><div class="l">Late</div></div>
+    </div>
+    <div class="dash-subhead">By mode (punctuality /100)</div>
+    ${modeRow("bus","Bus")}${modeRow("train","Train")}${modeRow("ferry","Ferry")}
+    <div class="dash-subhead">Running behind</div>
+    ${worstRows}
+  `;
+}
+
+function setDashboardEnabled(on){
+  dashboardEnabled=on;
+  const el=document.getElementById("dashboard");
+  if(el) el.hidden=!on;
+  if(on) renderDashboard();
 }
 
 // Debug info panel: last poll time, live vehicle counts, and the rolling status/error
@@ -1777,85 +1830,7 @@ function setupControlsCollapse(){
 }
 
 function normalizeFleetLabel(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
-// Existing quick-filter handlers stay attached when their controls move into the dialog.
-function setupSettingsMenu(){
-  const dialog=document.getElementById('map-settings');
-  const opener=document.getElementById('settings-open');
-  if(!dialog || dialog._wired) return;
-  dialog._wired=true;
-  const destinations={focus:'selection',follow:'selection',bearing:'markers',occupancy:'markers',debug:'data'};
-  for(const [layer,section] of Object.entries(destinations)){
-    const row=document.querySelector(`#filters input[data-layer="${layer}"]`)?.closest('label');
-    if(row) document.getElementById('settings-'+section).append(row);
-  }
-  document.querySelector('#filters input[data-layer="overlays"]')?.closest('label')?.remove();
-  document.querySelectorAll('#filters .switch-section').forEach((el,i)=>{ if(i>0) el.remove(); });
-  const debugPanel=document.getElementById('debug-panel');
-  if(debugPanel) document.getElementById('settings-data').append(debugPanel);
-  const controls=[...document.querySelectorAll('#filters input[data-layer], #map-settings input, #map-settings select')];
-  const defaults=new Map(controls.map(el=>[el,el.type==='checkbox'?el.defaultChecked:el.value]));
-  const key=el=>el.dataset.layer || el.dataset.pref;
-  const save=()=>{
-    const prefs=Object.fromEntries(controls.map(el=>[key(el),el.type==='checkbox'?el.checked:el.value]));
-    try{localStorage.setItem('atMapPreferences.v1',JSON.stringify(prefs));}catch{}
-  };
-  const apply=el=>{
-    const on=el.checked;
-    switch(el.dataset.pref){
-      case 'routeHide': routeHideEnabled=on; focusedRouteKey=vehicleRouteKey(pinnedPopup); applyRouteFocus(); break;
-      case 'stops': setStopsEnabled(on); break;
-      case 'rail': setRailLinesEnabled(on); break;
-      case 'frequent': setFrequentLinesEnabled(on); break;
-      case 'labels': vehicleLabelsEnabled=on; repaintVehicles(); break;
-      case 'hover': hoverPopupsEnabled=on; break;
-      case 'motion':
-        smoothMotionEnabled=on;
-        if(!on){
-          activeTweens.forEach((tw,id)=>vehicleMarkers[id]?.setLatLng([tw.eLat,tw.eLon]));
-          activeTweens.clear();
-        }
-        break;
-      case 'pause':
-        HIDDEN_PAUSE_DELAY_MS=Number(el.value);
-        if(document.hidden && pageVisible) scheduleHiddenPause();
-        break;
-    }
-  };
-  for(const el of controls) el.addEventListener('change',()=>{apply(el);save();});
-  let saved={};
-  try{saved=JSON.parse(localStorage.getItem('atMapPreferences.v1')||'{}')||{};}catch{}
-  for(const el of controls){
-    const value=saved[key(el)];
-    if(el.type==='checkbox' && typeof value==='boolean') el.checked=value;
-    if(el.tagName==='SELECT' && [...el.options].some(o=>o.value===String(value))) el.value=String(value);
-    el.dispatchEvent(new Event('change',{bubbles:true}));
-  }
-  const close=()=>dialog.close();
-  opener.disabled=false;
-  opener.addEventListener('click',()=>dialog.showModal());
-  document.getElementById('settings-close').addEventListener('click',close);
-  dialog.addEventListener('close',()=>opener.focus({preventScroll:true}));
-  dialog.addEventListener('click',e=>{
-    const rect=dialog.getBoundingClientRect();
-    if(e.target===dialog && (e.clientX<rect.left||e.clientX>rect.right||e.clientY<rect.top||e.clientY>rect.bottom)) close();
-  });
-  document.getElementById('selection-clear').addEventListener('click',()=>{
-    pinnedPopup?.closePopup(); pinnedPopup=null; pinnedFollow=false; focusedRouteKey=null;
-    clearRouteHighlights(); clearRouteOutline(); applyRouteFocus();
-  });
-  document.getElementById('settings-reset').addEventListener('click',()=>{
-    for(const el of controls){
-      if(el.type==='checkbox') el.checked=defaults.get(el); else el.value=defaults.get(el);
-      el.dispatchEvent(new Event('change',{bubbles:true}));
-    }
-  });
-  applyRouteFocus();
-}
 function normalizeRouteKey(s){return (s||"").toString().trim().replace(/\s+/g,"").toUpperCase();}
-function vehicleRouteKey(m){
-  if(!m || m.currentType==='out' || !m.routeName || m.routeName==='Unknown') return null;
-  return m.currentType+':'+(m.currentType==='train' ? resolveTrainLineCode(m.routeName)||normalizeRouteKey(m.routeName) : normalizeRouteKey(m.routeName));
-}
 function onlyDigits(s){return (s||"").replace(/\D/g,"");}
 function clearRouteHighlights(){
   Object.values(vehicleMarkers).forEach(m=>{
@@ -1923,11 +1898,14 @@ const SearchControl=L.Control.extend({
     const div=L.DomUtil.create("div","leaflet-control search-control",wrapper);
 
     const btn=L.DomUtil.create("button","search-icon-btn",div);
-    btn.type="button"; btn.title="Search";
+    btn.type="button"; btn.title="Search routes or vehicles";
+    btn.setAttribute("aria-label","Search routes or vehicles");
     btn.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`;
 
     const input=L.DomUtil.create("input","search-input",div);
-    input.type="text"; input.placeholder="search here"; input.setAttribute("enterkeyhint","search");
+    input.type="text"; input.placeholder="Route or vehicle · e.g. 70"; input.setAttribute("enterkeyhint","search");
+    input.setAttribute("aria-label","Search by route or vehicle number");
+    input.autocomplete="off";
 
     const cancel=L.DomUtil.create("button","search-cancel",div);
     cancel.type="button"; cancel.textContent="Cancel";
@@ -1945,14 +1923,13 @@ const SearchControl=L.Control.extend({
 
       if (pinnedPopup && pinnedPopup !== m) pinnedPopup.closePopup();
       pinnedPopup = m;
-      pinnedFollow = followSelectedEnabled;
+      pinnedFollow = true;
       showRouteOutlineFor(m);
       focusOnMarkerIfEnabled(m);
 
-      const needMove = followSelectedEnabled && (
+      const needMove =
         map.getZoom() < targetZoom ||
-        !map.getBounds().pad(-0.25).contains(ll)
-      );
+        !map.getBounds().pad(-0.25).contains(ll);
 
       const doOpen = () => {
         try {
@@ -1973,7 +1950,14 @@ const SearchControl=L.Control.extend({
       }
     }
 
-    function expand(){ div.classList.add("expanded"); input.focus({ preventScroll:true }); renderSuggestions(input.value); }
+    function expand(){
+      if(isMobileScreen()){
+        document.getElementById("controls")?.classList.add("collapsed");
+        document.getElementById("controls-toggle")?.setAttribute("aria-expanded","false");
+        updateControlsHeight();
+      }
+      div.classList.add("expanded"); input.focus({ preventScroll:true }); renderSuggestions(input.value);
+    }
     function collapse(opts = { preservePopup: false }) {
       div.classList.remove("expanded"); input.value = ""; sugg.innerHTML = ""; clearRouteHighlights();
       if (!opts.preservePopup && pinnedPopup) { pinnedPopup.closePopup(); pinnedPopup = null; pinnedFollow=false; clearRouteOutline(); }
@@ -2077,9 +2061,15 @@ const SearchControl=L.Control.extend({
 });
 map.addControl(new SearchControl());
 
+let tripsInFlight=false;
 async function fetchTripsBatch(tripIds){
+  if(tripsInFlight) return;
+  if(Date.now()<backoff.trips.until) return;
   const idsToFetch=tripIds.filter(t=>t && !tripCache[t]); if(!idsToFetch.length) return;
+  tripsInFlight=true;
+  try{
   for(const ids of chunk([...new Set(idsToFetch)],100)){
+    if(Date.now()<backoff.trips.until) break;
     const tripJson=await safeFetch(`${tripsUrl}?ids=${ids.join(",")}`);
     if(!tripJson || tripJson._rateLimited){ if(tripJson&&tripJson._rateLimited) applyRateLimitBackoff(tripJson.retryAfterMs,"trips"); continue; }
     if(tripJson?.data?.length>0){
@@ -2102,10 +2092,11 @@ async function fetchTripsBatch(tripIds){
         const r=routes[trip.route_id]||{};
         const routeName=r.route_short_name||r.route_long_name||"Unknown";
         const destination=trip.trip_headsign||r.route_long_name||"Unknown";
-        ms.forEach(m=>{ m.routeName=routeName; m.destination=destination; m.badgeText=badgeForRoute(m.currentType,routeName,destination); m.redraw(); refreshOpenPopup(m); });
+        ms.forEach(m=>{ m.routeName=routeName; m.destination=destination; m.badgeText=badgeForRoute(m.currentType,routeName); m.redraw(); refreshOpenPopup(m); });
       });
     }
   }
+  }finally{ tripsInFlight=false; }
 }
 
 function pairAMTrains(inSvc,outOfService){
@@ -2131,20 +2122,22 @@ function pairAMTrains(inSvc,outOfService){
 function renderFromCache(c){
   if(!c) return;
   c.forEach(v=>addOrUpdateMarker(v.vehicleId,v.lat,v.lon,v.color,v.typeKey,v.tripId,{
-    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",nextStopLine:v.nextStopLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||"",routeName:v.routeName||"Unknown",destination:v.destination||"Unknown",extraLines:v.extraLines||"",badgeText:v.badgeText??badgeForRoute(v.typeKey,v.routeName||"",v.destination||"")
+    currentType:v.typeKey,vehicleLabel:v.vehicleLabel||"",licensePlate:v.licensePlate||"",busType:v.busType||"",speedStr:v.speedStr||"",scheduleLine:v.scheduleLine||"",nextStopLine:v.nextStopLine||"",occupancy:v.occupancy||"",bikesLine:v.bikesLine||"",routeName:v.routeName||"Unknown",destination:v.destination||"Unknown",extraLines:v.extraLines||"",badgeText:v.badgeText??badgeForRoute(v.typeKey,v.routeName||"")
   }));
   const ts = c[0]?.ts || Date.now();
+  statusCached=true;
   setDebug(`Showing cached data (last update: ${new Date(ts).toLocaleTimeString()})`);
   setLastUpdateTs(ts);
   updateVehicleCount();
 }
 
-async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false }){
-  const ignoreBackoff = !!opts.ignoreBackoff;
+let initialFeedPromise=null;
+async function fetchVehicles(){
   const now = Date.now();
-  const realtimeBlocked = (!ignoreBackoff && backoff.realtime.until && now < backoff.realtime.until);
-  if(!pageVisible || vehiclesInFlight || realtimeBlocked) return;
+  const realtimeBlocked = backoff.realtime.until && now < backoff.realtime.until;
+  if(!appReady || !isPageVisible() || vehiclesInFlight || realtimeBlocked || navigator.onLine===false) return;
   vehiclesInFlight=true;
+  updateLiveStatus();
 
   const watchdogMs = 10000;
   let watchdog;
@@ -2153,13 +2146,12 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     vehiclesAbort=new AbortController();
     watchdog = setTimeout(()=>{ try{ vehiclesAbort.abort(); }catch{} }, watchdogMs);
 
-    const json=await safeFetch(realtimeUrl,{signal:vehiclesAbort.signal});
-    if(!json) return;
+    const startupFeed=initialFeedPromise;
+    initialFeedPromise=null;
+    const json=await (startupFeed || safeFetch(realtimeUrl,{signal:vehiclesAbort.signal}));
+    if(!json){ statusFailed=true; return; }
     if(json._rateLimited){
       applyRateLimitBackoff(json.retryAfterMs,"realtime");
-      if (!opts.__retryOnce) {
-        setTimeout(()=>{ fetchVehicles({ ignoreBackoff:true, __retryOnce:true }); }, Math.min(json.retryAfterMs || 3000, 5000));
-      }
       return;
     }
 
@@ -2167,12 +2159,14 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     if(backoff.realtime.ms < 4000) backoff.realtime.ms = 0;
     backoff.realtime.until = 0;
 
-    const vehicles=json?.response?.entity||json?.entity||[];
+    const vehicles=json?.response?.entity||json?.entity;
+    if(!Array.isArray(vehicles)){ statusFailed=true; setDebug("Realtime response is missing vehicle data"); return; }
+    statusFailed=false; statusCached=false;
     const newIds=new Set(), inServiceAM=[], outOfServiceAM=[], allTripIds=[], cachedState=[];
     vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear(); markersByTrip.clear(); arrivalsByStop.clear();
 
-    // Schedule adherence comes from trip updates. If none are present alongside the
-    // vehicle entities, use the separately cached trip-update feed.
+    // Schedule adherence: prefer trip_update entities already in the combined feed (free).
+    // If the feed carries vehicles but no trip updates, fall back to the dedicated feed.
     let delayMap=buildDelayMap(vehicles);
     const hasVehicles=vehicles.some(e=>e.vehicle);
     if(delayMap.size===0 && hasVehicles) useSeparateTripUpdates=true;
@@ -2181,6 +2175,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       if(sep && sep.size) delayMap=sep;
     }
 
+    const punctSamples=[]; // {mode,route,delay} for the on-time dashboard
     vehicles.forEach(v=>{
       const vehicleId=v.vehicle?.vehicle?.id; if(!v.vehicle||!v.vehicle.position||!vehicleId) return; newIds.add(vehicleId);
       const lat=v.vehicle.position.latitude, lon=v.vehicle.position.longitude;
@@ -2305,6 +2300,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
       // pick the most relevant delay from the trip update).
       const tu=(typeKey!=="out" && tripId) ? delayMap.get(tripId) : null;
       const delaySec=tu ? delayForTrip(tu, stopSeq) : null;
+      if(typeKey!=="out" && delaySec!=null) punctSamples.push({mode:typeKey, route:routeName, delay:delaySec, label:vehicleLabel});
       const scheduleLine=scheduleLineHtml(delaySec);
 
       // Next stops: list the next few from the trip update (name + ETA); fall back to the
@@ -2319,7 +2315,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
         else outOfServiceAM.push({vehicleId,lat,lon,speedKmh,vehicleLabel});
       }
 
-      const badgeText=badgeForRoute(typeKey,routeName,destination);
+      const badgeText=badgeForRoute(typeKey,routeName);
 
       // Register this service against every stop it will reach in the next hour, so a
       // station/stop popup can show the genuinely soonest services arriving (not only the
@@ -2331,7 +2327,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
           if(u.timeSec!=null && (u.timeSec-nowSec)>3600) continue; // only the next hour
           const key = stopKeyById.get(String(u.stopId)) || String(u.stopId);
           let arr=arrivalsByStop.get(key); if(!arr){ arr=[]; arrivalsByStop.set(key,arr); }
-          arr.push({ badge: badgeText || routeName, color, dest: destination, etaSec: u.timeSec, delaySec: u.delay, typeKey });
+          arr.push({ badge: badgeText || routeName, color, dest: destination, etaSec: u.timeSec, delaySec: u.delay });
         }
       }
 
@@ -2362,7 +2358,7 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
 
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
-        if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; focusedRouteKey=null; clearRouteOutline(); }
+        if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; clearRouteOutline(); }
         map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; motionState.delete(id); activeTweens.delete(id);
       }
     });
@@ -2372,21 +2368,23 @@ async function fetchVehicles(opts = { ignoreBackoff: false, __retryOnce:false })
     const nowTs = Date.now();
     saveSnapshot(cachedState);
     setDebug(`Realtime update complete at ${new Date(nowTs).toLocaleTimeString()}`);
-    setLastUpdateTs(nowTs);
+    const feedTimestamp=Number(json?.response?.header?.timestamp ?? json?.header?.timestamp);
+    setLastUpdateTs(feedTimestamp>0 ? feedTimestamp*1000 : nowTs);
     lastPollOkTs=nowTs;
     updateVehicleCount();
     applyRouteFocus(); // keep dimming consistent as vehicles appear/disappear
+    updatePunctuality(punctSamples); // refresh the on-time dashboard from this poll
     refreshOpenStopPopup(); // keep an open station's arrivals board live
 
-    await fetchTripsBatch([...new Set(allTripIds)]);
-
-    // Now that shape_ids are known, fetch the shapes we can actually see, and make sure
-    // the selected vehicle's outline reflects any shape that just loaded.
-    ensureShapesForViewport();
-    if(pinnedPopup && pinnedPopup.currentType!=="out") showRouteOutlineFor(pinnedPopup);
+    // Metadata enrichment must not hold up the next live position refresh.
+    fetchTripsBatch([...new Set(allTripIds)]).then(()=>{
+      ensureShapesForViewport();
+      if(pinnedPopup && pinnedPopup.currentType!=="out") showRouteOutlineFor(pinnedPopup);
+    }).catch(err=>console.warn("[trips] enrichment failed",err));
   }finally{
     clearTimeout(watchdog);
     vehiclesInFlight=false;
+    updateLiveStatus();
   }
 }
 
@@ -2406,7 +2404,7 @@ function scheduleNextFetch(){
   const delay=Math.max(base, waitRealtime);
   pollTimeoutId=setTimeout(async()=>{
     pollTimeoutId=null;
-    try{ if(pageVisible) await fetchVehicles(); }
+    try{ if(isPageVisible()) await fetchVehicles(); }
     finally{ scheduleNextFetch(); } // reschedule no matter what happened
   }, delay);
 }
@@ -2417,10 +2415,10 @@ let heartbeatId=null;
 function startHeartbeat(){
   if(heartbeatId) return;
   heartbeatId=setInterval(()=>{
-    if(!pageVisible) return;
+    if(!isPageVisible()) return;
     const stale=!lastPollOkTs || (Date.now()-lastPollOkTs)>STALE_REFRESH_MS;
     if(stale && !vehiclesInFlight && backoff.realtime.until<=Date.now()){
-      fetchVehicles({ ignoreBackoff:true });
+      fetchVehicles();
     }
   }, 5000);
 }
@@ -2432,40 +2430,32 @@ function pauseUpdatesNow(){
   // Intentionally NOT killing the loop; the visibility gate stops fetches while hidden.
 }
 async function resumeUpdatesNow(){
+  if(!appReady) return;
   const wasHidden=!pageVisible;
   pageVisible=true;
   if(!pollTimeoutId) scheduleNextFetch(); // ensure the loop is alive
   startHeartbeat();
   if(wasHidden){
     setDebug("Tab visible. Refreshing...");
-    await fetchVehicles({ ignoreBackoff:true }); // immediate catch-up
+    await fetchVehicles(); // immediate catch-up
   }
 }
 
-// Keep polling briefly after a tab becomes hidden. This avoids stopping trip updates for
-// short tab switches while still saving network work when the page stays in the background.
-let HIDDEN_PAUSE_DELAY_MS=30000;
-let hiddenPauseTimer=null;
-function scheduleHiddenPause(){
-  clearTimeout(hiddenPauseTimer);
-  if(!pageVisible) return;
-  setDebug(`Tab hidden. Pausing updates in ${HIDDEN_PAUSE_DELAY_MS/1000}s`);
-  hiddenPauseTimer=setTimeout(()=>{
-    hiddenPauseTimer=null;
-    if(document.hidden) pauseUpdatesNow();
-  },HIDDEN_PAUSE_DELAY_MS);
-}
-function cancelHiddenPause(){ clearTimeout(hiddenPauseTimer); hiddenPauseTimer=null; }
-document.addEventListener("visibilitychange",()=>{
-  if(document.hidden) scheduleHiddenPause();
-  else { cancelHiddenPause(); resumeUpdatesNow(); }
-});
-window.addEventListener("pageshow",()=>{ cancelHiddenPause(); resumeUpdatesNow(); });
-window.addEventListener("pagehide",()=>{ cancelHiddenPause(); pauseUpdatesNow(); }); // torn down/bfcached
-window.addEventListener("focus",()=>{ if(!document.hidden){ cancelHiddenPause(); resumeUpdatesNow(); } });
+// Tab-hide/blur pause immediately, and coming back always does an immediate catch-up
+// fetch — no grace period. A delayed pause was tried here and reverted: it meant a short
+// return (under the delay) never flipped pageVisible, so resumeUpdatesNow saw wasHidden
+// as false and skipped the catch-up fetch, leaving stale positions on screen until the
+// ambient ~15-27s poll cycle happened to land. Immediate pause/resume guarantees a fresh
+// fetch the moment the tab becomes visible again, however long it was away.
+document.addEventListener("visibilitychange",()=>{ if(document.hidden) pauseUpdatesNow(); else resumeUpdatesNow(); });
+window.addEventListener("pageshow",()=>{ resumeUpdatesNow(); });
+window.addEventListener("pagehide",()=>{ pauseUpdatesNow(); }); // page is being torn down/bfcached
+window.addEventListener("focus",()=>{ resumeUpdatesNow(); });
+window.addEventListener("blur",()=>{ pauseUpdatesNow(); });
 
 
-async function init(){
+async function loadReferenceData(){
+  const busTypesPromise=safeFetch(busTypesUrl);
   // Load persisted trips/shapes (and prune expired) before anything fetches, so the first
   // poll's trip/shape lookups hit warm caches instead of the network.
   try{ await idbHydrateAndPrune(); }catch{}
@@ -2484,18 +2474,44 @@ async function init(){
     }
   }
 
-  const bj=await safeFetch(busTypesUrl);
+  const bj=await busTypesPromise;
   if(bj && !bj._rateLimited){ busTypes=bj; busTypeIndex=buildBusTypeIndex(bj); }
+}
 
-  const cached=localStorage.getItem("realtimeSnapshot");
-  if(cached){ try{ const snap=JSON.parse(cached); renderFromCache(snap); }catch{} }
+function saveFilterPreferences(){
+  const preferences={};
+  document.querySelectorAll('#filters input[type="checkbox"]').forEach(cb=>{ preferences[cb.dataset.layer]=cb.checked; });
+  try{ localStorage.setItem("mapFilters",JSON.stringify(preferences)); }catch{}
+}
+async function init(){
+  // Wire the UI and show saved positions before waiting for any network request.
+  let preferences={};
+  try{ preferences=JSON.parse(localStorage.getItem("mapFilters")||"{}")||{}; }catch{}
+  document.querySelectorAll('#filters input[type="checkbox"]').forEach(cb=>{
+    if(typeof preferences[cb.dataset.layer]==="boolean") cb.checked=preferences[cb.dataset.layer];
+    const layer=vehicleLayers[cb.dataset.layer];
+    if(layer && !cb.checked) map.removeLayer(layer);
+    if(["bus","train","ferry"].includes(cb.dataset.layer)){
+      const badge=document.createElement("span"); badge.className="mode-count";
+      badge.dataset.count=cb.dataset.layer; badge.textContent="—";
+      cb.closest("label").querySelector(".switch-label").appendChild(badge);
+    }
+  });
+  try{
+    const cached=localStorage.getItem("realtimeSnapshot");
+    if(cached){ const snap=JSON.parse(cached); if(Array.isArray(snap) && snap.length) renderFromCache(snap); }
+  }catch{}
+  document.getElementById("refresh-vehicles")?.addEventListener("click",()=>fetchVehicles());
+  window.addEventListener("offline",updateLiveStatus);
+  window.addEventListener("online",()=>{ updateLiveStatus(); if(appReady) fetchVehicles(); });
+  setInterval(()=>{ if(isPageVisible()) updateLiveStatus(); },1000);
 
   document.querySelectorAll('#filters input[type="checkbox"]').forEach(cb=>{
     cb.addEventListener("change",e=>{
       const layer=e.target.getAttribute("data-layer");
       if(layer==="overlays"){ setOverlaysEnabled(e.target.checked); }
       else if(layer==="focus"){ setRouteFocusEnabled(e.target.checked); }
-      else if(layer==="follow"){ setFollowSelectedEnabled(e.target.checked); }
+      else if(layer==="dashboard"){ setDashboardEnabled(e.target.checked); }
       else if(layer==="debug"){ setDebugPanelEnabled(e.target.checked); }
       else if(layer==="occupancy"){ setOccupancyRingsEnabled(e.target.checked); }
       else if(layer==="bearing"){ setBearingTicksEnabled(e.target.checked); }
@@ -2504,6 +2520,7 @@ async function init(){
       else if(layer==="frequent"){ setFrequentLinesEnabled(e.target.checked); }
       else if(vehicleLayers[layer]){ if(e.target.checked) map.addLayer(vehicleLayers[layer]); else map.removeLayer(vehicleLayers[layer]); }
       updateControlsHeight();
+      saveFilterPreferences();
     });
   });
 
@@ -2511,17 +2528,31 @@ async function init(){
   const overlaysCb=document.querySelector('#filters input[data-layer="overlays"]');
   const overlaysOn = overlaysCb ? overlaysCb.checked : true;
   stopsEnabled=overlaysOn; railLinesEnabled=overlaysOn; frequentLinesEnabled=overlaysOn;
-  loadStops();
-  loadRailLines();
-  loadFrequentRoutes();
+  // Let the first map frame paint before parsing the stop and overlay files.
+  const loadOverlays=()=>{ loadStops(); loadRailLines(); loadFrequentRoutes(); };
+  if(window.requestIdleCallback) requestIdleCallback(loadOverlays,{timeout:2500});
+  else setTimeout(loadOverlays,250);
 
   // Route focus starts from the switch's initial state (default off).
   const focusCb=document.querySelector('#filters input[data-layer="focus"]');
   routeFocusEnabled = focusCb ? focusCb.checked : false;
 
-  // When enabled, selecting a vehicle centres it and keeps the map following its updates.
-  const followCb=document.querySelector('#filters input[data-layer="follow"]');
-  followSelectedEnabled = followCb ? followCb.checked : true;
+  // On-time dashboard: restore any persisted session history, sync to its switch (default
+  // off) and wire its close button.
+  const dashCb=document.querySelector('#filters input[data-layer="dashboard"]');
+  loadPunctuality().then(()=>renderDashboard());
+  setDashboardEnabled(dashCb ? dashCb.checked : false);
+  const dashClose=document.getElementById("dashboard-close");
+  if(dashClose) dashClose.addEventListener("click",()=>{
+    const cb=document.querySelector('#filters input[data-layer="dashboard"]');
+    if(cb) cb.checked=false;
+    setDashboardEnabled(false);
+    saveFilterPreferences();
+  });
+  // Flush the session history when the tab is hidden/closed so nothing is lost.
+  const flushPunct=()=>{ _punctSaveTs=0; savePunctuality(); };
+  window.addEventListener("pagehide", flushPunct);
+  document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="hidden") flushPunct(); });
 
   // Optional marker decorations: heading arrows (default on) and occupancy rings (default off).
   const bearingCb=document.querySelector('#filters input[data-layer="bearing"]');
@@ -2532,24 +2563,20 @@ async function init(){
   const debugCb=document.querySelector('#filters input[data-layer="debug"]');
   setDebugPanelEnabled(debugCb ? debugCb.checked : false);
 
-  // Warm the larger bus_routes.geojson on the idle queue so the first bus click is usually
-  // instant, without blocking first paint. Click-time load still covers a cold cache.
-  const prefetchBusRoutes=()=>ensureBusRoutesLoaded();
-  if(window.requestIdleCallback) requestIdleCallback(prefetchBusRoutes,{timeout:8000});
-  else setTimeout(prefetchBusRoutes,4000);
+  // Detailed bus geometry (7.6 MB) is fetched only when a bus route is selected.
 
-  setupSettingsMenu();
   updateControlsHeight();
 
-  // Sync the cached flag to reality at startup, then start everything unconditionally.
+  // Fetch live positions and metadata together, then classify the vehicles with routes ready.
+  if(isPageVisible() && navigator.onLine!==false) initialFeedPromise=safeFetch(realtimeUrl);
+  await loadReferenceData();
+  appReady=true;
+  updateLiveStatus();
   pageVisible=isPageVisible();
   startHeartbeat();
 
-  const initialJitter=300+Math.random()*1200;
-  setTimeout(async()=>{
-    if(pageVisible) await fetchVehicles({ ignoreBackoff:true });
-    scheduleNextFetch(); // start the self-perpetuating loop regardless of visibility
-  }, initialJitter);
+  try{ if(isPageVisible()) await fetchVehicles(); }
+  finally{ scheduleNextFetch(); }
 }
 init();
 

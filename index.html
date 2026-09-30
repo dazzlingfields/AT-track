@@ -4,6 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
   <title>AT Realtime Map</title>
+  <meta name="description" content="Track Auckland buses, trains and ferries live. Search routes and vehicles, explore stops and check service delays." />
+  <link rel="preconnect" href="https://unpkg.com" crossorigin />
+  <link rel="preconnect" href="https://atrealtime.vercel.app" crossorigin />
 
   <!-- PWA -->
   <link rel="manifest" href="manifest.webmanifest" />
@@ -148,6 +151,108 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 .switch input:checked ~ .knob { transform: translateX(14px); }
 .switch input:focus-visible ~ .track { box-shadow: var(--ring); }
 
+/* On-time performance dashboard */
+#dashboard{
+  position: absolute;
+  right: 12px;
+  bottom: calc(12px + env(safe-area-inset-bottom));
+  z-index: 1200;
+  width: 320px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px);
+  background: var(--panel-bg);
+  backdrop-filter: var(--panel-backdrop);
+  -webkit-backdrop-filter: var(--panel-backdrop);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-xl);
+  box-shadow: var(--elev-2);
+  overflow: hidden;
+  display: flex; flex-direction: column;
+}
+#dashboard[hidden]{ display: none; }
+.dash-head{
+  display: flex; align-items: center; gap: 8px;
+  padding: 11px 12px 9px;
+}
+.dash-dot{
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #1a8f3c; flex: 0 0 auto;
+  box-shadow: 0 0 0 0 rgba(26,143,60,0.5);
+  animation: dashpulse 2.4s ease-out infinite;
+}
+@keyframes dashpulse{
+  0%{ box-shadow: 0 0 0 0 rgba(26,143,60,0.45); }
+  70%{ box-shadow: 0 0 0 7px rgba(26,143,60,0); }
+  100%{ box-shadow: 0 0 0 0 rgba(26,143,60,0); }
+}
+.dash-title{ font-weight: 700; font-size: 14px; letter-spacing: 0.2px; flex: 1 1 auto; }
+.dash-close{
+  -webkit-appearance: none; appearance: none;
+  border: 0; background: transparent; cursor: pointer;
+  color: var(--text-subtle); font-size: 15px; line-height: 1;
+  width: 24px; height: 24px; border-radius: 8px;
+}
+.dash-close:hover{ background: var(--accent-weak); color: var(--text-strong); }
+#dashboard-body{ padding: 4px 12px 12px; overflow-y: auto; }
+.dash-empty{ margin: 4px 0 8px; color: var(--text-subtle); font-size: 13px; }
+
+/* Headline punctuality score */
+.dash-hero{ display: flex; align-items: baseline; gap: 8px; margin: 2px 0 10px; }
+.dash-hero .num{ font-size: 40px; font-weight: 800; letter-spacing: -0.5px; line-height: 1; }
+.dash-hero .unit{ font-size: 16px; font-weight: 700; opacity: 0.6; }
+.dash-hero .sub{ font-size: 11px; color: var(--text-subtle); margin-left: auto; text-align: right; line-height: 1.3; }
+
+/* Session trend sparkline (desktop) */
+.dash-spark{ display: block; width: 100%; height: 40px; margin: 0 0 10px; }
+.dash-spark .spark-area{ fill: var(--accent-weak); stroke: none; }
+.dash-spark .spark-line{ fill: none; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke-linecap: round; }
+
+/* Proportional Early / On time / Late bar */
+.dash-split{ display: flex; height: 8px; border-radius: 999px; overflow: hidden; margin: 2px 0 10px; background: rgba(120,120,128,0.18); }
+.dash-split .seg{ height: 100%; }
+.dash-split .seg.early{ background: #0a84ff; }
+.dash-split .seg.ontime{ background: #1a8f3c; }
+.dash-split .seg.late{ background: #d0021b; }
+
+/* Early / On time / Late chips */
+.dash-buckets{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 10px; }
+.dash-chip{
+  border-radius: var(--r-md); padding: 7px 6px; text-align: center;
+  background: rgba(120,120,128,0.10);
+}
+.dash-chip .c{ font-size: 16px; font-weight: 800; line-height: 1; }
+.dash-chip .l{ font-size: 10px; color: var(--text-subtle); margin-top: 3px; letter-spacing: 0.2px; text-transform: uppercase; }
+.dash-chip.early .c{ color: #0a84ff; }
+.dash-chip.ontime .c{ color: #1a8f3c; }
+.dash-chip.late .c{ color: #d0021b; }
+
+.dash-subhead{ font-size: 11px; font-weight: 600; letter-spacing: 0.3px; text-transform: uppercase; color: var(--text-subtle); margin: 4px 0 5px; }
+
+/* By-mode mini bars */
+.dash-mode{ display: grid; grid-template-columns: 46px 1fr 34px; align-items: center; gap: 8px; margin: 5px 0; font-size: 12px; }
+.dash-mode .name{ color: var(--text-strong); }
+.dash-mode .bar{ height: 6px; border-radius: 999px; background: rgba(120,120,128,0.18); overflow: hidden; }
+.dash-mode .bar > span{ display: block; height: 100%; border-radius: 999px; background: var(--accent); }
+.dash-mode .pct{ text-align: right; color: var(--text-subtle); font-variant-numeric: tabular-nums; }
+
+/* Most-delayed individual vehicles: route badge · vehicle number · delay */
+.dash-route{ display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; margin: 5px 0; font-size: 12px; }
+.dash-route .badge{
+  display: inline-block; min-width: 30px; text-align: center;
+  background: var(--accent); color: #fff; border-radius: 8px;
+  padding: 2px 6px; font-weight: 700; font-size: 11px;
+}
+.dash-route .veh{ color: var(--text-subtle); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dash-route .delay{ color: #d0021b; font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+
+@media (prefers-reduced-motion: reduce){ .dash-dot{ animation: none; } }
+@media (max-width: 600px){
+  #dashboard{ width: 216px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); border-radius: 16px; }
+  .dash-hero .num{ font-size: 30px; }
+  .dash-desktop-only{ display: none !important; }   /* sparkline + trend label */
+  .dash-route-extra{ display: none; }                /* keep mobile to the top 3 routes */
+}
+
 /* Debug info panel: last poll time, live vehicle counts, rolling status line. Hidden by
    default and toggled from its own switch (data-layer="debug") rather than forced off on
    small screens, so it now works the same on phones as on desktop. */
@@ -169,12 +274,6 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
   border-radius: var(--r-lg);
   box-shadow: var(--elev-1);
 }
-.station-name-tooltip{
-  background:rgba(255,255,255,0.94); color:var(--text-strong);
-  border:1px solid var(--panel-border); border-radius:8px;
-  box-shadow:var(--elev-1); padding:4px 7px; font-weight:600;
-}
-.station-name-tooltip::before{ border-top-color:rgba(255,255,255,0.94); }
 
 /* Search control wrapper sits beneath #controls, in the left stack */
 .leaflet-control.search-wrapper{
@@ -383,32 +482,58 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
   outline: none; box-shadow: var(--ring);
 }
 
-#settings-open{position:fixed;right:12px;bottom:calc(24px + env(safe-area-inset-bottom));z-index:1400;min-height:44px;padding:10px 18px;border-radius:14px;background:#fff;color:#172b3a;border:1px solid #d7dfe5;box-shadow:0 3px 16px #0002;font:600 14px system-ui;cursor:pointer;}
-#map-settings{padding:0;border:1px solid #d7dfe5;border-radius:20px;width:min(420px,calc(100vw - 32px));max-width:none;max-height:calc(100dvh - 32px);background:#fff;color:#172b3a;box-shadow:0 18px 70px #0004;}
-#map-settings[open]{display:flex;flex-direction:column;}
-#map-settings::backdrop{background:rgba(15,30,45,.32);}
-.settings-header,.settings-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;flex-shrink:0;}
-.settings-header{border-bottom:1px solid #e5ebef;}
-.settings-header h2{font-size:19px;margin:0;}.settings-header p{font-size:13px;margin:4px 0 0;color:#526674;}
-.settings-scroll{overflow-y:auto;overscroll-behavior:contain;padding:0 20px;min-height:0;}
-.settings-scroll section{padding:18px 0;border-bottom:1px solid #e5ebef;}
-.settings-scroll h3{font-size:14px;margin:0 0 8px;}.settings-scroll p{font-size:12px;line-height:1.5;color:#526674;margin:6px 0;}
-#map-settings .switch-row{min-height:44px;gap:14px;}.settings-help{max-width:34em;}
-#map-settings button{font:600 13px system-ui;min-height:44px;border:1px solid #d7dfe5;border-radius:10px;padding:8px 12px;background:#f4f7f9;color:#172b3a;cursor:pointer;}
-.settings-footer{border-top:1px solid #e5ebef;font-size:11px;color:#526674;}.settings-footer button{white-space:nowrap;}
-.setting-select{display:grid;gap:8px;font-size:13px;}.setting-select select{min-height:44px;font:inherit;border:1px solid #c5d0d8;border-radius:10px;padding:8px;background:white;color:#172b3a;}
-#controls-body{max-height:calc(100dvh - 180px);overflow-y:auto;overscroll-behavior:contain;}
-@media(min-width:701px){#map-settings{margin-right:16px;margin-top:16px;margin-bottom:16px;}}
-@media(max-width:700px){#map-settings{margin:auto 0 0;width:100%;border-radius:20px 20px 0 0;max-height:85dvh;border-bottom:0;}.settings-footer{padding-bottom:calc(12px + env(safe-area-inset-bottom));}.settings-header,.settings-footer{padding-left:16px;padding-right:16px;}.settings-scroll{padding:0 16px;}#controls .switch-row{min-height:44px;}}
-</style>
+/* Readable controls and a persistent connection indicator. */
+#map { height: 100dvh; }
+#controls { width: 240px; top: max(12px, env(safe-area-inset-top)); }
+#controls-toggle { min-height: 48px; padding: 12px 14px; }
+.brand-name { font-size: 16px; font-weight: 750; letter-spacing: -0.3px; }
+.live-status { display: flex; align-items: center; gap: 8px; padding: 0 12px 10px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: #b7791f; flex-shrink: 0; }
+.live-status[data-state="live"] .status-dot { background: #1a8f3c; }
+.live-status[data-state="offline"] .status-dot,
+.live-status[data-state="error"] .status-dot { background: #d0021b; }
+.status-copy { flex: 1; min-width: 0; font-size: 12px; line-height: 1.45; }
+#status-update { display: block; color: var(--text-subtle); font-size: 10px; }
+.refresh-button { width: 36px; height: 36px; border: 1px solid var(--panel-border); border-radius: 10px; background: transparent; color: var(--text-strong); cursor: pointer; font-size: 20px; }
+.refresh-button:disabled { opacity: 0.45; cursor: default; }
+.switch-row { min-height: 36px; box-sizing: border-box; padding: 7px 8px; }
+.switch-label { display: flex; align-items: center; gap: 8px; }
+.mode-count { color: var(--text-subtle); font-size: 11px; font-variant-numeric: tabular-nums; }
+#controls-body { max-height: calc(100dvh - 160px); }
+.search-icon-btn, .search-cancel, .dash-close { min-width: 36px; min-height: 36px; }
+.search-input { box-sizing: border-box; min-width: 0; color: var(--text-strong); }
+.search-control:not(.expanded) .search-input { display: none; }
+.search-control.expanded .search-input { width: 220px; }
+.search-suggestions { width: 100%; max-width: 100%; }
+.leaflet-top.leaflet-left { z-index: 1300; }
+.leaflet-control-zoom a { width: 36px; height: 36px; line-height: 36px; }
+.map-home { display: block; width: 36px; height: 36px; border: 0; background: var(--panel-bg); color: var(--text-strong); font-size: 19px; cursor: pointer; }
+.leaflet-bar, .leaflet-control-layers { border-radius: 10px; overflow: hidden; }
+@media (max-width: 600px) {
+  #controls { width: 208px; }
+  #controls-body { max-height: calc(100dvh - 230px); }
+  .switch-row { min-height: 44px; }
+  .refresh-button, .search-icon-btn, .search-cancel { min-width: 44px; min-height: 44px; }
+  .search-control.expanded { max-width: calc(100vw - 36px); }
+  .search-control.expanded .search-input { width: min(50vw, 220px); }
+  .search-control .search-suggestions { max-width: 100%; }
+  .search-control .search-suggestions { max-height: min(48dvh, calc(100dvh - var(--controls-height) - 110px)); }
+  #dashboard { max-height: min(55dvh, 420px); }
+}
+  </style>
 </head>
 
 <body>
   <div id="controls">
     <button id="controls-toggle" type="button" aria-expanded="true" aria-controls="controls-body">
-      <span>Vehicle filters</span>
+      <span class="brand-name">AT Track</span>
       <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
     </button>
+    <div id="live-status" class="live-status" data-state="loading">
+      <span class="status-dot" aria-hidden="true"></span>
+      <div class="status-copy"><span id="status-label" role="status" aria-live="polite">Loading vehicles…</span><span id="status-update">Connecting to live data</span></div>
+      <button id="refresh-vehicles" class="refresh-button" type="button" aria-label="Refresh vehicles" title="Refresh vehicles">↻</button>
+    </div>
     <div id="controls-body">
       <div id="filters">
         <div class="switch-section">Vehicles</div>
@@ -419,14 +544,14 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
 
         <div class="switch-section">Map</div>
         <label class="switch-row"><span class="switch-label">Map overlays</span><span class="switch"><input type="checkbox" data-layer="overlays" checked><span class="track"></span><span class="knob"></span></span></label>
-        <label class="switch-row"><span class="switch-label">Dim other routes</span><span class="switch"><input type="checkbox" data-layer="focus"><span class="track"></span><span class="knob"></span></span></label>
-        <label class="switch-row"><span class="switch-label">Follow selected vehicle</span><span class="switch"><input type="checkbox" data-layer="follow" checked><span class="track"></span><span class="knob"></span></span></label>
+        <label class="switch-row"><span class="switch-label">Route focus</span><span class="switch"><input type="checkbox" data-layer="focus"><span class="track"></span><span class="knob"></span></span></label>
 
         <div class="switch-section">Markers</div>
         <label class="switch-row"><span class="switch-label">Heading arrows</span><span class="switch"><input type="checkbox" data-layer="bearing" checked><span class="track"></span><span class="knob"></span></span></label>
         <label class="switch-row"><span class="switch-label">Occupancy rings</span><span class="switch"><input type="checkbox" data-layer="occupancy"><span class="track"></span><span class="knob"></span></span></label>
 
         <div class="switch-section">Data</div>
+        <label class="switch-row"><span class="switch-label">On-time dashboard</span><span class="switch"><input type="checkbox" data-layer="dashboard"><span class="track"></span><span class="knob"></span></span></label>
         <label class="switch-row"><span class="switch-label">Debug info</span><span class="switch"><input type="checkbox" data-layer="debug"><span class="track"></span><span class="knob"></span></span></label>
       </div>
 
@@ -438,37 +563,26 @@ h4 { margin: 0 0 8px 0; font-weight: 700; letter-spacing: 0.2px; font-size: 17px
     </div>
   </div>
 
-  <button id="settings-open" type="button" aria-haspopup="dialog" aria-controls="map-settings" disabled>Settings</button>
-  <dialog id="map-settings" aria-labelledby="settings-title">
-    <header class="settings-header"><div><h2 id="settings-title">Map settings</h2><p>Make the map work your way</p></div><button id="settings-close" type="button" aria-label="Close settings">Close</button></header>
-    <div class="settings-scroll">
-      <section id="settings-selection"><h3>Selected route</h3><p id="route-filter-status" role="status">Select a vehicle to filter its route.</p>
-        <label class="switch-row"><span class="switch-label">Hide other routes</span><span class="switch"><input type="checkbox" data-pref="routeHide"><span class="track"></span><span class="knob"></span></span></label>
-        <p class="settings-help">Hiding takes priority over dimming. Vehicle-type filters still apply.</p>
-        <button id="selection-clear" type="button">Clear selection</button>
-      </section>
-      <section id="settings-overlays"><h3>Map layers</h3>
-        <label class="switch-row"><span class="switch-label">Stops and stations</span><span class="switch"><input type="checkbox" data-pref="stops" checked><span class="track"></span><span class="knob"></span></span></label>
-        <label class="switch-row"><span class="switch-label">Train lines</span><span class="switch"><input type="checkbox" data-pref="rail" checked><span class="track"></span><span class="knob"></span></span></label>
-        <label class="switch-row"><span class="switch-label">Frequent bus lines</span><span class="switch"><input type="checkbox" data-pref="frequent" checked><span class="track"></span><span class="knob"></span></span></label>
-      </section>
-      <section id="settings-markers"><h3>Vehicle markers</h3>
-        <label class="switch-row"><span class="switch-label">Route labels</span><span class="switch"><input type="checkbox" data-pref="labels" checked><span class="track"></span><span class="knob"></span></span></label>
-        <label class="switch-row"><span class="switch-label">Popups on hover</span><span class="switch"><input type="checkbox" data-pref="hover" checked><span class="track"></span><span class="knob"></span></span></label>
-        <p class="settings-help">Click or tap always opens vehicle details.</p>
-        <label class="switch-row"><span class="switch-label">Smooth vehicle movement</span><span class="switch"><input type="checkbox" data-pref="motion" checked><span class="track"></span><span class="knob"></span></span></label>
-      </section>
-      <section id="settings-data"><h3>Data and diagnostics</h3><label class="setting-select" for="background-delay">Pause after tab is hidden<select id="background-delay" data-pref="pause"><option value="0">Immediately</option><option value="15000">15 seconds</option><option value="30000" selected>30 seconds</option><option value="60000">1 minute</option><option value="120000">2 minutes</option></select></label><p class="settings-help">Browsers may suspend background tabs sooner. Updates resume when you return.</p></section>
-    </div>
-    <footer class="settings-footer"><span>Preferences saved on this device</span><button id="settings-reset" type="button">Reset settings</button></footer>
-  </dialog>
   <div id="map"></div>
 
-  <div id="mobile-last-update">Last update: —</div>
+  <noscript><p style="position:absolute;top:120px;left:12px;z-index:1500;background:white;padding:16px;color:#222">Enable JavaScript to use the live transport map.</p></noscript>
 
-  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
-  <script src="script.js"></script>
+  <section id="dashboard" hidden aria-label="On-time performance">
+    <header class="dash-head">
+      <span class="dash-dot" aria-hidden="true"></span>
+      <span class="dash-title">On-time performance</span>
+      <button id="dashboard-close" class="dash-close" type="button" title="Hide dashboard" aria-label="Hide dashboard">✕</button>
+    </header>
+    <div id="dashboard-body">
+      <p class="dash-empty">Waiting for schedule data…</p>
+    </div>
+  </section>
+  <script defer src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+  <script defer src="script.js"></script>
 
 </body>
 </html>
+
+
+
+
