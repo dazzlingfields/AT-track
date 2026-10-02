@@ -274,9 +274,9 @@ function getBusType(op,num){const ix=busTypeIndex[op]; return ix?(ix[num]||""):"
 function resolveTrainLineCode(s){
   const u=(s||"").toString().toUpperCase();
   if(!u) return null;
-  if(u.includes("S-C")||u.includes("SOUTH-CITY")||u.includes("SOUTH CITY")||u.includes("SOUTHCITY")) return "SC";
-  if(u.includes("E-W")||u.includes("EAST-WEST")||u.includes("EAST WEST")||u.includes("EASTWEST")) return "EW";
-  if(u.includes("O-W")||u.includes("ONEHUNGA-WEST")||u.includes("ONEHUNGA WEST")||u.includes("ONEHUNGAWEST")) return "OW";
+  if(/\bSC\b/.test(u)||u.includes("S-C")||u.includes("SOUTH-CITY")||u.includes("SOUTH CITY")||u.includes("SOUTHCITY")) return "SC";
+  if(/\bEW\b/.test(u)||u.includes("E-W")||u.includes("EAST-WEST")||u.includes("EAST WEST")||u.includes("EASTWEST")) return "EW";
+  if(/\bOW\b/.test(u)||u.includes("O-W")||u.includes("ONEHUNGA-WEST")||u.includes("ONEHUNGA WEST")||u.includes("ONEHUNGAWEST")) return "OW";
   if(u.includes("STH")||u.includes("SOUTHERN")||u.includes("SOUTH")) return "STH";
   if(u.includes("WESTERN")||u.includes("WEST")) return "WEST";
   if(u.includes("EASTERN")||u.includes("EAST")) return "EAST";
@@ -814,11 +814,10 @@ let _shapeViewTimer=null;
 map.on("moveend zoomend",()=>{ clearTimeout(_shapeViewTimer); _shapeViewTimer=setTimeout(ensureShapesForViewport,400); });
 
 // ===================== Stops & stations ==============================================
-// Stop geometry is not in the realtime feed, so it loads once from a static stops.json
-// (generate it from a current AT GTFS export with build-stops.mjs). Stations and ferry
+// Stop geometry is not in the realtime feed, so it loads from local GeoJSON and CSVs. Stations and ferry
 // terminals are few and act as map landmarks, so they show across the region; bus stops
 // are dense, so they only appear when zoomed right in. Only the stops inside the current
-// viewport are drawn, on their own canvas pane beneath the vehicles, capped for safety.
+// viewport are drawn. Stations use accessible DOM markers; dense bus stops use canvas.
 const STOP_MIN_ZOOM_RAILFERRY = 11;
 const STOP_MIN_ZOOM_BUS       = 16;
 const STOP_RENDER_CAP         = 800;
@@ -836,8 +835,13 @@ const arrivalsByStop = new Map();
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
 try{ map.createPane("stopsPane"); map.getPane("stopsPane").style.zIndex=250; }catch{}
+// DOM station buttons must sit above the full-map vehicle canvas to receive taps.
+try{ map.createPane("stationPane"); map.getPane("stationPane").style.zIndex=450; }catch{}
 const stopsRenderer=L.canvas({pane:"stopsPane",padding:0.5,tolerance:10}); // +10px hit area so tiny bus dots are easy to tap
 const stopsLayer=L.layerGroup();
+const stopMarkersByKey=new Map();
+const stationIcon=L.divIcon({className:"rail-station-icon",iconSize:[26,26],iconAnchor:[13,13],popupAnchor:[0,-14],
+  html:'<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="3" width="12" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M7 10h10M9 18l-3 4m9-4 3 4M9 6h6" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="14" r="1.3" fill="currentColor"/><circle cx="15" cy="14" r="1.3" fill="currentColor"/></svg>'});
 
 const STOP_STYLE={
   1:{radius:5,color:trainLineColors.STH,fill:"#fff",weight:2,label:"Rail station"},
@@ -892,14 +896,21 @@ function buildArrivalsBoard(key){
 }
 function buildStopPopup(m){
   const st=STOP_STYLE[m._stopType]||STOP_STYLE[0];
-  const head=`<b>${escapeHtml(m._stopName)}</b><br><span style="color:var(--text-subtle);font-size:0.92em;">Stop ${escapeHtml(String(m._stopCode||"—"))} &middot; ${st.label}</span>`;
-  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${buildArrivalsBoard(m._stopKey)}</div>`;
+  const rail=m._stopType===1, info=m._stopInfo;
+  const head=`<b>${escapeHtml(m._stopName)}</b><br><span style="color:var(--text-subtle);font-size:0.92em;">${rail ? st.label : `Stop ${escapeHtml(String(m._stopCode||"—"))} &middot; ${st.label}`}</span>`;
+  const platforms=rail && info?.platforms?.length ? `<div class="station-details"><b>Platforms / stop codes</b>${info.platforms.map(p=>`<div>${escapeHtml(p.name.replace(m._stopName,"").trim()||"Station")} &middot; ${escapeHtml(p.code)}${p.description?`<br>${escapeHtml(p.description)}`:""}</div>`).join("")}</div>` : "";
+  const position=rail ? `<div class="station-coordinates">${m.getLatLng().lat.toFixed(5)}, ${m.getLatLng().lng.toFixed(5)}</div>` : "";
+  const board=buildArrivalsBoard(m._stopKey);
+  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${platforms}${board|| (rail?'<div class="station-details">No live arrival predictions available.</div>':"")}${position}</div>`;
 }
 
 function makeStopMarker(s){
   const st=STOP_STYLE[s[4]]||STOP_STYLE[0];
-  const m=L.circleMarker([s[0],s[1]],{renderer:stopsRenderer,radius:st.radius,color:st.color,weight:st.weight,fillColor:st.fill,fillOpacity:0.95,opacity:1,interactive:true,bubblingMouseEvents:false});
+  const m=s[4]===1 ? L.marker([s[0],s[1]],{icon:stationIcon,pane:"stationPane",title:s[3],alt:s[3],keyboard:true,bubblingMouseEvents:false})
+    : L.circleMarker([s[0],s[1]],{renderer:stopsRenderer,radius:st.radius,color:st.color,weight:st.weight,fillColor:st.fill,fillOpacity:0.95,opacity:1,interactive:true,bubblingMouseEvents:false});
   m._stopName=s[3]; m._stopCode=s[2]; m._stopType=s[4]; m._stopKey=s[5];
+  m._stopInfo=s[6];
+  if(s[4]===1) m.bindTooltip(escapeHtml(s[3]),{direction:"top",offset:[0,-12]});
   // Function content => rebuilt on every open, so the arrivals board stays current.
   m.bindPopup(()=>buildStopPopup(m),{maxWidth:240,className:"vehicle-popup"});
   // Track the open station popup so the poll can refresh its arrivals board live.
@@ -916,18 +927,27 @@ function refreshOpenStopPopup(){
 }
 
 function renderStopsForViewport(){
-  if(!stopsEnabled || !stopsData.length){ stopsLayer.clearLayers(); return; }
+  if(!stopsEnabled || !stopsData.length){ stopsLayer.clearLayers(); stopMarkersByKey.clear(); return; }
   const z=map.getZoom();
   const showRailFerry=z>=STOP_MIN_ZOOM_RAILFERRY;
   const showBus=z>=STOP_MIN_ZOOM_BUS;
-  stopsLayer.clearLayers();
-  if(!showRailFerry && !showBus) return;
+  const visible=new Set();
+  const add=s=>{
+    const key=s[5]||`${s[4]}|${s[0]}|${s[1]}|${s[2]}`;
+    visible.add(key);
+    if(!stopMarkersByKey.has(key)){
+      const marker=makeStopMarker(s); stopMarkersByKey.set(key,marker); stopsLayer.addLayer(marker);
+    }
+  };
   const b=map.getBounds().pad(0.2);
   const south=b.getSouth(),north=b.getNorth(),west=b.getWest(),east=b.getEast();
   const inView=s=>s[0]>=south&&s[0]<=north&&s[1]>=west&&s[1]<=east;
   // Stations/ferries first (always drawn when visible), then bus stops up to the cap.
-  if(showRailFerry) for(const s of stopsRailFerry){ if(inView(s)) stopsLayer.addLayer(makeStopMarker(s)); }
-  if(showBus){ let n=0; for(const s of stopsBus){ if(!inView(s)) continue; stopsLayer.addLayer(makeStopMarker(s)); if(++n>=STOP_RENDER_CAP) break; } }
+  if(showRailFerry) for(const s of stopsRailFerry){ if(inView(s)) add(s); }
+  if(showBus){ let n=0; for(const s of stopsBus){ if(!inView(s)) continue; add(s); if(++n>=STOP_RENDER_CAP) break; } }
+  for(const [key,marker] of stopMarkersByKey){
+    if(!visible.has(key)){ stopsLayer.removeLayer(marker); stopMarkersByKey.delete(key); }
+  }
 }
 
 let _stopsTimer=null;
@@ -937,7 +957,7 @@ map.on("moveend zoomend", scheduleStopsRender);
 function setStopsEnabled(on){
   stopsEnabled=on;
   if(on){ if(!map.hasLayer(stopsLayer)) map.addLayer(stopsLayer); renderStopsForViewport(); }
-  else { map.removeLayer(stopsLayer); stopsLayer.clearLayers(); }
+  else { map.removeLayer(stopsLayer); stopsLayer.clearLayers(); stopMarkersByKey.clear(); }
 }
 
 // Stop geometry is loaded directly from AT CSV exports hosted alongside the site, so
@@ -946,6 +966,12 @@ function setStopsEnabled(on){
 // Each CSV carries WGS84 lat/lon and a Mode column, which is all we need; train platforms
 // are collapsed to one marker per parent station.
 const STOP_CSV_FILES = ["stops_train.csv", "stops_bus.csv", "stops_ferry.csv"];
+function parseTrainStations(gj){
+  return (gj?.features||[]).filter(f=>f.geometry?.type==="Point" && f.properties?.STOPNAME
+    && f.geometry.coordinates.length>=2 && f.geometry.coordinates.slice(0,2).every(Number.isFinite))
+    .map(f=>({lat:f.geometry.coordinates[1],lon:f.geometry.coordinates[0],name:f.properties.STOPNAME,
+      parent:f.properties.PARENTSTATION||"",code:"",id:"",type:1,platforms:f.properties.platforms||[]}));
+}
 
 // Quote-aware single-line CSV splitter (handles "a,b" and escaped "").
 function csvSplitLine(line){
@@ -1005,20 +1031,35 @@ function parseStopsCsv(text){
 // to the right station for naming and the arrivals board. Tuple gains a 6th field: the key.
 function dedupeStops(rows){
   stopById.clear(); stopKeyById.clear(); stopNameByKey.clear();
-  const seen=new Set(), res=[];
+  const seen=new Map(), res=[];
+  const parentByName=new Map();
+  for(const s of rows){
+    if(s.type!==0 && s.parent){
+      const name=s.name.replace(/\s+(platform\s*)?\d+$/i,"").trim().toLowerCase();
+      const key=`${s.type}|${name}`;
+      if(!parentByName.has(key)) parentByName.set(key,s.parent);
+    }
+  }
   for(const s of rows){
     const isBus = s.type===0;
     const clean = isBus ? s.name : s.name.replace(/\s+(platform\s*)?\d+$/i,"").trim();
     const stationKey = isBus
       ? ("0|"+(s.id||s.code||clean.toLowerCase()))
-      : (s.type+"|"+(s.parent||clean.toLowerCase()));
+      : (s.type+"|"+(parentByName.get(`${s.type}|${clean.toLowerCase()}`)||s.parent||clean.toLowerCase()));
     if(s.id){ stopById.set(String(s.id), clean); stopKeyById.set(String(s.id), stationKey); }
     if(s.parent){ stopById.set(String(s.parent), clean); stopKeyById.set(String(s.parent), stationKey); }
+    for(const p of s.platforms||[]){
+      if(p.id){ stopById.set(String(p.id),clean); stopKeyById.set(String(p.id),stationKey); }
+    }
     stopNameByKey.set(stationKey, clean);
     if(isBus){ res.push([s.lat,s.lon,s.code,clean,0,stationKey]); continue; }
     if(seen.has(stationKey)) continue;
-    seen.add(stationKey);
-    res.push([s.lat,s.lon,s.code,clean,s.type,stationKey]);
+    const platforms=s.platforms?.length ? s.platforms : rows.filter(r=>r.type===s.type &&
+      (r.parent ? r.parent===s.parent : r.name.replace(/\s+(platform\s*)?\d+$/i,"").trim()===clean))
+      .map(r=>({id:r.id,code:r.code,name:r.name}));
+    const tuple=[s.lat,s.lon,s.code,clean,s.type,stationKey,{platforms}];
+    seen.set(stationKey,tuple);
+    res.push(tuple);
   }
   return res;
 }
@@ -1031,12 +1072,21 @@ function afterStopsLoaded(){
 
 async function loadStops(){
   const rows=[];
+  // New geometry first; the CSV still registers older platform IDs for cached GTFS trips.
+  try{
+    const res=await fetch("train_stations.geojson",{cache:"no-cache"});
+    if(res.ok) rows.push(...parseTrainStations(await res.json()));
+  }catch{}
   for(const file of STOP_CSV_FILES){
     try{
       const res=await fetch(file,{cache:"no-cache"}); // revalidate so new commits show up
       if(!res.ok) continue;
       const parsed=parseStopsCsv(await res.text());
-      if(parsed.length) rows.push(...parsed);
+      if(parsed.length){
+        const authoritative=new Set(rows.filter(s=>s.platforms).map(s=>s.name.toLowerCase()));
+        rows.push(...parsed.filter(s=>s.type!==1 || !authoritative.size ||
+          authoritative.has(s.name.replace(/\s+(platform\s*)?\d+$/i,"").trim().toLowerCase())));
+      }
     }catch{}
   }
   if(rows.length){
@@ -1055,10 +1105,8 @@ async function loadStops(){
 }
 
 // ===================== Rail line geometry (optional GeoJSON) ==========================
-// The AT "Train Route" CSV export has attributes but no geometry, so route lines come from
-// a GeoJSON export of the same layer (Download > GeoJSON on the AT Open GIS Data portal,
-// or append ?f=geojson to the layer's REST query). Same replaceable-file workflow: drop in
-// train_routes.geojson, reload, lines redraw. Lines are coloured by line code and sit on
+// Routes come from the AT Train Route GeoJSON export, condensed with scripts/condense-rail.cjs.
+// Replace train_routes.geojson and reload to update the network. Lines are coloured by line code and sit on
 // their own pane beneath everything else. Absent file -> layer simply never appears.
 const RAIL_LINES_FILE="train_routes.geojson";
 let railLinesLayer=null, railLinesEnabled=true;
@@ -1091,25 +1139,35 @@ async function loadRailLines(){
     const longest=new Map(); // line code -> {len, id}
     feats.forEach(f=>{
       const p=f.properties||{};
-      const code=String(p.ROUTENUMBER??p.routenumber??p.OBJECTID??Math.random()).toUpperCase();
-      const len=Number(p.Shape__Length??p.shape__length??0)||0;
-      const id=p.OBJECTID??p.objectid??f;
+      const name=`${p.ROUTENUMBER??p.routenumber??""} ${p.ROUTENAME??p.routename??""}`;
+      const code=resolveTrainLineCode(name)||name.trim()||f;
+      const lines=f.geometry?.type==="LineString" ? [f.geometry.coordinates] : f.geometry?.type==="MultiLineString" ? f.geometry.coordinates : [];
+      const len=Number(p.Shape__Length??p.shape__length)||lines.reduce((sum,line)=>sum+line.slice(1).reduce((n,c,i)=>n+haversineM(line[i][1],line[i][0],c[1],c[0]),0),0);
+      const id=f; // feature identity avoids duplicate/missing OBJECTID collisions
       const cur=longest.get(code);
       if(!cur || len>cur.len) longest.set(code,{len,id});
     });
     longest.forEach(v=>keep.add(v.id));
   }
-  const keepFeature=f=>{ const p=f.properties||{}; return !RAIL_DEDUPE_BY_LINE || keep.has(p.OBJECTID??p.objectid??f); };
+  const keepFeature=f=>!RAIL_DEDUPE_BY_LINE || keep.has(f);
+  // Draw S-C first, then the thinner dashed E-W: both remain visible on shared tracks.
+  const order={HUIA:0,OW:1,SC:2,EW:3};
+  const display={type:"FeatureCollection",features:feats.filter(keepFeature).sort((a,b)=>
+    (order[resolveTrainLineCode(a.properties.ROUTENUMBER)]??0)-(order[resolveTrainLineCode(b.properties.ROUTENUMBER)]??0))};
 
   try{
-    railLinesLayer=L.geoJSON(gj,{
+    railLinesLayer=L.geoJSON(display,{
       pane:"railPane",
       filter:f=>{ const m=String(f?.properties?.MODE??f?.properties?.mode??"").toLowerCase(); return (!m || m.includes("train")||m.includes("rail")) && keepFeature(f); },
-      style:f=>({color:railLineColor(f.properties),weight:3,opacity:0.65,lineJoin:"round",lineCap:"round"}),
+      style:f=>{
+        const code=resolveTrainLineCode(f.properties.ROUTENUMBER);
+        return {color:railLineColor(f.properties),weight:code==="SC"?7:4,opacity:0.9,
+          dashArray:code==="EW"?"10 6":null,lineJoin:"round",lineCap:"round",smoothFactor:0.2};
+      },
       onEachFeature:(f,layer)=>{
         const p=f.properties||{};
         const nm=p.ROUTENAME||p.routename||p.ROUTENUMBER||p.routenumber||"Train route";
-        layer.bindTooltip(String(nm),{sticky:true});
+        layer.bindTooltip(escapeHtml(`${p.ROUTENUMBER||""} · ${nm}`),{sticky:true});
       },
     });
     if(railLinesEnabled) railLinesLayer.addTo(map);
