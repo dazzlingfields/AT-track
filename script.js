@@ -5,6 +5,7 @@ const routesUrl    = `${proxyBaseUrl}/api/routes`;
 const tripsUrl     = `${proxyBaseUrl}/api/trips`;
 const shapesUrl    = `${proxyBaseUrl}/api/shapes`;
 const tripUpdatesUrl = `${proxyBaseUrl}/api/tripupdates`; // fallback only; see fetchVehicles
+const departuresUrl = `${proxyBaseUrl}/api/departures`;
 const busTypesUrl  = "busTypes.json";
 
 // CARTO gated their free raster basemap tiles behind an API key in Aug 2026. This key is
@@ -114,6 +115,7 @@ const backoff = {
   trips:    { ms:0, until:0 },
   shapes:   { ms:0, until:0 },
   tripupdates: { ms:0, until:0 },
+  departures: { ms:0, until:0 },
 };
 function applyRateLimitBackoff(retryAfterMs, who){
   const b = backoff[who] || backoff.realtime;
@@ -184,18 +186,21 @@ let _idbPromise=null;
 function idbOpen(){
   if(_idbPromise) return _idbPromise;
   _idbPromise=new Promise(resolve=>{
+    let settled=false;
+    const timer=setTimeout(()=>finish(null),2000);
+    const finish=db=>{if(settled){db?.close?.();return;}settled=true;clearTimeout(timer);resolve(db);};
     let req;
-    try{ req=indexedDB.open(IDB_NAME,IDB_VER); }catch{ resolve(null); return; }
+    try{ req=indexedDB.open(IDB_NAME,IDB_VER); }catch{ finish(null); return; }
     req.onupgradeneeded=()=>{ const db=req.result; if(!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE); };
-    req.onsuccess=()=>resolve(req.result);
-    req.onerror=()=>resolve(null);
-    req.onblocked=()=>resolve(null);
+    req.onsuccess=()=>{req.result.onversionchange=()=>{req.result.close();_idbPromise=null;};finish(req.result);};
+    req.onerror=()=>finish(null);
+    req.onblocked=()=>finish(null);
   }).catch(()=>null);
   return _idbPromise;
 }
 async function idbGet(key){
   const db=await idbOpen(); if(!db) return null;
-  return new Promise(res=>{ try{ const r=db.transaction(IDB_STORE,"readonly").objectStore(IDB_STORE).get(key); r.onsuccess=()=>res(r.result??null); r.onerror=()=>res(null); }catch{ res(null); } });
+  return new Promise(res=>{ try{ const tx=db.transaction(IDB_STORE,"readonly"),r=tx.objectStore(IDB_STORE).get(key); tx.onabort=()=>res(null);r.onsuccess=()=>res(r.result??null); r.onerror=()=>res(null); }catch{ res(null); } });
 }
 // Batched put: one transaction for many [key,record] pairs.
 async function idbPutMany(pairs){
@@ -209,7 +214,7 @@ async function idbHydrateAndPrune(){
   const now=Date.now();
   return new Promise(res=>{
     let cur;
-    try{ cur=db.transaction(IDB_STORE,"readwrite").objectStore(IDB_STORE).openCursor(); }
+    try{ const tx=db.transaction(IDB_STORE,"readwrite");tx.onabort=()=>res();tx.onerror=()=>res();cur=tx.objectStore(IDB_STORE).openCursor(); }
     catch{ res(); return; }
     cur.onerror=()=>res();
     cur.onsuccess=e=>{
@@ -255,6 +260,15 @@ async function safeFetch(url,opts={}){
     return await res.json();
   }catch(err){console.error("Fetch error:",err); setDebug(`Fetch error: ${err.message}`); return null;}
   finally{ clearTimeout(timer); opts.signal?.removeEventListener("abort",abort); }
+}
+async function fetchReferenceAsset(file,format="json"){
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+  try{
+    const response=await fetch(file,{cache:"no-cache",signal:controller.signal});
+    if(!response.ok) return null;
+    return await (format==="text"?response.text():response.json());
+  }catch{ return null; }
+  finally{ clearTimeout(timer); }
 }
 function chunk(a,n){const o=[]; for(let i=0;i<a.length;i+=n)o.push(a.slice(i,i+n)); return o;}
 function buildBusTypeIndex(json){const idx={}; if(!json||typeof json!=="object") return idx; for(const model of Object.keys(json)){const ops=json[model]||{}; for(const op of Object.keys(ops)){const nums=ops[op]||[]; if(!idx[op]) idx[op]={}; for(const n of nums) idx[op][n]=model;}} return idx;}
@@ -359,7 +373,7 @@ function buildPopup(routeName,destination,nextStopLine,vehicleLabel,busType,lice
 function buildDelayMap(entities){
   const map=new Map();
   for(const e of (entities||[])){
-    const tu=e.trip_update||e.tripUpdate; if(!tu) continue;
+    const tu=e.trip_update||e.tripUpdate; if(!tu || e.is_deleted || e.isDeleted || TransitData.canceled(tu)) continue;
     const tid=tu.trip?.trip_id ?? tu.trip?.tripId;
     if(tid) map.set(tid, tu);
   }
@@ -369,7 +383,7 @@ function buildDelayMap(entities){
 // vehicle's current stop sequence (i.e. the next stop), falling back to the final stop.
 function pickRelevantStu(tu, currentStopSeq){
   if(!tu) return null;
-  const stus=tu.stop_time_update||tu.stopTimeUpdate||[];
+  const stus=TransitData.stopUpdates(tu);
   if(!stus.length) return null;
   if(currentStopSeq!=null){
     let best=null;
@@ -378,8 +392,10 @@ function pickRelevantStu(tu, currentStopSeq){
       if(seq>=currentStopSeq && (best==null || seq<best.seq)) best={seq,s};
     }
     if(best) return best.s;
+    return null; // all supplied sequences are behind the vehicle
   }
-  return stus[stus.length-1];
+  const now=Date.now()/1000;
+  return stus.find(s=>(toNum(s.departure?.time)??toNum(s.arrival?.time)??0)>=now-30)||stus[stus.length-1];
 }
 function delayForTrip(tu, currentStopSeq){
   if(!tu) return null;
@@ -421,7 +437,7 @@ function scheduleLineHtml(sec){
 // ---- Next stop (vehicle popup) ------------------------------------------------------
 // Resolves a GTFS stop_id to a station name (built from the stops CSVs) and renders an ETA
 // from the trip update's predicted arrival time. Degrades to the raw id, then to nothing.
-function stopNameForId(id){ if(id===null||id===undefined||id==="") return ""; return stopById.get(String(id))||""; }
+function stopNameForId(id){ if(id===null||id===undefined||id==="") return ""; return stopById.get(String(id))||stopNameByKey.get(resolveStopKey(id))||""; }
 function formatEta(timeSec){
   const t=toNum(timeSec); if(t===null||t<=0) return "";
   const s=Math.round(t-Date.now()/1000);
@@ -442,7 +458,7 @@ function buildNextStopLine(info, fallbackStopId){
 // first, from the same trip update. Used for the upcoming-stops list and the station boards.
 function upcomingStus(tu, currentStopSeq, limit){
   if(!tu) return [];
-  const stus=tu.stop_time_update||tu.stopTimeUpdate||[];
+  const stus=TransitData.stopUpdates(tu);
   const out=[];
   for(const s of stus){
     const seq=toNum(s.stop_sequence ?? s.stopSequence);
@@ -475,17 +491,34 @@ function buildNextStopsLine(tu, currentStopSeq, fallbackStopId, limit=4){
       + `<span style="color:var(--text-subtle);white-space:nowrap;">${eta||""}</span></div>`;
   }).filter(Boolean).join("");
   if(!rows) return buildNextStopLine(null, fallbackStopId);
-  const label = ups.length>1 ? "Next stops:" : "Next stop:";
+  const singleReport=tu && !Array.isArray(tu.stop_time_update??tu.stopTimeUpdate);
+  const label = singleReport ? "Latest reported stop:" : ups.length>1 ? "Next stops:" : "Next stop:";
   return `<b>${label}</b><div style="margin-top:2px;">${rows}</div>`;
 }
 
-// Fallback path: only used if the combined realtime feed carries no trip updates.
-let useSeparateTripUpdates=false;
+// The fallback is independent of vehicle rendering and respects its own retry window.
 async function fetchTripUpdatesDelays(){
+  if(Date.now()<backoff.tripupdates.until) return null;
   const json=await safeFetch(tripUpdatesUrl);
-  if(!json || json._rateLimited){ if(json&&json._rateLimited) applyRateLimitBackoff(json.retryAfterMs,"tripupdates"); return null; }
-  const ents=json?.response?.entity||json?.entity||[];
+  if(!json || json._rateLimited){
+    arrivalsFeedState=json?"limited":"error";
+    if(json?._rateLimited) applyRateLimitBackoff(json.retryAfterMs,"tripupdates");
+    refreshOpenStopPopup(); return null;
+  }
+  const ents=TransitData.entities(json);
+  captureScheduleUpdates(ents);
+  backoff.tripupdates.ms=0; backoff.tripupdates.until=0;
+  arrivalsLastUpdated=(toNum(json?.response?.header?.timestamp??json?.header?.timestamp)||Date.now()/1000)*1000;
   return buildDelayMap(ents);
+}
+let tripUpdatesInFlight=false;
+function refreshSeparateTripUpdates(){
+  if(tripUpdatesInFlight || Date.now()<backoff.tripupdates.until || navigator.onLine===false || !isPageVisible()) return;
+  tripUpdatesInFlight=true;
+  fetchTripUpdatesDelays().then(updates=>{
+    if(updates){ latestTripUpdates=updates; arrivalsFeedState="ready"; rebuildStationArrivals(); }
+  }).catch(()=>{ arrivalsFeedState="error"; refreshOpenStopPopup(); })
+    .finally(()=>{ tripUpdatesInFlight=false; });
 }
 
 // ===================== Motion / speed estimation =====================================
@@ -831,6 +864,123 @@ const stopKeyById  = new Map(); // stop_id -> stationKey
 const stopNameByKey= new Map(); // stationKey -> display name
 // Rebuilt every poll: stationKey -> [{badge,color,etaSec,delaySec}] of inbound services.
 const arrivalsByStop = new Map();
+let stopAliases=new Map(),latestTripUpdates=new Map(),latestStopSequences=new Map();
+let latestScheduleUpdates=new Map();
+const latestPlatformIds=new Map();
+const departuresByStation=new Map(),departuresPending=new Map();
+function captureScheduleUpdates(entities){
+  latestScheduleUpdates=new Map();
+  for(const entity of entities){
+    const update=entity.trip_update??entity.tripUpdate,id=update?.trip?.trip_id??update?.trip?.tripId;
+    if(id && !entity.is_deleted && !entity.isDeleted) latestScheduleUpdates.set(id,update);
+    for(const stop of TransitData.list(update?.stop_time_update??update?.stopTimeUpdate)){
+      if(!stop || typeof stop!=="object") continue;
+      const stopId=stop.stop_id??stop.stopId,code=TransitData.stopCode(stopId);
+      if(code) latestPlatformIds.set(code,stopId);
+    }
+  }
+  while(latestPlatformIds.size>10000) latestPlatformIds.delete(latestPlatformIds.keys().next().value);
+}
+let arrivalsLastUpdated=0,arrivalsFeedState="loading",arrivalsDiagnostics={};
+function resolveStopKey(id){ return TransitData.resolveStop(id,stopKeyById,stopAliases); }
+function rebuildStationArrivals(){
+  const result=TransitData.buildArrivals(latestTripUpdates,{
+    now:Date.now()/1000,resolveStop:resolveStopKey,sequenceForTrip:id=>latestStopSequences.get(id),
+    serviceForTrip:(id,tu)=>{
+      const trip=tripCache[id],route=routes[tu.trip?.route_id??tu.trip?.routeId??trip?.route_id]||{};
+      const type=Number(route.route_type),name=route.route_short_name||route.route_long_name||tu.trip?.route_id||"Service";
+      const mode=type===2?"train":type===4?"ferry":"bus";
+      return {badge:badgeForRoute(mode,name),color:mode==="train"?trainColorForRoute(name):vehicleColors[mode],
+        dest:trip?.trip_headsign||route.route_long_name||"Destination unavailable"};
+    }
+  });
+  arrivalsByStop.clear();
+  result.byStop.forEach((list,key)=>arrivalsByStop.set(key,list));
+  arrivalsDiagnostics=result.stats;
+  refreshOpenStopPopup();
+}
+function stationArrivalsMessage(){
+  if(navigator.onLine===false) return "Offline — live arrivals are unavailable.";
+  if(arrivalsFeedState==="loading") return "Loading service updates…";
+  if(arrivalsFeedState==="error") return "Service updates unavailable. Retrying automatically.";
+  if(arrivalsFeedState==="limited") return "Service updates are rate limited. Retrying automatically.";
+  if(!arrivalsLastUpdated || Date.now()-arrivalsLastUpdated>120000) return "Service updates are out of date.";
+  if(!arrivalsDiagnostics.multiStopTrips) return "The feed reports recent stops; upcoming station times are not supplied.";
+  return "No arrival predictions supplied for this station in the next hour.";
+}
+function getTransitDiagnostics(){
+  return {routes:Object.keys(routes).length,trips:Object.keys(tripCache).length,stops:stopsData.length,
+    vehicles:Object.keys(vehicleMarkers).length,vehicleLayerCounts:Object.fromEntries(Object.entries(vehicleLayers).map(([key,layer])=>[key,layer.getLayers().length])),
+    arrivals:{state:arrivalsFeedState,ageSeconds:arrivalsLastUpdated?Math.round((Date.now()-arrivalsLastUpdated)/1000):null,...arrivalsDiagnostics},
+    timetables:[...departuresByStation].map(([station,data])=>({station,status:data.status,complete:data.complete,entries:data.data?.length||0})),
+    pending:{vehicles:vehiclesInFlight,trips:tripsInFlight,tripUpdates:tripUpdatesInFlight,departures:departuresPending.size},
+    retrySeconds:Object.fromEntries(Object.entries(backoff).map(([key,value])=>[key,Math.max(0,Math.ceil((value.until-Date.now())/1000))]))};
+}
+function loadStationDepartures(marker){
+  if(marker?._stopType!==1 || navigator.onLine===false || !isPageVisible()) return Promise.resolve();
+  const key=marker._stopKey,previous=departuresByStation.get(key),now=Date.now();
+  if(departuresPending.has(key)) return departuresPending.get(key);
+  if(now<backoff.departures.until || now<(previous?.retryAt||0) || previous?.status==="ready" && now-previous.fetchedAt<60000) return Promise.resolve();
+  const ids=[...new Set((marker._stopInfo?.platforms||[]).map(p=>{
+    const current=latestPlatformIds.get(TransitData.stopCode(p.id));
+    return current && resolveStopKey(current)===key?current:p.id;
+  }).filter(Boolean))];
+  if(!ids.length) return Promise.resolve();
+  departuresByStation.set(key,{...previous,status:"loading"});
+  refreshOpenStopPopup();
+  const work=(async()=>{
+    const result=await safeFetch(`${departuresUrl}?ids=${ids.slice(0,8).map(encodeURIComponent).join(",")}`);
+    if(!result || result._rateLimited){
+      if(result?._rateLimited) applyRateLimitBackoff(result.retryAfterMs,"departures");
+      departuresByStation.set(key,{...previous,status:result?"limited":"error",retryAt:Date.now()+60000});
+    }else if(Array.isArray(result.data)){
+      if(result.retryAfter) applyRateLimitBackoff(parseRetryAfterMs(result.retryAfter),"departures");
+      departuresByStation.set(key,{status:"ready",data:result.data,fetchedAt:Date.now(),
+        complete:result.complete===true && ids.length<=8,invalidTimeCount:result.invalidTimeCount||0,
+        errors:result.errors||[],retryAt:result.complete?0:Date.now()+60000});
+    }else departuresByStation.set(key,{...previous,status:"error",retryAt:Date.now()+60000});
+    while(departuresByStation.size>100) departuresByStation.delete(departuresByStation.keys().next().value);
+    refreshOpenStopPopup();
+    if(_openStopMarker?._stopKey===key) enrichOpenStation(false);
+  })().finally(()=>departuresPending.delete(key));
+  departuresPending.set(key,work);return work;
+}
+function stationDepartureRows(marker){
+  const record=departuresByStation.get(marker._stopKey);
+  if(!record?.data) return [];
+  return ScheduleData.mergeDepartures(record.data,latestScheduleUpdates,{now:Date.now()/1000,
+    liveFresh:navigator.onLine!==false && arrivalsFeedState==="ready" && Date.now()-arrivalsLastUpdated<=120000,
+    sequenceForTrip:id=>latestStopSequences.get(id)});
+}
+function buildStationDepartureBoard(marker){
+  const record=departuresByStation.get(marker._stopKey),rows=stationDepartureRows(marker).slice(0,6);
+  const offline=navigator.onLine===false;
+  let message="";
+  if(offline) message=rows.length?"Saved timetable · offline":"Offline — no saved timetable for this station.";
+  else if(!record || record.status==="loading") message="Loading station timetable…";
+  else if(record.status==="limited") message="Timetable updates are rate limited. Retrying automatically.";
+  else if(record.status==="error") message="Station timetable unavailable. Retrying automatically.";
+  else if(record.invalidTimeCount) message="Some timetable records have no usable clock time.";
+  else if(!record.complete) message="Partial timetable — some platform times are unavailable.";
+  else if(!rows.length) message="No scheduled departures in the next hour.";
+  const clock=new Intl.DateTimeFormat("en-NZ",{timeZone:"Pacific/Auckland",hour:"2-digit",minute:"2-digit",hourCycle:"h23"});
+  const items=rows.map(row=>{
+    const trip=tripCache[row.tripId],route=routes[row.routeId||trip?.route_id]||{};
+    const name=route.route_short_name||route.route_long_name||"Train",badge=badgeForRoute("train",name),color=trainColorForRoute(name);
+    const dest=row.destination||trip?.trip_headsign||route.route_long_name||"Destination unavailable";
+    const platform=marker._stopInfo?.platforms?.find(p=>ScheduleData.sameStop(p.id,row.stopId));
+    const platformName=platform?.name?.replace(marker._stopName,"").trim()||"";
+    const label={scheduled:"Scheduled",live:"Live",estimated:"Estimated",canceled:"Cancelled"}[row.status];
+    const eta=row.status==="canceled"?"Cancelled":formatEta(row.etaSec).replace("in ","");
+    return `<div class="departure-row${row.status==="canceled"?" departure-canceled":""}">
+      <span class="departure-badge" style="background:${color};color:${badgeTextColor(color)}">${escapeHtml(badge)}</span>
+      <span class="departure-destination">${escapeHtml(dest)}<small>${label}${platformName?` · Platform ${escapeHtml(platformName)}`:""}${Number(row.pickupType)>1?" · Boarding by arrangement":""}</small></span>
+      <span class="departure-time">${clock.format(new Date(row.etaSec*1000))}<small>${escapeHtml(eta)}</small></span></div>`;
+  }).join("");
+  // Keep a useful live report while a new timetable request is loading or unavailable.
+  const reports=rows.length?"":buildArrivalsBoard(marker._stopKey);
+  return `<div class="station-details station-departures"><b>${reports?"Station timetable":"Next services"}</b>${items}${message?`<div class="departure-message" role="status">${escapeHtml(message)}</div>`:""}${rows.length?'<div class="station-coordinates">Times in Auckland · timetable times are marked Scheduled</div>':""}</div>${reports}`;
+}
 
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
@@ -868,6 +1018,7 @@ function nearestStop(lat,lon,maxKm){
 // station is the next stop, soonest first. Built from arrivalsByStop (refreshed each poll);
 // content is materialised on each popup open, so reopening reflects the latest poll.
 function buildArrivalsBoard(key){
+  if(navigator.onLine===false || Date.now()-arrivalsLastUpdated>120000 || arrivalsFeedState!=="ready") return "";
   const list = key ? arrivalsByStop.get(key) : null;
   if(!list || !list.length) return "";
   const rows = list
@@ -877,7 +1028,7 @@ function buildArrivalsBoard(key){
     .slice(0,6);
   if(!rows.length) return "";
   const items = rows.map(({a,eta})=>{
-    const badge = escapeHtml(String(a.badge||"?")).slice(0,6);
+    const badge = escapeHtml(String(a.badge||"?").slice(0,6));
     const when  = eta==="due" ? "due" : eta.replace("in ","");
     const dest  = a.dest ? escapeHtml(String(a.dest)) : "";
     let late="";
@@ -892,16 +1043,17 @@ function buildArrivalsBoard(key){
         <span style="text-align:right;white-space:nowrap;">${when}${late}</span>
       </div>`;
   }).join("");
-  return `<div style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>Next services</b>${items}</div>`;
+  const full=arrivalsDiagnostics.multiStopTrips>0;
+  return `<div style="margin-top:6px;border-top:1px solid var(--panel-border);padding-top:5px;"><b>${full?"Next services":"Reported service times"}</b>${items}${full?"":'<div class="station-coordinates">Recent stop reports; a full departure board is unavailable.</div>'}</div>`;
 }
 function buildStopPopup(m){
   const st=STOP_STYLE[m._stopType]||STOP_STYLE[0];
   const rail=m._stopType===1, info=m._stopInfo;
   const head=`<b>${escapeHtml(m._stopName)}</b><br><span style="color:var(--text-subtle);font-size:0.92em;">${rail ? st.label : `Stop ${escapeHtml(String(m._stopCode||"—"))} &middot; ${st.label}`}</span>`;
-  const platforms=rail && info?.platforms?.length ? `<div class="station-details"><b>Platforms / stop codes</b>${info.platforms.map(p=>`<div>${escapeHtml(p.name.replace(m._stopName,"").trim()||"Station")} &middot; ${escapeHtml(p.code)}${p.description?`<br>${escapeHtml(p.description)}`:""}</div>`).join("")}</div>` : "";
+  const platforms=rail && info?.platforms?.length ? `<details class="station-details"><summary>Platforms / stop codes</summary>${info.platforms.map(p=>`<div>${escapeHtml(p.name.replace(m._stopName,"").trim()||"Station")} &middot; ${escapeHtml(p.code)}${p.description?`<br>${escapeHtml(p.description)}`:""}</div>`).join("")}</details>` : "";
   const position=rail ? `<div class="station-coordinates">${m.getLatLng().lat.toFixed(5)}, ${m.getLatLng().lng.toFixed(5)}</div>` : "";
-  const board=buildArrivalsBoard(m._stopKey);
-  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${platforms}${board|| (rail?'<div class="station-details">No live arrival predictions available.</div>':"")}${position}</div>`;
+  const board=rail?buildStationDepartureBoard(m):buildArrivalsBoard(m._stopKey);
+  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${platforms}${board}${position}</div>`;
 }
 
 function makeStopMarker(s){
@@ -914,7 +1066,23 @@ function makeStopMarker(s){
   // Function content => rebuilt on every open, so the arrivals board stays current.
   m.bindPopup(()=>buildStopPopup(m),{maxWidth:240,className:"vehicle-popup"});
   // Track the open station popup so the poll can refresh its arrivals board live.
-  m.on("popupopen",()=>{ _openStopMarker=m; });
+  m.on("popupopen",()=>{
+    _openStopMarker=m;
+    if(s[4]===1){
+      const mobile=window.innerWidth<=600;
+      if(mobile){
+        document.getElementById("controls")?.classList.add("collapsed");
+        document.getElementById("controls-toggle")?.setAttribute("aria-expanded","false");
+        updateControlsHeight();
+      }
+      const inset=mobile?(document.getElementById("controls")?.getBoundingClientRect().bottom||110)+80:20;
+      const popup=m.getPopup();
+      Object.assign(popup.options,{autoPanPaddingTopLeft:[10,inset],autoPanPaddingBottomRight:[10,20],
+        maxHeight:Math.max(140,window.innerHeight-inset-95)});
+      popup.update();
+    }
+    enrichOpenStation();
+  });
   m.on("popupclose",()=>{ if(_openStopMarker===m) _openStopMarker=null; });
   // Open on click/tap (bindPopup's default). Works on both desktop and touch and stays open
   // until dismissed, unlike the old hover behaviour which vanished as the cursor moved off.
@@ -924,6 +1092,14 @@ let _openStopMarker=null;
 function refreshOpenStopPopup(){
   const m=_openStopMarker;
   if(m && m.isPopupOpen && m.isPopupOpen()){ try{ m.setPopupContent(buildStopPopup(m)); }catch{} }
+}
+function enrichOpenStation(loadTimetable=true){
+  if(!_openStopMarker || navigator.onLine===false) return;
+  if(loadTimetable) loadStationDepartures(_openStopMarker).catch(()=>{});
+  const boardRows=stationDepartureRows(_openStopMarker);
+  const ids=(boardRows.length?boardRows.filter(row=>!row.destination || !row.routeId):arrivalsByStop.get(_openStopMarker._stopKey)||[]).filter(a=>a.etaSec>=Date.now()/1000-30)
+    .sort((a,b)=>a.etaSec-b.etaSec).slice(0,6).map(a=>a.tripId);
+  if(ids.length) fetchTripsBatch(ids).catch(()=>{});
 }
 
 function renderStopsForViewport(){
@@ -1061,33 +1237,28 @@ function dedupeStops(rows){
     seen.set(stationKey,tuple);
     res.push(tuple);
   }
+  stopAliases=TransitData.stopAliases(stopKeyById);
   return res;
 }
 
 function afterStopsLoaded(){
   stopsRailFerry=stopsData.filter(s=>s[4]!==0);
   stopsBus=stopsData.filter(s=>s[4]===0);
+  rebuildStationArrivals(); // resolves a feed received before the reference data finished loading
   if(stopsEnabled){ if(!map.hasLayer(stopsLayer)) map.addLayer(stopsLayer); renderStopsForViewport(); }
 }
 
 async function loadStops(){
   const rows=[];
   // New geometry first; the CSV still registers older platform IDs for cached GTFS trips.
-  try{
-    const res=await fetch("train_stations.geojson",{cache:"no-cache"});
-    if(res.ok) rows.push(...parseTrainStations(await res.json()));
-  }catch{}
-  for(const file of STOP_CSV_FILES){
-    try{
-      const res=await fetch(file,{cache:"no-cache"}); // revalidate so new commits show up
-      if(!res.ok) continue;
-      const parsed=parseStopsCsv(await res.text());
-      if(parsed.length){
-        const authoritative=new Set(rows.filter(s=>s.platforms).map(s=>s.name.toLowerCase()));
-        rows.push(...parsed.filter(s=>s.type!==1 || !authoritative.size ||
-          authoritative.has(s.name.replace(/\s+(platform\s*)?\d+$/i,"").trim().toLowerCase())));
-      }
-    }catch{}
+  const [stations,...csvs]=await Promise.all([fetchReferenceAsset("train_stations.geojson"),
+    ...STOP_CSV_FILES.map(file=>fetchReferenceAsset(file,"text"))]);
+  rows.push(...parseTrainStations(stations));
+  const authoritative=new Set(rows.map(s=>s.name.toLowerCase()));
+  for(const text of csvs){
+    if(!text) continue;
+    rows.push(...parseStopsCsv(text).filter(s=>s.type!==1 || !authoritative.size ||
+      authoritative.has(s.name.replace(/\s+(platform\s*)?\d+$/i,"").trim().toLowerCase())));
   }
   if(rows.length){
     stopsData=dedupeStops(rows);
@@ -1122,12 +1293,7 @@ function railLineColor(props){
 }
 
 async function loadRailLines(){
-  let gj=null;
-  try{
-    const res=await fetch(RAIL_LINES_FILE,{cache:"no-cache"}); // revalidate so new commits show up
-    if(!res.ok) return;
-    gj=await res.json();
-  }catch{ return; }
+  const gj=await fetchReferenceAsset(RAIL_LINES_FILE); if(!gj) return;
   if(railLinesLayer){ try{ map.removeLayer(railLinesLayer); }catch{} railLinesLayer=null; }
 
   // AT's export carries every pattern variant (dozens of overlapping Southern Line copies),
@@ -1239,12 +1405,7 @@ let frequentLinesLayer=null, frequentLinesEnabled=true;
 try{ map.createPane("frequentPane"); map.getPane("frequentPane").style.zIndex=242; }catch{}
 
 async function loadFrequentRoutes(){
-  let gj=null;
-  try{
-    const res=await fetch(FREQUENT_ROUTES_FILE,{cache:"no-cache"}); // revalidate so new commits show
-    if(!res.ok) return;
-    gj=await res.json();
-  }catch{ return; }
+  const gj=await fetchReferenceAsset(FREQUENT_ROUTES_FILE); if(!gj) return;
 
   indexBusRoutesGeoJSON(gj); // also make these three clickable from the same index
 
@@ -1259,7 +1420,7 @@ async function loadFrequentRoutes(){
       onEachFeature:(f,layer)=>{
         const p=f.properties||{};
         const nm=`${p.ROUTENUMBER||""}${p.ROUTENAME?` · ${p.ROUTENAME}`:""}`.trim();
-        if(nm) layer.bindTooltip(nm,{sticky:true});
+        if(nm) layer.bindTooltip(escapeHtml(nm),{sticky:true});
       },
     });
     if(frequentLinesEnabled) frequentLinesLayer.addTo(map);
@@ -1281,9 +1442,8 @@ function ensureBusRoutesLoaded(){
   if(_busRoutesPromise) return _busRoutesPromise;
   _busRoutesPromise=(async()=>{
     setDebug("Loading bus routes…");
-    const res=await fetch(BUS_ROUTES_FILE,{cache:"no-cache"});
-    if(!res.ok){ _busRoutesPromise=null; setDebug(`Bus routes file unavailable (${res.status})`); return; }
-    const gj=await res.json();
+    const gj=await fetchReferenceAsset(BUS_ROUTES_FILE);
+    if(!gj){ _busRoutesPromise=null; setDebug("Bus routes file unavailable — select again to retry"); return; }
     indexBusRoutesGeoJSON(gj);
     _busRoutesLoaded=true;
     setDebug(`Bus routes loaded (${busRouteIndex.size} routes indexed)`);
@@ -1659,6 +1819,15 @@ function addOrUpdateMarker(id,lat,lon,color,type,tripId,fields={}){
     vehicleMarkers[id]=marker;
   }
 }
+
+function removeVehicleMarker(id){
+  const marker=vehicleMarkers[id]; if(!marker) return;
+  // Removing only from the map leaves the marker in its mode group, so toggling that
+  // mode can resurrect departed vehicles and accumulate references indefinitely.
+  Object.values(vehicleLayers).forEach(layer=>layer.removeLayer(marker));
+  map.removeLayer(marker);
+  delete vehicleMarkers[id]; motionState.delete(id); activeTweens.delete(id);
+}
 function updateVehicleCount(){
   let busCount=0, trainCount=0, ferryCount=0;
   for(const id in vehicleMarkers){
@@ -1947,6 +2116,22 @@ function resolveQueryToMarkers(raw){
   return {type:"none"};
 }
 function isMobileScreen(){ return window.innerWidth <= 600; }
+function stationSearchKey(value){return String(value||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/[^a-z0-9]/g,"");}
+function findStations(query){
+  const key=stationSearchKey(query); if(!key) return [];
+  return stopsRailFerry.filter(s=>s[4]===1 && stationSearchKey(s[3]).includes(key)).slice(0,8);
+}
+function openStation(stop){
+  if(!stop) return;
+  if(pinnedPopup){pinnedPopup.closePopup();pinnedPopup=null;}
+  pinnedFollow=false;clearRouteOutline();clearRouteHighlights();
+  if(!stopsEnabled){
+    const cb=document.querySelector('#filters input[data-layer="overlays"]');if(cb) cb.checked=true;
+    setOverlaysEnabled(true);saveFilterPreferences();
+  }
+  map.setView([stop[0],stop[1]],Math.max(map.getZoom(),15),{animate:false});
+  renderStopsForViewport();stopMarkersByKey.get(stop[5])?.openPopup();
+}
 
 // Search control 
 const SearchControl=L.Control.extend({
@@ -1956,13 +2141,13 @@ const SearchControl=L.Control.extend({
     const div=L.DomUtil.create("div","leaflet-control search-control",wrapper);
 
     const btn=L.DomUtil.create("button","search-icon-btn",div);
-    btn.type="button"; btn.title="Search routes or vehicles";
-    btn.setAttribute("aria-label","Search routes or vehicles");
+    btn.type="button"; btn.title="Search routes, vehicles or stations";
+    btn.setAttribute("aria-label","Search routes, vehicles or stations");
     btn.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`;
 
     const input=L.DomUtil.create("input","search-input",div);
-    input.type="text"; input.placeholder="Route or vehicle · e.g. 70"; input.setAttribute("enterkeyhint","search");
-    input.setAttribute("aria-label","Search by route or vehicle number");
+    input.type="text"; input.placeholder="Route, vehicle or station"; input.setAttribute("enterkeyhint","search");
+    input.setAttribute("aria-label","Search routes, vehicles or stations");
     input.autocomplete="off";
 
     const cancel=L.DomUtil.create("button","search-cancel",div);
@@ -2043,7 +2228,9 @@ const SearchControl=L.Control.extend({
           if(res.exemplar){ if(blurTimer){ clearTimeout(blurTimer); blurTimer=null; } openAndPin(res.exemplar); }
           collapse({ preservePopup: true });
         }else{
-          clearRouteHighlights(); collapse({ preservePopup: !!pinnedPopup });
+          const station=findStations(input.value)[0];
+          if(station){if(blurTimer){clearTimeout(blurTimer);blurTimer=null;}openStation(station);collapse({preservePopup:true});}
+          else{clearRouteHighlights(); collapse({ preservePopup: !!pinnedPopup });}
         }
       }else if(e.key==="Escape"){
         e.preventDefault(); collapse({ preservePopup: !!pinnedPopup });
@@ -2086,16 +2273,22 @@ const SearchControl=L.Control.extend({
       const html=[];
       if(fleets.length){
         html.push(`<div class="suggestion-section">Fleets</div>`);
-        fleets.forEach(it=>html.push(`<div class="suggestion-item" data-kind="fleet" data-id="${it.label}"><span>${it.label}</span><span class="suggestion-meta">vehicle</span></div>`));
+        fleets.forEach(it=>html.push(`<button type="button" class="suggestion-item" data-kind="fleet" data-id="${escapeHtml(it.label)}"><span>${escapeHtml(it.label)}</span><span class="suggestion-meta">vehicle</span></button>`));
       }
       if(routesList.length){
         html.push(`<div class="suggestion-section">Routes</div>`);
-        routesList.forEach(it=>html.push(`<div class="suggestion-item" data-kind="route" data-id="${it.rk}"><span>${it.rk}</span><span class="suggestion-meta">${it.count} vehicle${it.count===1?"":"s"}</span></div>`));
+        routesList.forEach(it=>html.push(`<button type="button" class="suggestion-item" data-kind="route" data-id="${escapeHtml(it.rk)}"><span>${escapeHtml(it.rk)}</span><span class="suggestion-meta">${it.count} vehicle${it.count===1?"":"s"}</span></button>`));
       }
+      const stations=findStations(q);
+      if(stations.length){
+        html.push('<div class="suggestion-section">Train stations</div>');
+        stations.forEach(s=>html.push(`<button type="button" class="suggestion-item" data-kind="station" data-id="${escapeHtml(s[5])}"><span>${escapeHtml(s[3])}</span><span class="suggestion-meta">station</span></button>`));
+      }
+      if(!html.length) html.push('<div class="suggestion-section" role="status">No matching routes, vehicles or stations</div>');
       sugg.innerHTML=html.join("");
 
       sugg.querySelectorAll(".suggestion-item").forEach(el=>{
-        el.addEventListener("pointerup",(ev)=>{
+        el.addEventListener("click",(ev)=>{
           ev.preventDefault(); ev.stopPropagation();
           const kind=el.getAttribute("data-kind");
           const id=el.getAttribute("data-id");
@@ -2107,6 +2300,9 @@ const SearchControl=L.Control.extend({
             const set=routeIndex.get(id);
             if(set&&set.size){ const list=[...set]; highlightMarkers(list); if(blurTimer){ clearTimeout(blurTimer); blurTimer=null; } openAndPin(list[0]); collapse({ preservePopup: true }); }
             else{ collapse({ preservePopup: !!pinnedPopup }); }
+          }else if(kind==="station"){
+            if(blurTimer){clearTimeout(blurTimer);blurTimer=null;}
+            openStation(stopsRailFerry.find(s=>s[5]===id));collapse({preservePopup:true});
           }else{
             collapse({ preservePopup: !!pinnedPopup });
           }
@@ -2120,16 +2316,26 @@ const SearchControl=L.Control.extend({
 map.addControl(new SearchControl());
 
 let tripsInFlight=false;
+const tripRetryAt=new Map();
+const tripRequestQueue=new Set();
 async function fetchTripsBatch(tripIds){
-  if(tripsInFlight) return;
+  if(tripsInFlight){ tripIds.filter(id=>id && !tripCache[id]).forEach(id=>tripRequestQueue.add(id));return; }
   if(Date.now()<backoff.trips.until) return;
-  const idsToFetch=tripIds.filter(t=>t && !tripCache[t]); if(!idsToFetch.length) return;
+  const idsToFetch=tripIds.filter(t=>t && !tripCache[t] && (tripRetryAt.get(t)||0)<=Date.now()); if(!idsToFetch.length) return;
   tripsInFlight=true;
   try{
   for(const ids of chunk([...new Set(idsToFetch)],100)){
     if(Date.now()<backoff.trips.until) break;
-    const tripJson=await safeFetch(`${tripsUrl}?ids=${ids.join(",")}`);
-    if(!tripJson || tripJson._rateLimited){ if(tripJson&&tripJson._rateLimited) applyRateLimitBackoff(tripJson.retryAfterMs,"trips"); continue; }
+    const tripJson=await safeFetch(`${tripsUrl}?ids=${ids.map(encodeURIComponent).join(",")}`);
+    if(!tripJson || tripJson._rateLimited){
+      if(tripJson?._rateLimited) applyRateLimitBackoff(tripJson.retryAfterMs,"trips");
+      ids.forEach(id=>tripRetryAt.set(id,Date.now()+30000));
+      break; // don't hammer the rest of the batch after a network/upstream failure
+    }
+    if(tripJson.retryAfter) applyRateLimitBackoff(parseRetryAfterMs(tripJson.retryAfter),"trips");
+    for(const id of ids){
+      if(tripJson.errors?.[id]) tripRetryAt.set(id,Date.now()+(/not found/i.test(tripJson.errors[id])?300000:30000));
+    }
     if(tripJson?.data?.length>0){
       const freshTrips=[];
       tripJson.data.forEach(t=>{
@@ -2137,6 +2343,7 @@ async function fetchTripsBatch(tripIds){
         if(a){
           const obj={trip_id:a.trip_id,trip_headsign:a.trip_headsign||"N/A",route_id:a.route_id,bikes_allowed:a.bikes_allowed,shape_id:a.shape_id};
           tripCache[a.trip_id]=obj;
+          tripRetryAt.delete(a.trip_id);
           freshTrips.push(obj);
         }
       });
@@ -2150,11 +2357,19 @@ async function fetchTripsBatch(tripIds){
         const r=routes[trip.route_id]||{};
         const routeName=r.route_short_name||r.route_long_name||"Unknown";
         const destination=trip.trip_headsign||r.route_long_name||"Unknown";
-        ms.forEach(m=>{ m.routeName=routeName; m.destination=destination; m.badgeText=badgeForRoute(m.currentType,routeName); m.redraw(); refreshOpenPopup(m); });
+        ms.forEach(m=>{ m.routeName=routeName; m.destination=destination; m.badgeText=badgeForRoute(m.currentType,routeName);
+          const bikes=TransitData.bikesAllowed(trip.bikes_allowed);m.bikesLine=bikes?`<br><b>Bikes allowed:</b> ${bikes}`:"";
+          m.redraw(); refreshOpenPopup(m); });
       });
+      rebuildStationArrivals(); // destinations can become available after the first feed
     }
   }
-  }finally{ tripsInFlight=false; }
+  }finally{
+    tripsInFlight=false;while(tripRetryAt.size>1000) tripRetryAt.delete(tripRetryAt.keys().next().value);
+    if(tripRequestQueue.size){
+      const pending=[...tripRequestQueue];tripRequestQueue.clear();fetchTripsBatch(pending).catch(()=>{});
+    }
+  }
 }
 
 function pairAMTrains(inSvc,outOfService){
@@ -2207,9 +2422,10 @@ async function fetchVehicles(){
     const startupFeed=initialFeedPromise;
     initialFeedPromise=null;
     const json=await (startupFeed || safeFetch(realtimeUrl,{signal:vehiclesAbort.signal}));
-    if(!json){ statusFailed=true; return; }
+    if(!json){ statusFailed=true; arrivalsFeedState="error"; refreshOpenStopPopup(); return; }
     if(json._rateLimited){
       applyRateLimitBackoff(json.retryAfterMs,"realtime");
+      arrivalsFeedState="limited"; refreshOpenStopPopup();
       return;
     }
 
@@ -2217,32 +2433,44 @@ async function fetchVehicles(){
     if(backoff.realtime.ms < 4000) backoff.realtime.ms = 0;
     backoff.realtime.until = 0;
 
-    const vehicles=json?.response?.entity||json?.entity;
-    if(!Array.isArray(vehicles)){ statusFailed=true; setDebug("Realtime response is missing vehicle data"); return; }
+    const rawEntities=json?.response?.entity??json?.entity;
+    if(rawEntities==null || typeof rawEntities!=="object"){ statusFailed=true; setDebug("Realtime response is missing vehicle data"); return; }
+    const vehicles=TransitData.entities(json);
+    if(!Object.keys(routes).length || routesRetryAt || backoff.routes.until) refreshRoutes().catch(()=>{});
     statusFailed=false; statusCached=false;
     const newIds=new Set(), inServiceAM=[], outOfServiceAM=[], allTripIds=[], cachedState=[];
-    vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear(); markersByTrip.clear(); arrivalsByStop.clear();
+    vehicleIndexByFleet.clear(); routeIndex.clear(); oosIndexByFleet.clear(); markersByTrip.clear();
+    latestStopSequences=new Map();
+    for(const e of vehicles){
+      const trip=e.vehicle?.trip?.trip_id??e.vehicle?.trip?.tripId;
+      if(trip) latestStopSequences.set(trip,toNum(e.vehicle.current_stop_sequence??e.vehicle.currentStopSequence));
+    }
 
     // Schedule adherence: prefer trip_update entities already in the combined feed (free).
     // If the feed carries vehicles but no trip updates, fall back to the dedicated feed.
     let delayMap=buildDelayMap(vehicles);
-    const hasVehicles=vehicles.some(e=>e.vehicle);
-    if(delayMap.size===0 && hasVehicles) useSeparateTripUpdates=true;
-    if(useSeparateTripUpdates){
-      const sep=await fetchTripUpdatesDelays();
-      if(sep && sep.size) delayMap=sep;
+    if(vehicles.some(e=>e.trip_update||e.tripUpdate)){
+      captureScheduleUpdates(vehicles);
+      latestTripUpdates=delayMap; arrivalsFeedState="ready";
+      arrivalsLastUpdated=(toNum(json?.response?.header?.timestamp??json?.header?.timestamp)||Date.now()/1000)*1000;
+    }else{
+      delayMap=latestTripUpdates;
+      refreshSeparateTripUpdates(); // never hold up vehicle positions for the secondary API
     }
+    rebuildStationArrivals();
 
     const punctSamples=[]; // {mode,route,delay} for the on-time dashboard
     vehicles.forEach(v=>{
-      const vehicleId=v.vehicle?.vehicle?.id; if(!v.vehicle||!v.vehicle.position||!vehicleId) return; newIds.add(vehicleId);
-      const lat=v.vehicle.position.latitude, lon=v.vehicle.position.longitude;
+      const vehicleId=v.vehicle?.vehicle?.id;
+      if(v.is_deleted || v.isDeleted || !vehicleId || !TransitData.validPosition(v.vehicle?.position)) return;
+      newIds.add(vehicleId);
+      const lat=Number(v.vehicle.position.latitude), lon=Number(v.vehicle.position.longitude);
       const vehicleLabel=v.vehicle.vehicle?.label||"N/A", licensePlate=v.vehicle.vehicle?.license_plate||"N/A";
       const operator=v.vehicle.vehicle?.operator_id||(vehicleLabel.match(/^[A-Za-z]+/)?.[0]??"");
       const vehicleNumber=(()=>{const d=Number(vehicleLabel.replace(/\D/g,"")); return !isNaN(d)&&d>0?d:(Number(vehicleLabel)||Number(vehicleLabel.slice(2))||0);})();
 
-      const routeId=v.vehicle?.trip?.route_id, tripId=v.vehicle?.trip?.trip_id;
-      const rType=routes[routeId]?.route_type;
+      const routeId=v.vehicle?.trip?.route_id??v.vehicle?.trip?.routeId, tripId=v.vehicle?.trip?.trip_id??v.vehicle?.trip?.tripId;
+      const rType=Number(routes[routeId]?.route_type);
       const isTrain=rType===2, isFerry=rType===4, isAM=vehicleLabel.startsWith("AM");
 
       // ---- Speed: derive from fix-to-fix motion (robust), feed value as fallback ----
@@ -2287,9 +2515,9 @@ async function fetchVehicles(){
       let typeKey="out", color=vehicleColors.out, routeName="Out of service", destination="Unknown";
       if(routeId && tripId && routes[routeId]){
         const r=routes[routeId]; routeName=r.route_short_name||r.route_long_name||"Unknown";
-        switch(r.route_type){case 2:typeKey="train";color=trainColorForRoute(r.route_short_name);break; case 3:typeKey="bus";color=vehicleColors.bus;break; case 4:typeKey="ferry";color=vehicleColors.ferry;break;}
+        switch(Number(r.route_type)){case 2:typeKey="train";color=trainColorForRoute(r.route_short_name);break; case 3:typeKey="bus";color=vehicleColors.bus;break; case 4:typeKey="ferry";color=vehicleColors.ferry;break;}
       }
-      if(routes[routeId]?.route_type===3){typeKey="bus"; color=vehicleColors.bus;}
+      if(Number(routes[routeId]?.route_type)===3){typeKey="bus"; color=vehicleColors.bus;}
       if(tripId) allTripIds.push(tripId);
 
       if(tripId && tripCache[tripId]?.trip_headsign) destination=tripCache[tripId].trip_headsign;
@@ -2297,13 +2525,8 @@ async function fetchVehicles(){
 
       let bikesLine="";
       const t=tripId?tripCache[tripId]:null;
-      if(t?.bikes_allowed!==undefined){
-        if(typeKey==="bus" && t.bikes_allowed===2) bikesLine=`<br><b>Bikes allowed:</b> Yes`;
-        if(typeKey==="train"){
-          if(t.bikes_allowed===2) bikesLine=`<br><b>Bikes allowed:</b> Yes`;
-          else if(t.bikes_allowed===1) bikesLine=`<br><b>Bikes allowed:</b> Some`;
-        }
-      }
+      const bikes=TransitData.bikesAllowed(t?.bikes_allowed);
+      if(bikes) bikesLine=`<br><b>Bikes allowed:</b> ${bikes}`;
 
       // ---- Optional GTFS-RT extras (rendered only when present) ----
       const pos=v.vehicle.position||{};
@@ -2375,20 +2598,6 @@ async function fetchVehicles(){
 
       const badgeText=badgeForRoute(typeKey,routeName);
 
-      // Register this service against every stop it will reach in the next hour, so a
-      // station/stop popup can show the genuinely soonest services arriving (not only the
-      // ones for which it is the immediate next stop). Keyed by collapsed station.
-      if(typeKey!=="out" && tu){
-        const nowSec=Date.now()/1000;
-        for(const u of upcomingStus(tu, stopSeq, 12)){
-          if(u.stopId==null) continue;
-          if(u.timeSec!=null && (u.timeSec-nowSec)>3600) continue; // only the next hour
-          const key = stopKeyById.get(String(u.stopId)) || String(u.stopId);
-          let arr=arrivalsByStop.get(key); if(!arr){ arr=[]; arrivalsByStop.set(key,arr); }
-          arr.push({ badge: badgeText || routeName, color, dest: destination, etaSec: u.timeSec, delaySec: u.delay });
-        }
-      }
-
       addOrUpdateMarker(vehicleId,lat,lon,color,typeKey,tripId,{
         currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText,bearingDeg:(ex.bearingDeg??null),_occColor:occColor
       });
@@ -2417,7 +2626,7 @@ async function fetchVehicles(){
     Object.keys(vehicleMarkers).forEach(id=>{
       if(!newIds.has(id)){
         if(pinnedPopup===vehicleMarkers[id]){ pinnedPopup=null; pinnedFollow=false; clearRouteOutline(); }
-        map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; motionState.delete(id); activeTweens.delete(id);
+        removeVehicleMarker(id);
       }
     });
 
@@ -2512,6 +2721,27 @@ window.addEventListener("focus",()=>{ resumeUpdatesNow(); });
 window.addEventListener("blur",()=>{ pauseUpdatesNow(); });
 
 
+let routesInFlight=null,routesRetryAt=0;
+function refreshRoutes(){
+  if(routesInFlight) return routesInFlight;
+  if(navigator.onLine===false || Date.now()<Math.max(routesRetryAt,backoff.routes.until)) return Promise.resolve();
+  routesInFlight=(async()=>{
+    const rj=await safeFetch(routesUrl);
+    if(rj?._rateLimited){applyRateLimitBackoff(rj.retryAfterMs,"routes");return;}
+    if(!Array.isArray(rj?.data)){routesRetryAt=Date.now()+30000;return;}
+    const fresh={};
+    for(const r of rj.data){
+      const a=r.attributes||r,id=r.id??a.route_id; if(!id) continue;
+      fresh[id]={route_type:Number(a.route_type),route_short_name:a.route_short_name,route_long_name:a.route_long_name,
+        route_color:a.route_color,agency_id:a.agency_id};
+    }
+    if(!Object.keys(fresh).length){routesRetryAt=Date.now()+30000;return;}
+    routes=fresh;routesRetryAt=0;backoff.routes.ms=0;backoff.routes.until=0;
+    idbPutMany([["routes",{t:Date.now(),data:routes}]]);
+    rebuildStationArrivals();
+  })().finally(()=>{routesInFlight=null;});
+  return routesInFlight;
+}
 async function loadReferenceData(){
   const busTypesPromise=safeFetch(busTypesUrl);
   // Load persisted trips/shapes (and prune expired) before anything fetches, so the first
@@ -2522,14 +2752,12 @@ async function loadReferenceData(){
   let routesReady=false;
   try{
     const rc=await idbGet("routes");
-    if(rc && rc.data && (Date.now()-(rc.t||0))<TTL_ROUTES){ routes=rc.data; routesReady=true; }
+    if(rc && rc.data && typeof rc.data==="object"){
+      routes=rc.data; routesReady=Object.keys(routes).length>0 && (Date.now()-(rc.t||0))<TTL_ROUTES;
+    }
   }catch{}
   if(!routesReady){
-    const rj=await safeFetch(routesUrl); if(rj&&rj._rateLimited) applyRateLimitBackoff(rj.retryAfterMs,"routes");
-    if(rj?.data){
-      rj.data.forEach(r=>{const a=r.attributes||r; routes[r.id]={route_type:a.route_type,route_short_name:a.route_short_name,route_long_name:a.route_long_name,route_color:a.route_color,agency_id:a.agency_id};});
-      idbPutMany([["routes",{t:Date.now(),data:routes}]]);
-    }
+    await refreshRoutes();
   }
 
   const bj=await busTypesPromise;
@@ -2560,9 +2788,10 @@ async function init(){
     if(cached){ const snap=JSON.parse(cached); if(Array.isArray(snap) && snap.length) renderFromCache(snap); }
   }catch{}
   document.getElementById("refresh-vehicles")?.addEventListener("click",()=>fetchVehicles());
-  window.addEventListener("offline",updateLiveStatus);
+  window.addEventListener("offline",()=>{updateLiveStatus();refreshOpenStopPopup();});
   window.addEventListener("online",()=>{ updateLiveStatus(); if(appReady) fetchVehicles(); });
   setInterval(()=>{ if(isPageVisible()) updateLiveStatus(); },1000);
+  setInterval(()=>{ if(isPageVisible() && _openStopMarker){refreshOpenStopPopup();enrichOpenStation();} },15000);
 
   document.querySelectorAll('#filters input[type="checkbox"]').forEach(cb=>{
     cb.addEventListener("change",e=>{
