@@ -917,7 +917,7 @@ function getTransitDiagnostics(){
     retrySeconds:Object.fromEntries(Object.entries(backoff).map(([key,value])=>[key,Math.max(0,Math.ceil((value.until-Date.now())/1000))]))};
 }
 function loadStationDepartures(marker){
-  if(marker?._stopType!==1 || navigator.onLine===false || !isPageVisible()) return Promise.resolve();
+  if(![1,3].includes(marker?._stopType) || navigator.onLine===false || !isPageVisible()) return Promise.resolve();
   const key=marker._stopKey,previous=departuresByStation.get(key),now=Date.now();
   if(departuresPending.has(key)) return departuresPending.get(key);
   if(now<backoff.departures.until || now<(previous?.retryAt||0) || previous?.status==="ready" && now-previous.fetchedAt<60000) return Promise.resolve();
@@ -929,14 +929,27 @@ function loadStationDepartures(marker){
   departuresByStation.set(key,{...previous,status:"loading"});
   refreshOpenStopPopup();
   const work=(async()=>{
-    const result=await safeFetch(`${departuresUrl}?ids=${ids.slice(0,8).map(encodeURIComponent).join(",")}`);
+    // The proxy accepts eight stops per request. Fetch all bays sequentially to respect rate limits.
+    const batches=[];
+    for(let i=0;i<ids.length;i+=8){
+      const batch=await safeFetch(`${departuresUrl}?ids=${ids.slice(i,i+8).map(encodeURIComponent).join(",")}`);
+      batches.push(batch);
+      if(batch?._rateLimited || batch?.retryAfter) break;
+    }
+    const successful=batches.filter(batch=>Array.isArray(batch?.data));
+    const limited=batches.find(batch=>batch?._rateLimited || batch?.retryAfter);
+    const result=successful.length?{data:successful.flatMap(batch=>batch.data),
+      complete:batches.length===Math.ceil(ids.length/8) && batches.every(batch=>batch?.complete===true),
+      invalidTimeCount:successful.reduce((n,batch)=>n+(batch.invalidTimeCount||0),0),
+      errors:successful.flatMap(batch=>batch.errors||[]),retryAfter:limited?.retryAfter} : limited || null;
+    if(limited?._rateLimited) applyRateLimitBackoff(limited.retryAfterMs,"departures");
     if(!result || result._rateLimited){
       if(result?._rateLimited) applyRateLimitBackoff(result.retryAfterMs,"departures");
       departuresByStation.set(key,{...previous,status:result?"limited":"error",retryAt:Date.now()+60000});
     }else if(Array.isArray(result.data)){
       if(result.retryAfter) applyRateLimitBackoff(parseRetryAfterMs(result.retryAfter),"departures");
       departuresByStation.set(key,{status:"ready",data:result.data,fetchedAt:Date.now(),
-        complete:result.complete===true && ids.length<=8,invalidTimeCount:result.invalidTimeCount||0,
+        complete:result.complete===true,invalidTimeCount:result.invalidTimeCount||0,
         errors:result.errors||[],retryAt:result.complete?0:Date.now()+60000});
     }else departuresByStation.set(key,{...previous,status:"error",retryAt:Date.now()+60000});
     while(departuresByStation.size>100) departuresByStation.delete(departuresByStation.keys().next().value);
@@ -966,15 +979,17 @@ function buildStationDepartureBoard(marker){
   const clock=new Intl.DateTimeFormat("en-NZ",{timeZone:"Pacific/Auckland",hour:"2-digit",minute:"2-digit",hourCycle:"h23"});
   const items=rows.map(row=>{
     const trip=tripCache[row.tripId],route=routes[row.routeId||trip?.route_id]||{};
-    const name=route.route_short_name||route.route_long_name||"Train",badge=badgeForRoute("train",name),color=trainColorForRoute(name);
+    const mode=marker._stopType===3?"bus":"train";
+    const name=route.route_short_name||route.route_long_name||(mode==="bus"?row.routeId||"Bus":"Train"),
+      badge=badgeForRoute(mode,name),color=mode==="train"?trainColorForRoute(name):vehicleColors.bus;
     const dest=row.destination||trip?.trip_headsign||route.route_long_name||"Destination unavailable";
     const platform=marker._stopInfo?.platforms?.find(p=>ScheduleData.sameStop(p.id,row.stopId));
-    const platformName=platform?.name?.replace(marker._stopName,"").trim()||"";
+    const platformName=platform?.label || (platform?.name?.replace(marker._stopName,"").trim()?`Platform ${platform.name.replace(marker._stopName,"").trim()}`:"");
     const label={scheduled:"Scheduled",live:"Live",estimated:"Estimated",canceled:"Cancelled"}[row.status];
     const eta=row.status==="canceled"?"Cancelled":formatEta(row.etaSec).replace("in ","");
     return `<div class="departure-row${row.status==="canceled"?" departure-canceled":""}">
       <span class="departure-badge" style="background:${color};color:${badgeTextColor(color)}">${escapeHtml(badge)}</span>
-      <span class="departure-destination">${escapeHtml(dest)}<small>${label}${platformName?` · Platform ${escapeHtml(platformName)}`:""}${Number(row.pickupType)>1?" · Boarding by arrangement":""}</small></span>
+      <span class="departure-destination">${escapeHtml(dest)}<small>${label}${platformName?` · ${escapeHtml(platformName)}`:""}${Number(row.pickupType)>1?" · Boarding by arrangement":""}</small></span>
       <span class="departure-time">${clock.format(new Date(row.etaSec*1000))}<small>${escapeHtml(eta)}</small></span></div>`;
   }).join("");
   // Keep a useful live report while a new timetable request is loading or unavailable.
@@ -993,7 +1008,10 @@ const stopMarkersByKey=new Map();
 const stationIcon=L.divIcon({className:"rail-station-icon",iconSize:[26,26],iconAnchor:[13,13],popupAnchor:[0,-14],
   html:'<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="3" width="12" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M7 10h10M9 18l-3 4m9-4 3 4M9 6h6" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="14" r="1.3" fill="currentColor"/><circle cx="15" cy="14" r="1.3" fill="currentColor"/></svg>'});
 
+const busStationIcon=L.divIcon({className:"rail-station-icon bus-station-icon",iconSize:[28,28],iconAnchor:[14,14],popupAnchor:[0,-15],
+  html:'<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="14" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 11h14M9 6h6M7 19v3m10-3v3" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8" cy="15" r="1.3" fill="currentColor"/><circle cx="16" cy="15" r="1.3" fill="currentColor"/></svg>'});
 const STOP_STYLE={
+  3:{radius:5,color:vehicleColors.bus,fill:"#fff",weight:2,label:"Bus station / interchange"},
   1:{radius:5,color:trainLineColors.STH,fill:"#fff",weight:2,label:"Rail station"},
   2:{radius:5,color:vehicleColors.ferry,fill:"#fff",weight:2,label:"Ferry terminal"},
   0:{radius:3,color:"#666",fill:"#fff",weight:1,label:"Bus stop"},
@@ -1048,9 +1066,9 @@ function buildArrivalsBoard(key){
 }
 function buildStopPopup(m){
   const st=STOP_STYLE[m._stopType]||STOP_STYLE[0];
-  const rail=m._stopType===1, info=m._stopInfo;
+  const rail=[1,3].includes(m._stopType), info=m._stopInfo;
   const head=`<b>${escapeHtml(m._stopName)}</b><br><span style="color:var(--text-subtle);font-size:0.92em;">${rail ? st.label : `Stop ${escapeHtml(String(m._stopCode||"—"))} &middot; ${st.label}`}</span>`;
-  const platforms=rail && info?.platforms?.length ? `<details class="station-details"><summary>Platforms / stop codes</summary>${info.platforms.map(p=>`<div>${escapeHtml(p.name.replace(m._stopName,"").trim()||"Station")} &middot; ${escapeHtml(p.code)}${p.description?`<br>${escapeHtml(p.description)}`:""}</div>`).join("")}</details>` : "";
+  const platforms=rail && info?.platforms?.length ? `<details class="station-details"><summary>${m._stopType===3?"Bays":"Platforms"} / stop codes</summary>${info.platforms.map(p=>`<div>${escapeHtml(p.label||p.name.replace(m._stopName,"").trim()||"Station")} &middot; ${escapeHtml(p.code)}${p.description?`<br>${escapeHtml(p.description)}`:""}</div>`).join("")}</details>` : "";
   const position=rail ? `<div class="station-coordinates">${m.getLatLng().lat.toFixed(5)}, ${m.getLatLng().lng.toFixed(5)}</div>` : "";
   const board=rail?buildStationDepartureBoard(m):buildArrivalsBoard(m._stopKey);
   return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${platforms}${board}${position}</div>`;
@@ -1058,17 +1076,17 @@ function buildStopPopup(m){
 
 function makeStopMarker(s){
   const st=STOP_STYLE[s[4]]||STOP_STYLE[0];
-  const m=s[4]===1 ? L.marker([s[0],s[1]],{icon:stationIcon,pane:"stationPane",title:s[3],alt:s[3],keyboard:true,bubblingMouseEvents:false})
+  const m=[1,3].includes(s[4]) ? L.marker([s[0],s[1]],{icon:s[4]===3?busStationIcon:stationIcon,pane:"stationPane",title:s[3],alt:s[3],keyboard:true,bubblingMouseEvents:false})
     : L.circleMarker([s[0],s[1]],{renderer:stopsRenderer,radius:st.radius,color:st.color,weight:st.weight,fillColor:st.fill,fillOpacity:0.95,opacity:1,interactive:true,bubblingMouseEvents:false});
   m._stopName=s[3]; m._stopCode=s[2]; m._stopType=s[4]; m._stopKey=s[5];
   m._stopInfo=s[6];
-  if(s[4]===1) m.bindTooltip(escapeHtml(s[3]),{direction:"top",offset:[0,-12]});
+  if([1,3].includes(s[4])) m.bindTooltip(escapeHtml(s[3]),{direction:"top",offset:[0,-12]});
   // Function content => rebuilt on every open, so the arrivals board stays current.
   m.bindPopup(()=>buildStopPopup(m),{maxWidth:240,className:"vehicle-popup"});
   // Track the open station popup so the poll can refresh its arrivals board live.
   m.on("popupopen",()=>{
     _openStopMarker=m;
-    if(s[4]===1){
+    if([1,3].includes(s[4])){
       const mobile=window.innerWidth<=600;
       if(mobile){
         document.getElementById("controls")?.classList.add("collapsed");
@@ -1079,6 +1097,11 @@ function makeStopMarker(s){
       const popup=m.getPopup();
       Object.assign(popup.options,{autoPanPaddingTopLeft:[10,inset],autoPanPaddingBottomRight:[10,20],
         maxHeight:Math.max(140,window.innerHeight-inset-95)});
+      const element=popup.getElement();
+      if(element && popup._detailsElement!==element){
+        element.addEventListener("toggle",()=>popup.update(),true);
+        popup._detailsElement=element;
+      }
       popup.update();
     }
     enrichOpenStation();
@@ -1123,6 +1146,31 @@ function renderStopsForViewport(){
   if(showBus){ let n=0; for(const s of stopsBus){ if(!inView(s)) continue; add(s); if(++n>=STOP_RENDER_CAP) break; } }
   for(const [key,marker] of stopMarkersByKey){
     if(!visible.has(key)){ stopsLayer.removeLayer(marker); stopMarkersByKey.delete(key); }
+  }
+  // Nearby rail and bus hubs can occupy the same screen pixels at regional zoom.
+  // Shift only their icons; geographic coordinates and arrival matching stay exact.
+  const occupied=[];
+  for(const marker of stopMarkersByKey.values()){
+    if(![1,3].includes(marker._stopType)) continue;
+    const point=map.latLngToContainerPoint(marker.getLatLng());
+    let dx=0,dy=0,found=false;
+    for(let ring=0;ring<=8 && !found;ring++){
+      for(let x=-ring;x<=ring && !found;x++) for(let y=-ring;y<=ring && !found;y++){
+        if(ring && Math.max(Math.abs(x),Math.abs(y))!==ring) continue;
+        const px=point.x+x*34,py=point.y+y*34;
+        if(occupied.every(p=>Math.abs(px-p.x)>=32 || Math.abs(py-p.y)>=32)){
+          dx=x*34;dy=y*34;occupied.push({x:px,y:py});found=true;
+        }
+      }
+    }
+    const offset=`${dx}|${dy}`;
+    if(marker._stationOffset===offset) continue;
+    const icon=marker._stopType===3?busStationIcon:stationIcon;
+    marker.setIcon(L.divIcon({...icon.options,iconAnchor:[icon.options.iconAnchor[0]-dx,icon.options.iconAnchor[1]-dy],
+      popupAnchor:[dx,dy+icon.options.popupAnchor[1]]}));
+    marker.getTooltip()?.setLatLng(marker.getLatLng());
+    if(marker.getTooltip()) marker.getTooltip().options.offset=L.point(dx,dy-12);
+    marker._stationOffset=offset;
   }
 }
 
@@ -1179,6 +1227,7 @@ function parseStopsCsv(text){
     mode:   _pickCol(idx,["mode"]),
     parent: _pickCol(idx,["parentstation","parent"]),
     id:     _pickCol(idx,["stopid","stop_id","id","platformid","platform_id"]),
+    description: _pickCol(idx,["stopdescription","stopdesc","description"]),
   };
   if(ci.lat<0||ci.lon<0||ci.name<0) return out;
   for(let i=1;i<rows.length;i++){
@@ -1194,6 +1243,7 @@ function parseStopsCsv(text){
       code:   ci.code>=0?(f[ci.code]||"").trim():"",
       parent: ci.parent>=0?(f[ci.parent]||"").trim():"",
       id:     ci.id>=0?(f[ci.id]||"").trim():"",
+      description: ci.description>=0?(f[ci.description]||"").trim():"",
       type,
     });
   }
@@ -1206,11 +1256,12 @@ function parseStopsCsv(text){
 // station's clean name and key, so a trip update referencing any platform id still resolves
 // to the right station for naming and the arrivals board. Tuple gains a 6th field: the key.
 function dedupeStops(rows){
+  rows=TransitData.groupBusStations(rows);
   stopById.clear(); stopKeyById.clear(); stopNameByKey.clear();
   const seen=new Map(), res=[];
   const parentByName=new Map();
   for(const s of rows){
-    if(s.type!==0 && s.parent){
+    if((s.type===1 || s.type===2) && s.parent){
       const name=s.name.replace(/\s+(platform\s*)?\d+$/i,"").trim().toLowerCase();
       const key=`${s.type}|${name}`;
       if(!parentByName.has(key)) parentByName.set(key,s.parent);
@@ -1232,7 +1283,7 @@ function dedupeStops(rows){
     if(seen.has(stationKey)) continue;
     const platforms=s.platforms?.length ? s.platforms : rows.filter(r=>r.type===s.type &&
       (r.parent ? r.parent===s.parent : r.name.replace(/\s+(platform\s*)?\d+$/i,"").trim()===clean))
-      .map(r=>({id:r.id,code:r.code,name:r.name}));
+      .map(r=>({id:r.id,code:r.code,name:r.name,description:r.description||""}));
     const tuple=[s.lat,s.lon,s.code,clean,s.type,stationKey,{platforms}];
     seen.set(stationKey,tuple);
     res.push(tuple);
@@ -2119,7 +2170,7 @@ function isMobileScreen(){ return window.innerWidth <= 600; }
 function stationSearchKey(value){return String(value||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/[^a-z0-9]/g,"");}
 function findStations(query){
   const key=stationSearchKey(query); if(!key) return [];
-  return stopsRailFerry.filter(s=>s[4]===1 && stationSearchKey(s[3]).includes(key)).slice(0,8);
+  return stopsRailFerry.filter(s=>[1,3].includes(s[4]) && stationSearchKey(s[3]).includes(key)).slice(0,8);
 }
 function openStation(stop){
   if(!stop) return;
@@ -2281,7 +2332,7 @@ const SearchControl=L.Control.extend({
       }
       const stations=findStations(q);
       if(stations.length){
-        html.push('<div class="suggestion-section">Train stations</div>');
+        html.push('<div class="suggestion-section">Stations / interchanges</div>');
         stations.forEach(s=>html.push(`<button type="button" class="suggestion-item" data-kind="station" data-id="${escapeHtml(s[5])}"><span>${escapeHtml(s[3])}</span><span class="suggestion-meta">station</span></button>`));
       }
       if(!html.length) html.push('<div class="suggestion-section" role="status">No matching routes, vehicles or stations</div>');

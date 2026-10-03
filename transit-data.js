@@ -63,7 +63,35 @@
     }
     return {byStop,stats};
   }
-  const api={list,number,entities,canceled,stopUpdates,stopCode,stopAliases,resolveStop,validPosition,bikesAllowed,buildArrivals};
+  function groupBusStations(rows){
+    const groups=new Map(),selected=new Set(),stations=[];
+    const hubs=new Set(['lower albert','onehunga','new lynn','akoranga','constellation','hibiscus coast','sunnynook','smales farm','westgate','puhinui','takapuna','ormiston town centre']);
+    const base=name=>name.replace(/^(?:Stop\s+[A-Z]|Bay\s+\d+)\s+/i,'').trim();
+    for(const row of rows) if(row.type===0 && row.parent){
+      if(!groups.has(row.parent)) groups.set(row.parent,[]);
+      groups.get(row.parent).push(row);
+    }
+    for(const [parent,bays] of groups){
+      if(bays.length<2) continue;
+      const names=bays.map(row=>base(row.name));
+      // Explicit station/interchange names or established bus hubs, never arbitrary road groups.
+      if(!names.some(name=>/\b(?:bus station|bus interchange|transport centre|station|interchange)\b/i.test(name)||hubs.has(name.toLowerCase()))) continue;
+      const name=names.find(name=>/\bstation\b/i.test(name))||names[0];
+      const platforms=bays.map(row=>({id:row.id,code:row.code,name:row.name,description:row.description||'',
+        label:row.name.match(/^(Stop\s+[A-Z]|Bay\s+\d+)\b/i)?.[1]||row.name}));
+      stations.push({type:3,parent,name:/\b(?:bus|interchange|transport centre)\b/i.test(name)?name:`${name} Bus Interchange`,
+        lat:bays.reduce((n,row)=>n+row.lat,0)/bays.length,lon:bays.reduce((n,row)=>n+row.lon,0)/bays.length,
+        code:'',id:'',platforms});
+      bays.forEach(row=>selected.add(row));
+    }
+    const counts=new Map();
+    for(const station of stations) counts.set(station.name,(counts.get(station.name)||0)+1);
+    for(const station of stations) if(counts.get(station.name)>1){
+      station.name+=` (${station.platforms.map(p=>p.label).join(', ')})`;
+    }
+    return [...rows.filter(row=>!selected.has(row)),...stations];
+  }
+  const api={list,number,entities,canceled,stopUpdates,stopCode,stopAliases,resolveStop,validPosition,bikesAllowed,buildArrivals,groupBusStations};
   if(typeof module==='object' && module.exports) module.exports=api;
   else root.TransitData=api;
 })(typeof globalThis==='object'?globalThis:window);
