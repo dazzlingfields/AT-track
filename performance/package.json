@@ -1,0 +1,8 @@
+{
+  "name": "at-route-performance",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone Auckland Transport punctuality collector and dashboard",
+  "engines": { "node": ">=24" },
+  "scripts": { "prestart": "node ../scripts/build-next.cjs", "start": "node --env-file-if-exists=.env server.cjs", "build:next": "node ../scripts/build-next.cjs", "test": "node --test ../tests/performance.test.cjs", "pretest:next": "node ../scripts/build-next.cjs", "test:next": "node ../tests/workspace-browser.cjs" }
+}

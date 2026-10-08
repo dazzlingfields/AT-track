@@ -1,0 +1,15 @@
+{
+  "name": "at-route-performance-cloud",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "precheck": "node ../../scripts/build-next.cjs",
+    "predeploy": "node ../../scripts/build-next.cjs",
+    "predev": "node ../../scripts/build-next.cjs",
+    "dev": "wrangler dev --test-scheduled",
+    "check": "wrangler deploy --dry-run --outdir .wrangler/dry-run",
+    "deploy": "wrangler deploy",
+    "migrate": "wrangler d1 migrations apply at-route-performance --remote"
+  },
+  "devDependencies": { "wrangler": "4.147.0" }
+}

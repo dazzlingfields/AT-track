@@ -1,0 +1,42 @@
+name = "at-route-performance"
+account_id = "7551249d45ba821b306fba5eeaea0f08"
+main = "worker.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[vars]
+AT_PROXY_URL = "https://atrealtime.vercel.app"
+PAGES_ORIGIN = "https://dazzlingfields.github.io"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.01
+
+[assets]
+directory = "../public"
+binding = "ASSETS"
+run_worker_first = true
+
+[triggers]
+crons = ["* * * * *"]
+
+[[durable_objects.bindings]]
+name = "COLLECTOR"
+class_name = "PerformanceCollector"
+
+[[migrations]]
+tag = "collector-alarm-v1"
+new_sqlite_classes = ["PerformanceCollector"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "at-route-performance"
+database_id = "d9ba0de3-1ac2-4b07-89fb-1897ef84b374"
+migrations_dir = "migrations"

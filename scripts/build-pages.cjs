@@ -1,0 +1,23 @@
+// Export public static files only. The original map stays at the Pages root.
+const fs=require('node:fs'),path=require('node:path'),{execFileSync}=require('node:child_process'),crypto=require('node:crypto');
+const root=path.resolve(__dirname,'..');
+const argument=(name,fallback)=>{const i=process.argv.indexOf(name);return i<0?fallback:process.argv[i+1];};
+const base=argument('--base','/AT-track/'),backend=argument('--backend','https://at-route-performance.dazzlingfields.workers.dev');
+if(!/^\/(?:[A-Za-z0-9_-]+\/)*$/.test(base))throw Error('Use an absolute Pages base ending with /');
+const origin=new URL(backend);if(origin.protocol!=='https:'||origin.username||origin.password||origin.pathname!=='/'||origin.search||origin.hash)throw Error('Backend must be an HTTPS origin without credentials');
+execFileSync(process.execPath,[path.join(__dirname,'build-next.cjs')],{stdio:'inherit'});
+const output=path.join(root,'dist/pages'),source=path.join(root,'performance/public/next'),next=base+'next/';
+fs.mkdirSync(output,{recursive:true});
+for(const file of ['index.html','script.js','transit-data.js','schedule-data.js','sw.js','manifest.webmanifest','busTypes.json','bus_routes.geojson','frequent_routes.geojson','train_routes.geojson','train_stations.geojson','stops_bus.csv','stops_train.csv','stops_ferry.csv','train.png','apple-touch-icon.png','icon-192.png','icon-512.png','icon-512-maskable.png'])if(fs.existsSync(path.join(root,file)))fs.copyFileSync(path.join(root,file),path.join(output,file));
+fs.cpSync(source,path.join(output,'next'),{recursive:true});
+const visit=directory=>{for(const entry of fs.readdirSync(directory,{withFileTypes:true})){const file=path.join(directory,entry.name);if(entry.isDirectory()){visit(file);continue;}if(!/\.(html|js|css|webmanifest)$/.test(file))continue;let text=fs.readFileSync(file,'utf8').replaceAll('/next/',next);if(entry.name==='index.html'&&directory===path.join(output,'next'))text=text.replaceAll('href="/"',`href="${origin.origin}/"`);fs.writeFileSync(file,text);}};
+visit(path.join(output,'next'));
+fs.writeFileSync(path.join(output,'next/config.js'),'window.AT_TRACK_CONFIG='+JSON.stringify({backend:origin.origin})+';\n');
+const mapFile=path.join(output,'next/live/script.js'),map=fs.readFileSync(mapFile,'utf8');
+if(!/const routesUrl\s*=/.test(map))throw Error('Map route catalogue anchor missing');
+fs.writeFileSync(mapFile,map.replace(/const routesUrl\s*=.*?;/,`const routesUrl = ${JSON.stringify(origin.origin+'/api/network/routes')};`));
+const swFile=path.join(output,'next/sw.js'),hash=crypto.createHash('sha256');
+for(const file of ['index.html','app.js','workspace.js','backend.js','config.js','style.css','manifest.webmanifest','live/script.js'])hash.update(fs.readFileSync(path.join(output,'next',file)));
+fs.writeFileSync(swFile,fs.readFileSync(swFile,'utf8').replace(/const VERSION='[^']+'/,`const VERSION='pages-${hash.digest('hex').slice(0,12)}'`));
+fs.writeFileSync(path.join(output,'.nojekyll'),'');
+console.log('GitHub Pages build: dist/pages; combined app at '+next+'; backend '+origin.origin);

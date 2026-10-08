@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#142c46"><meta name="description" content="Auckland live journeys and route performance, together. Track vehicles, explore recorded trips and understand your connections.">
+  <link rel="manifest" href="/next/manifest.webmanifest"><link rel="apple-touch-icon" href="/next/live/apple-touch-icon.png"><meta name="apple-mobile-web-app-capable" content="yes">
+  <title>AT-track · Live network</title>
+  <link rel="icon" href="/next/live/icon-192.png"><link rel="stylesheet" href="/next/performance.css"><link rel="stylesheet" href="/next/style.css">
+  <script src="/next/config.js" defer></script><script src="/next/backend.js" defer></script><script src="/next/workspace.js" defer></script><script src="/next/app.js" defer></script>
+</head>
+<body data-view="live">
+<a href="#workspace-content" class="skip-link">Skip to workspace</a>
+<aside class="workspace-sidebar">
+  <a class="workspace-brand" href="#live"><span class="workspace-mark">AT<span>↗</span></span><span>AT-track<small>Auckland, in motion.</small></span></a>
+  <p class="nav-label">YOUR WORKSPACE</p>
+  <nav class="workspace-nav page-nav" aria-label="Main navigation">
+    <button data-view="live"><span aria-hidden="true">◎</span>Live network<span class="nav-live-dot"></span></button>
+    <button data-view="service"><span aria-hidden="true">↳</span>Selected service</button>
+    <button data-view="overview"><span aria-hidden="true">▤</span>Your routes</button>
+    <button data-view="trips"><span aria-hidden="true">↗</span>Trip explorer</button>
+    <button data-view="transfers"><span aria-hidden="true">⇄</span>Papakura connections</button>
+    <span class="nav-label">UNDERSTAND THE JOURNEY</span>
+    <button data-view="services"><span aria-hidden="true">▥</span>Service rankings</button>
+    <button data-view="stops"><span aria-hidden="true">⊙</span>Stop performance</button>
+    <button data-view="occupancy"><span aria-hidden="true">▦</span>Occupancy</button>
+    <button data-view="history"><span aria-hidden="true">◷</span>Observation history</button>
+    <button data-view="settings"><span aria-hidden="true">⚙</span>Settings</button>
+    <details class="tools-menu" hidden><summary>More tools</summary></details>
+  </nav>
+  <div class="sidebar-bottom"><div class="collector-box"><span class="nav-live-dot"></span><div><strong id="collector-label">Checking collector</strong><small>History builds in the background</small></div></div><a href="https://dazzlingfields.github.io/AT-track/" target="_blank" rel="noopener">Original live map ↗</a><a href="/" target="_blank" rel="noopener">Original performance dashboard ↗</a><small class="sidebar-credit">Independent tracker · AT open data</small></div>
+</aside>
+<div class="workspace-body">
+  <header class="workspace-topbar"><div class="breadcrumb">Workspace <span>/</span> <strong id="breadcrumb-view">Live network</strong></div><div class="topbar-actions"><time id="auckland-clock" aria-label="Auckland time"></time><button id="workspace-refresh" aria-label="Refresh workspace">↻ <span>Refresh</span></button><button id="add-route" class="primary">+ Add route</button></div></header>
+  <main id="workspace-content" tabindex="-1">
+    <div class="workspace-heading"><div><p class="eyebrow" id="workspace-kicker">AUCKLAND TRANSPORT · LIVE &amp; RECORDED</p><h1 id="workspace-title">Live network<span class="title-dot">.</span></h1><p id="workspace-subtitle">Every journey, in context.</p></div><span id="connection" class="connection" role="status">Checking collector…</span></div>
+    <section id="live-workspace" data-views="live" aria-label="Live network">
+      <div class="live-layout">
+        <div class="map-card">
+          <div class="map-toolbar"><div class="mode-chips" aria-label="Vehicle layers"><button type="button" data-map-mode="bus" aria-pressed="true"><i class="mode-dot bus"></i>Buses</button><button type="button" data-map-mode="train" aria-pressed="true"><i class="mode-dot train"></i>Trains</button><button type="button" data-map-mode="ferry" aria-pressed="true"><i class="mode-dot ferry"></i>Ferries</button></div><span id="map-state" class="feed-state" role="status">Connecting to AT feed</span></div>
+          <div class="map-stage"><iframe id="network-map" title="Auckland live vehicle map with station departure boards" data-src="/next/live/index.html" allow="geolocation"></iframe><div id="map-unavailable" hidden>Live map could not start. <button id="map-retry">Retry map</button></div></div>
+          <div class="map-evidence"><span><i class="mode-dot bus"></i>Live positions</span><span>◷ Scheduled departures</span><span>▤ Recorded stop events</span><span id="map-updated">Waiting for feed</span></div>
+        </div>
+      </div>
+      <div class="workspace-footnote"><span><i class="nav-live-dot"></i>Live now. Learning over time.</span><span>Reported, scheduled and estimated times stay clearly labelled.</span></div>
+    </section>
+    <section id="service-workspace" data-views="service" aria-label="Selected vehicle details">
+      <button type="button" data-open-view="live" class="back-to-map">← Back to live network</button>
+      <section class="selected-service"><p class="eyebrow">SELECTED FROM THE LIVE MAP</p><div id="selected-service"><div class="selection-placeholder"><span aria-hidden="true">◎</span><h3>Choose a vehicle to explore its journey.</h3><p>Select a vehicle on Live network, then choose View service details in its popup. Its route performance and recorded trip will be linked here.</p></div></div></section>
+      <button class="connection-callout" data-open-view="transfers"><span aria-hidden="true">⇄</span><span><strong>Making the connection?</strong><small>Explore 376 ↔ South City at Papakura</small></span><span aria-hidden="true">↗</span></button>
+    </section>
+    {{CONTENT}}
+    <div class="mobile-legacy-links"><a href="https://dazzlingfields.github.io/AT-track/" target="_blank" rel="noopener">Original live map ↗</a><a href="/" target="_blank" rel="noopener">Original dashboard ↗</a></div>
+  </main>
+</div>
+{{DIALOG}}
+<button id="backend-connect" class="backend-connect" hidden>Connect performance</button>
+<dialog id="backend-dialog"><form id="backend-form"><h2>Connect route performance</h2><p>Use your existing Cloudflare dashboard password. The live map is available without signing in.</p><label>Username<input value="admin" autocomplete="username" readonly></label><label>Dashboard password<input name="password" type="password" autocomplete="current-password" required></label><p id="backend-error" role="alert"></p><div class="backend-actions"><button type="button" id="backend-cancel">Back to map</button><button type="submit" class="primary">Connect</button></div></form></dialog>
+<noscript><p>Enable JavaScript to use AT-track. The original apps remain available from the sidebar links.</p></noscript>
+</body></html>

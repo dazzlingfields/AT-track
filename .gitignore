@@ -1,0 +1,11 @@
+.test-artifacts/
+performance/.env
+performance/.dev.vars
+performance/cloud/.dev.vars
+performance/data/
+performance/cloud/.wrangler/
+performance/node_modules/
+performance/cloud/node_modules/
+performance/public/timetables/
+performance/public/next/
+dist/

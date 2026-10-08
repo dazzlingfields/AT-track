@@ -1,0 +1,17 @@
+{
+  "name":"AT-track · Live journeys & route performance",
+  "short_name":"AT-track",
+  "description":"Live Auckland transport and your recorded route history in one workspace.",
+  "id":"/AT-track/next/",
+  "start_url":"/AT-track/next/",
+  "scope":"/AT-track/next/",
+  "display":"standalone",
+  "background_color":"#f5f7fa",
+  "theme_color":"#142c46",
+  "categories":["travel","navigation"],
+  "icons":[
+    {"src":"/AT-track/next/live/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},
+    {"src":"/AT-track/next/live/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"},
+    {"src":"/AT-track/next/live/icon-512-maskable.png","sizes":"512x512","type":"image/png","purpose":"maskable"}
+  ]
+}
