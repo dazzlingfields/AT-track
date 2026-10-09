@@ -55,6 +55,9 @@ const server = http.createServer((req, res) => {
                 {stop_id:'9406-abcdef99',stop_sequence:2,arrival:{time:Math.floor(Date.now()/1000)+600}}]}},
             {trip_update:{trip:{trip_id:'canceled-train',route_id:'rail-route',schedule_relationship:3},timestamp:Math.floor(Date.now()/1000)}}],
             header: { timestamp: Math.floor(Date.now() / 1000) } };
+          const reportTime=Math.floor(Date.now()/1000);
+          payload.entity.push({trip_update:{trip:{trip_id:'delayed-train',route_id:'rail-route',start_date:ScheduleData.dateString(ScheduleData.parts(reportTime))},timestamp:reportTime,
+            stop_time_update:{stop_id:'9406-abcdef99',stop_sequence:2,departure:{time:reportTime-30,delay:180}}}});
           if(viewport.width===320) payload.entity=payload.entity.filter(e=>!e.trip_update);
         } else if (endpoint === '/api/departures') {
           await new Promise(resolve=>setTimeout(resolve,600));
@@ -63,6 +66,7 @@ const server = http.createServer((req, res) => {
             {tripId:'legacy-train',serviceDate,stopId:'9297-abcdef99',sequence:1,routeId:'rail-route',destination:'Swanson',scheduledTime:now+120},
             {tripId:'future-train',serviceDate,stopId:'9298-abcdef99',sequence:1,routeId:'rail-route',destination:'Manukau',scheduledTime:now+240},
             {tripId:'scheduled-only',serviceDate,stopId:'9297-abcdef99',sequence:4,routeId:'rail-route',destination:'Henderson',scheduledTime:now+600},
+            {tripId:'delayed-train',serviceDate,stopId:'9297-abcdef99',sequence:3,routeId:'rail-route',destination:'Delayed Swanson',scheduledTime:now+660},
             {tripId:'canceled-train',serviceDate,stopId:'9298-abcdef99',sequence:1,routeId:'rail-route',destination:'Cancelled destination',scheduledTime:now+450}
           ]};
           const ids=new URL(route.request().url()).searchParams.get('ids').split(',');
@@ -117,6 +121,12 @@ const server = http.createServer((req, res) => {
       assert.match(await page.locator('.leaflet-popup-content').textContent(),/Henderson/);
       assert.match(await page.locator('.leaflet-popup-content').textContent(),/Live/);
       assert.match(await page.locator('.leaflet-popup-content').textContent(),/Cancelled/);
+      if(viewport.width!==320){
+        assert.match(await page.locator('.leaflet-popup-content').textContent(),/Average delay: 3m late/);
+        assert.match(await page.locator('.leaflet-popup-content').textContent(),/1 of 4 upcoming services · 1 estimated/);
+        assert.match(await page.locator('.leaflet-popup-content').textContent(),/Estimated/);
+        assert.match(await page.locator('.leaflet-popup-content').textContent(),/Sched\./);
+      }
       if(viewport.width<600){
         await page.waitForFunction(()=>{
           const popup=document.querySelector('.leaflet-popup')?.getBoundingClientRect();
@@ -170,6 +180,18 @@ const server = http.createServer((req, res) => {
         return popup && popup.top>=10 && popup.bottom<=innerHeight-10;
       },null,{timeout:5000});
       await page.screenshot({path:path.join(root,'.test-artifacts',`bus-station-${viewport.width}.png`)});
+      // An ordinary roadside bus stop gets the same board without querying nearby stops.
+      const beforeRoadCalls=requests.filter(u=>u.includes('/api/departures')).length;
+      await page.evaluate(()=>{
+        map.closePopup();const stop=stopsBus[0];map.setView([stop[0],stop[1]],17,{animate:false});
+        renderStopsForViewport();stopMarkersByKey.get(stop[5]).openPopup();
+      });
+      await page.waitForFunction(()=>_openStopMarker?._stopType===0 && departuresByStation.get(_openStopMarker._stopKey)?.complete===true);
+      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Next services/);
+      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Average delay unavailable/);
+      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Botany/);
+      assert.equal(requests.filter(u=>u.includes('/api/departures')).length,beforeRoadCalls+1);
+      await page.screenshot({path:path.join(root,'.test-artifacts',`road-stop-${viewport.width}.png`)});
       await page.evaluate(()=>{map.closePopup();map.setView([-36.8485,174.7633],12,{animate:false});});
       if(viewport.width<600) await page.locator('#controls-toggle').click();
       await page.locator('.search-icon-btn').click();

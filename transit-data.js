@@ -91,7 +91,13 @@
     }
     return [...rows.filter(row=>!selected.has(row)),...stations];
   }
-  const api={list,number,entities,canceled,stopUpdates,stopCode,stopAliases,resolveStop,validPosition,bikesAllowed,buildArrivals,groupBusStations};
+  function relevantStop(update,currentSequence,now=Date.now()/1000){
+    const stops=stopUpdates(update);if(!stops.length)return null;
+    if(currentSequence!=null){const candidates=stops.filter(s=>number(s.stop_sequence??s.stopSequence)!=null&&number(s.stop_sequence??s.stopSequence)>=currentSequence).sort((a,b)=>number(a.stop_sequence??a.stopSequence)-number(b.stop_sequence??b.stopSequence));return candidates[0]||null;}
+    return stops.find(s=>(number(s.departure?.time)??number(s.arrival?.time)??0)>=now-30)||stops[stops.length-1];
+  }
+  function tripDelay(update,currentSequence,now=Date.now()/1000){const stop=relevantStop(update,currentSequence,now);return number(stop?.arrival?.delay)??number(stop?.departure?.delay)??number(update?.delay);}
+  const api={list,number,entities,canceled,stopUpdates,stopCode,stopAliases,resolveStop,validPosition,bikesAllowed,buildArrivals,groupBusStations,relevantStop,tripDelay};
   if(typeof module==='object' && module.exports) module.exports=api;
   else root.TransitData=api;
 })(typeof globalThis==='object'?globalThis:window);

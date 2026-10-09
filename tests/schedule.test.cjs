@@ -72,6 +72,59 @@ test('cancellations are labelled, passed stops removed, and stale/offline data d
   assert.equal(S.mergeDepartures([scheduled()],new Map([['trip',update]]),{now})[0].status,'scheduled');
 });
 
+const upstream=(extra={})=>({trip:{start_date:'20261003'},timestamp:now,
+  stop_time_update:{stop_id:'9001-abcdef12',stop_sequence:2,departure:{time:now-30,delay:180}},...extra});
+const merged=update=>S.mergeDepartures([scheduled()],new Map([['trip',update]]),{now})[0];
+test('recent upstream delays project expected times while preserving the timetable',()=>{
+  const row=merged(upstream());
+  assert.equal(row.status,'estimated');assert.equal(row.etaSec,now+780);
+  assert.equal(row.delaySec,180);assert.equal(row.delaySource,'upstream');
+  assert.equal(row.scheduledTime,now+600);
+  assert.equal(merged(upstream({delay:0,stop_time_update:[]})).delaySec,0);
+  const early=upstream();early.stop_time_update.departure.delay=-60;
+  assert.equal(merged(early).etaSec,now+540);
+});
+test('stale, future, undated and wrong-service reports never become upstream estimates',()=>{
+  for(const update of [upstream({timestamp:now-121}),upstream({timestamp:now+31}),upstream({timestamp:null}),
+    upstream({trip:{}}),upstream({trip:{start_date:'20261002'}})]) assert.equal(merged(update).status,'scheduled');
+  for(const time of [now-301,now+60,null,'',false]){
+    const update=upstream();update.stop_time_update.departure.time=time;
+    assert.equal(merged(update).status,'scheduled');
+  }
+  assert.equal(S.mergeDepartures([scheduled()],new Map([['trip',upstream()]]),{now,liveFresh:false})[0].status,'scheduled');
+});
+test('actual downstream progress removes passed visits but future forecasts do not',()=>{
+  const update=upstream();update.stop_time_update.stop_sequence=4;
+  assert.equal(S.mergeDepartures([scheduled()],new Map([['trip',update]]),{now}).length,0);
+  update.stop_time_update.departure.time=now+900;
+  assert.equal(merged(update).status,'scheduled');
+});
+test('exact-stop predictions win; skipped and no-data stops block projected delays',()=>{
+  const update=upstream();
+  const stop={stop_id:'9297-12345678',stop_sequence:3,departure:{time:now+720}};
+  update.stop_time_update=[update.stop_time_update,stop];
+  assert.equal(merged(update).status,'live');assert.equal(merged(update).delaySec,120);
+  stop.schedule_relationship='NO_DATA';assert.equal(merged(update).status,'scheduled');
+  stop.schedule_relationship='SKIPPED';assert.equal(merged(update).status,'canceled');
+  stop.stop_sequence=2;stop.stop_id='9002-abcdef12';stop.schedule_relationship='NO_DATA';
+  update.stop_time_update[0].stop_sequence=1;
+  assert.equal(merged(update).status,'scheduled');
+});
+test('loop revisits retain sequence identity and arrival-only reports stay labelled arrivals',()=>{
+  const update=upstream();update.stop_time_update.stop_id='9297-abcdef12';
+  assert.equal(merged(update).status,'estimated');
+  update.stop_time_update={stop_id:'9297-abcdef12',stop_sequence:3,departure:{},arrival:{time:now+720}};
+  assert.equal(merged(update).timingKind,'arrival');assert.equal(merged(update).delaySec,null);
+  const row=S.mergeDepartures([scheduled({scheduledArrival:now+500})],new Map([['trip',update]]),{now})[0];
+  assert.equal(row.delaySec,220);
+});
+test('average includes real zero and early delays; unknown and cancelled rows are excluded',()=>{
+  const rows=[{status:'live',delaySec:0},{status:'estimated',delaySec:180},{status:'live',delaySec:-60},
+    {status:'live',delaySec:null},{status:'canceled',delaySec:900},{status:'scheduled',delaySec:0}];
+  assert.deepEqual(S.delaySummary(rows),{count:3,total:5,estimated:1,average:40});
+  assert.equal(S.delaySummary([{status:'live',delaySec:null}]).average,null);
+});
+
 function handler(fetch,extra={}){
   const context=vm.createContext({ScheduleData:S,fetch,URL,AbortController,setTimeout,clearTimeout,
     process:{env:{AT_API_KEY:'test'}},Date:{now:()=>now*1000},...extra});

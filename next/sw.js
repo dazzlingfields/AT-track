@@ -1,6 +1,6 @@
 // Offline shell and map references only. Never store report APIs, live feeds,
 // authentication failures or mutations. Separate names/scope protect the old app.
-const VERSION='pages-ec8eb107b92d',SHELL='at-workspace-shell-'+VERSION,TILES='at-workspace-tiles-'+VERSION;
+const VERSION='pages-c501e1cb17ab',SHELL='at-workspace-shell-'+VERSION,TILES='at-workspace-tiles-'+VERSION;
 const ASSETS=['/AT-track/next/','/AT-track/next/index.html','/AT-track/next/app.js','/AT-track/next/workspace.js','/AT-track/next/style.css','/AT-track/next/performance.css','/AT-track/next/manifest.webmanifest','/AT-track/next/live/index.html','/AT-track/next/live/script.js','/AT-track/next/live/transit-data.js','/AT-track/next/live/schedule-data.js','/AT-track/next/live/map.css','/AT-track/next/live/bridge.js','/AT-track/next/live/icon-192.png','/AT-track/next/live/icon-512.png','https://unpkg.com/leaflet@1.7.1/dist/leaflet.js','https://unpkg.com/leaflet@1.7.1/dist/leaflet.css','https://unpkg.com/leaflet@1.7.1/dist/images/layers.png'];
 ASSETS.push('/AT-track/next/config.js','/AT-track/next/backend.js');
 self.addEventListener('install',event=>event.waitUntil((async()=>{const cache=await caches.open(SHELL);await Promise.allSettled(ASSETS.map(async url=>{const response=await fetch(url,{cache:'reload'});if(response.ok)await cache.put(new URL(url,self.location.origin).href,response);}));await self.skipWaiting();})()));

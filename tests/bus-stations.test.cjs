@@ -27,8 +27,8 @@ test('major bus hubs preserve all bays and IDs; ordinary road stops remain separ
   assert.equal(result.filter(s=>s[4]===3).length,grouped.length);
   assert.equal(grouped.reduce((n,s)=>n+s.platforms.length,0)+result.filter(s=>s[4]===0).length,rows.length);
 });
-async function board(responses){
-  const {context,rows}=stops(),station=context.dedupeStops(rows).find(s=>s[3]==='Manukau Bus Station');
+async function board(responses,type=3){
+  const {context,rows}=stops(),station=context.dedupeStops(rows).find(s=>type===0?s[4]===0:s[3]==='Manukau Bus Station');
   const requests=[],records=new Map();
   Object.assign(context,{navigator:{onLine:true},isPageVisible:()=>true,departuresByStation:records,
     departuresPending:new Map(),backoff:{departures:{until:0}},latestPlatformIds:new Map(),
@@ -36,7 +36,7 @@ async function board(responses){
     applyRateLimitBackoff:()=>{},parseRetryAfterMs:()=>60000,
     safeFetch:async url=>{requests.push(new URL(url,'http://local').searchParams.get('ids').split(','));return responses[requests.length-1];}});
   vm.runInContext(helper('loadStationDepartures'),context);
-  await context.loadStationDepartures({_stopType:3,_stopKey:station[5],_stopInfo:station[6]});
+  await context.loadStationDepartures({_stopType:type,_stopKey:station[5],_stopInfo:station[6]});
   return {requests,record:records.get(station[5])};
 }
 test('bus station timetable queries every bay in bounded batches',async()=>{
@@ -45,6 +45,13 @@ test('bus station timetable queries every bay in bounded batches',async()=>{
   assert.equal(new Set(requests.flat()).size,11);
   assert.equal(record.data.length,2);
   assert.equal(record.complete,true);
+});
+
+test('ordinary road stops retain their exact AT ID and request a single-stop timetable',async()=>{
+  const {requests,record}=await board([{data:[{tripId:'road-stop-service'}],complete:true}],0);
+  assert.equal(requests.length,1);assert.equal(requests[0].length,1);
+  assert.match(requests[0][0],/^\d+-/);
+  assert.equal(record.complete,true);assert.equal(record.data[0].tripId,'road-stop-service');
 });
 test('failed later bay batch keeps successful departures and labels the board partial',async()=>{
   const {record}=await board([{data:[{tripId:'first'}],complete:true},null]);
