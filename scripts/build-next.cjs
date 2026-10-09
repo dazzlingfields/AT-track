@@ -43,10 +43,10 @@ mapScript=replace(mapScript,'  return base', '  return base + \'<br><button type
 mapScript=replace(mapScript,'currentType:typeKey,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText,bearingDeg:', 'currentType:typeKey,delaySec,serviceDate:v.vehicle?.trip?.start_date,tripStart,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText,bearingDeg:');
 write(path.join(target,'live/script.js'),mapScript);
 for(const file of ['map.css','bridge.js'])fs.copyFileSync(path.join(source,file),path.join(target,'live',file));
-for(const file of ['transit-data.js','schedule-data.js','busTypes.json','bus_routes.geojson','frequent_routes.geojson','train_routes.geojson','train_stations.geojson','stops_bus.csv','stops_train.csv','stops_ferry.csv','stops.json','train.png','apple-touch-icon.png','icon-192.png','icon-512.png','icon-512-maskable.png','manifest.webmanifest']){
+for(const file of ['transit-data.js','schedule-data.js','intercity-data.js','popups.css','busTypes.json','bus_routes.geojson','frequent_routes.geojson','train_routes.geojson','train_stations.geojson','stops_bus.csv','stops_train.csv','stops_ferry.csv','stops.json','train.png','apple-touch-icon.png','icon-192.png','icon-512.png','icon-512-maskable.png','manifest.webmanifest']){
  const from=path.join(root,file);if(fs.existsSync(from))fs.copyFileSync(from,path.join(target,'live',file));
 }
 const hash=require('node:crypto').createHash('sha256');
-for(const file of ['index.html','app.js','workspace.js','backend.js','config.js','style.css','performance.css','manifest.webmanifest','live/bridge.js','live/map.css','live/script.js','live/index.html'])hash.update(read(path.join(target,file)));
+for(const file of ['index.html','app.js','workspace.js','backend.js','config.js','style.css','performance.css','manifest.webmanifest','live/bridge.js','live/map.css','live/script.js','live/index.html','live/intercity-data.js','live/popups.css','live/schedule-data.js','live/transit-data.js'])hash.update(read(path.join(target,file)));
 write(path.join(target,'sw.js'),read(path.join(source,'sw.js')).replace('__CACHE_VERSION__',hash.digest('hex').slice(0,12)));
 console.log('Built combined AT-track workspace: performance/public/next/');

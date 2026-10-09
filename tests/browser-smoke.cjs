@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const ScheduleData=require('../schedule-data.js');
 const root = path.resolve(__dirname, '..');
-const mime = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json',
+const mime = { '.html': 'text/html', '.css':'text/css', '.js': 'text/javascript', '.json': 'application/json',
   '.geojson': 'application/json', '.csv': 'text/csv', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 const server = http.createServer((req, res) => {
   const file = path.resolve(root, '.' + new URL(req.url, 'http://localhost').pathname.replace(/\/$/, '/index.html'));
@@ -28,6 +28,8 @@ const server = http.createServer((req, res) => {
       const context = await browser.newContext({ viewport, serviceWorkers: 'block' });
       const page = await context.newPage();
       const errors = [], requests = [];
+      const board=page.locator(viewport.width>=900?'#station-panel .station-panel-content':'.station-popup .leaflet-popup-content').last();
+      await page.route('https://at-route-performance.dazzlingfields.workers.dev/api/network/station-averages',route=>route.fulfill({json:{from:'2026-10-03',to:'2026-10-09',generatedAt:Date.now()/1000,stops:[{stop_code:'9297',mode:'train',measured:12,observations:14,delayTotal:2160,routes:['E-W']}]},headers:{'Access-Control-Allow-Origin':'*'}}));
       page.on('pageerror', e => { errors.push(e.message); console.error('Browser error:',e.message); });
       page.on('requestfailed', req => {
         if(req.failure()?.errorText!=='net::ERR_ABORTED') console.error('Failed request:',req.url(),req.failure()?.errorText);
@@ -111,25 +113,25 @@ const server = http.createServer((req, res) => {
       // Close the expanded mobile controls before tapping the map.
       if(viewport.width<600) await page.locator('#controls-toggle').click();
       await station.click();
-      await page.locator('.leaflet-popup-content').waitFor();
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Te Waihorotiu Train Station/);
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Platforms \/ stop codes/);
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Next services/);
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/E-W/);
+      await board.waitFor();
+      assert.match(await board.textContent(),/Te Waihorotiu Train Station/);
+      assert.match(await board.textContent(),/Platforms \/ stop codes/);
+      assert.match(await board.textContent(),/Next services/);
+      assert.match(await board.textContent(),/E-W/);
       await page.waitForFunction(()=>document.querySelector('.leaflet-popup-content')?.textContent.includes('Manukau'));
       await page.waitForFunction(()=>document.querySelector('.leaflet-popup-content')?.textContent.includes('Scheduled'));
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Henderson/);
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Live/);
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Cancelled/);
+      assert.match(await board.textContent(),/Henderson/);
+      assert.match(await board.textContent(),/Live/);
+      assert.match(await board.textContent(),/Cancelled/);
       if(viewport.width!==320){
-        assert.match(await page.locator('.leaflet-popup-content').textContent(),/Average delay: 3m late/);
-        assert.match(await page.locator('.leaflet-popup-content').textContent(),/1 of 4 upcoming services · 1 estimated/);
-        assert.match(await page.locator('.leaflet-popup-content').textContent(),/Estimated/);
-        assert.match(await page.locator('.leaflet-popup-content').textContent(),/Sched\./);
+        assert.match(await board.textContent(),/3m late/);
+        assert.match(await board.textContent(),/12 measured arrivals/);
+        assert.match(await board.textContent(),/Estimated/);
+        assert.match(await board.textContent(),/Sched\./);
       }
       if(viewport.width<600){
         await page.waitForFunction(()=>{
-          const popup=document.querySelector('.leaflet-popup')?.getBoundingClientRect();
+          const popup=document.querySelector(innerWidth>=900?'#station-panel':'.leaflet-popup')?.getBoundingClientRect();
           const controls=document.getElementById('controls').getBoundingClientRect();
           return popup && popup.top>=controls.bottom+60 && popup.bottom<=innerHeight-10;
         });
@@ -139,7 +141,7 @@ const server = http.createServer((req, res) => {
       await page.evaluate(()=>map.panBy([10,0],{animate:false}));
       await page.waitForFunction(()=>_openStopMarker?.isPopupOpen());
       await page.evaluate(()=>renderStopsForViewport());
-      assert.equal(await page.locator('.leaflet-popup-content').count(),1);
+      assert.equal(await board.count(),1);
       const styles=await page.evaluate(()=>railLinesLayer.getLayers().map(layer=>({code:layer.feature.properties.ROUTENUMBER,weight:layer.options.weight,dash:layer.options.dashArray})));
       assert.ok(styles.find(s=>s.code==='S-C').weight>styles.find(s=>s.code==='E-W').weight);
       assert.equal(styles.find(s=>s.code==='E-W').dash,'10 6');
@@ -156,27 +158,27 @@ const server = http.createServer((req, res) => {
       await stationSearch.fill('Te Waihorotiu');
       await page.locator('.suggestion-item[data-kind="station"]').first().waitFor();
       await stationSearch.press('Enter');
-      await page.locator('.leaflet-popup-content').waitFor();
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Te Waihorotiu/);
+      await board.waitFor();
+      assert.match(await board.textContent(),/Te Waihorotiu/);
       assert.equal(await page.locator('input[data-layer="overlays"]').isChecked(),true);
       await page.evaluate(()=>map.closePopup());
       // Major bus hubs are visible at regional zoom and expose every bay in the timetable.
       await page.evaluate(()=>{const station=findStations('Manukau Bus Station')[0];map.setView([station[0],station[1]],12,{animate:false});renderStopsForViewport();});
       const busStation=page.locator('.bus-station-icon[title="Manukau Bus Station"]');
       await busStation.waitFor();
-      await busStation.click();
+      await page.evaluate(()=>openStation(findStations('Manukau Bus Station')[0]));
       await page.waitForFunction(()=>_openStopMarker?._stopType===3 && departuresByStation.get(_openStopMarker._stopKey)?.complete===true);
-      const busBoard=await page.locator('.leaflet-popup-content').textContent();
+      const busBoard=await board.textContent();
       assert.match(busBoard,/Bus station \/ interchange/);
       assert.match(busBoard,/70/);
       assert.match(busBoard,/Botany/);
       assert.match(busBoard,/Scheduled · Bay/);
       assert.equal(await page.evaluate(()=>departuresByStation.get(_openStopMarker._stopKey).data.length),11);
-      await page.locator('.station-details summary').click();
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Bay 18/);
-      await page.locator('.station-details summary').click();
+      await board.locator('.station-details summary').click();
+      assert.match(await board.textContent(),/Bay 18/);
+      await board.locator('.station-details summary').click();
       await page.waitForFunction(()=>{
-        const popup=document.querySelector('.leaflet-popup')?.getBoundingClientRect();
+        const popup=document.querySelector(innerWidth>=900?'#station-panel':'.leaflet-popup')?.getBoundingClientRect();
         return popup && popup.top>=10 && popup.bottom<=innerHeight-10;
       },null,{timeout:5000});
       await page.screenshot({path:path.join(root,'.test-artifacts',`bus-station-${viewport.width}.png`)});
@@ -187,11 +189,36 @@ const server = http.createServer((req, res) => {
         renderStopsForViewport();stopMarkersByKey.get(stop[5]).openPopup();
       });
       await page.waitForFunction(()=>_openStopMarker?._stopType===0 && departuresByStation.get(_openStopMarker._stopKey)?.complete===true);
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Next services/);
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Average delay unavailable/);
-      assert.match(await page.locator('.leaflet-popup-content').textContent(),/Botany/);
+      assert.match(await board.textContent(),/Next services/);
+      assert.match(await board.textContent(),/No recorded arrivals/);
+      assert.match(await board.textContent(),/Botany/);
       assert.equal(requests.filter(u=>u.includes('/api/departures')).length,beforeRoadCalls+1);
       await page.screenshot({path:path.join(root,'.test-artifacts',`road-stop-${viewport.width}.png`)});
+      // Timetable-only stations never query AT, even when reopened.
+      const callsBeforeIntercity=requests.filter(u=>u.includes('/api/departures')).length;
+      for(const name of ['The Strand','Hamilton Frankton','Hamilton Rotokauri','Huntly']){
+        await page.evaluate(name=>openStation(findStations(name)[0]),name);
+        await board.getByText('Intercity timetable',{exact:true}).waitFor();
+        assert.match(await board.textContent(),/Te Huia/);
+      }
+      assert.equal(requests.filter(u=>u.includes('/api/departures')).length,callsBeforeIntercity);
+      await page.evaluate(()=>openStation(findStations('The Strand')[0]));
+      assert.match(await board.textContent(),/Northern Explorer/);
+      await page.screenshot({path:path.join(root,'.test-artifacts',`strand-${viewport.width}.png`)});
+      if(viewport.width>=900){
+        await page.keyboard.press('Escape');assert.equal(await page.locator('#station-panel').isVisible(),false);
+      }
+      for(const name of ['Pukekohe','Puhinui']){
+        await page.evaluate(name=>openStation(findStations(name)[0]),name);
+        await page.waitForFunction(()=>departuresByStation.get(_openStopMarker._stopKey)?.complete===true);
+        assert.match(await board.textContent(),/Next services/);assert.match(await board.textContent(),/Te Huia/);
+      }
+      assert.equal(requests.filter(u=>u.includes('/api/departures')).length,callsBeforeIntercity+2);
+      assert.equal(await page.evaluate(()=>trainColorForRoute('E-W')),'#278446');
+      await page.evaluate(()=>{map.closePopup();const s=findStations('Manukau Bus Station')[0];map.setView([s[0],s[1]],11,{animate:false});renderStopsForViewport();});
+      const drift=await page.evaluate(()=>{const m=stopMarkersByKey.get(findStations('Manukau Bus Station')[0][5]),p=map.latLngToContainerPoint(m.getLatLng()),r=m.getElement().getBoundingClientRect();return Math.hypot(r.x+r.width/2-p.x,r.y+r.height/2-p.y);});
+      assert.ok(drift<2,'Bus interchange stays on its geographic point at low zoom');
+
       await page.evaluate(()=>{map.closePopup();map.setView([-36.8485,174.7633],12,{animate:false});});
       if(viewport.width<600) await page.locator('#controls-toggle').click();
       await page.locator('.search-icon-btn').click();

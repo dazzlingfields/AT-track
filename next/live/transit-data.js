@@ -31,6 +31,12 @@
     return lat!==null && lon!==null && Math.abs(lat)<=90 && Math.abs(lon)<=180;
   }
   function bikesAllowed(value){return number(value)===1?'Yes':number(value)===2?'No':'';}
+  function carriageCount(position){
+    const cars=position?.multi_carriage_details??position?.multiCarriageDetails;
+    if(!Array.isArray(cars)||!cars.length)return null;
+    // GTFS requires a complete ordered set, including non-boardable carriages.
+    return cars.every((c,i)=>number(c?.carriage_sequence??c?.carriageSequence)===i+1)?cars.length:null;
+  }
   function buildArrivals(updates,{now,resolveStop,serviceForTrip,sequenceForTrip=()=>null}){
     const byStop=new Map(),dedupe=new Map();
     const stats={trips:0,multiStopTrips:0,unmatchedStops:0,missingTimes:0,staleTrips:0,entries:0};
@@ -97,7 +103,7 @@
     return stops.find(s=>(number(s.departure?.time)??number(s.arrival?.time)??0)>=now-30)||stops[stops.length-1];
   }
   function tripDelay(update,currentSequence,now=Date.now()/1000){const stop=relevantStop(update,currentSequence,now);return number(stop?.arrival?.delay)??number(stop?.departure?.delay)??number(update?.delay);}
-  const api={list,number,entities,canceled,stopUpdates,stopCode,stopAliases,resolveStop,validPosition,bikesAllowed,buildArrivals,groupBusStations,relevantStop,tripDelay};
+  const api={list,number,entities,canceled,stopUpdates,stopCode,stopAliases,resolveStop,validPosition,bikesAllowed,carriageCount,buildArrivals,groupBusStations,relevantStop,tripDelay};
   if(typeof module==='object' && module.exports) module.exports=api;
   else root.TransitData=api;
 })(typeof globalThis==='object'?globalThis:window);

@@ -56,7 +56,7 @@ test('station compaction preserves available descriptions and averages platforms
 });
 
 test('station popup escapes source text and includes platform info and arrivals',()=>{
-  const context=vm.createContext({STOP_STYLE:{1:{label:'Rail station'}},buildStationDepartureBoard:()=>'<div>Next services</div>'});
+  const context=vm.createContext({STOP_STYLE:{1:{label:'Rail station'}},buildIntercityBoard:()=>'',isIntercityOnly:()=>false,stationHistoryHtml:()=>'',buildStationDepartureBoard:()=>'<div>Next services</div>'});
   vm.runInContext(source.match(/function escapeHtml[^\r\n]+/)[0]+'\n'+helper('buildStopPopup'),context);
   const html=context.buildStopPopup({_stopType:1,_stopName:'<Station>',_stopInfo:{platforms:[
     {name:'<Station> 1',code:'9001',description:'<script>alert(1)</script>'}]},getLatLng:()=>({lat:-36.85,lng:174.76})});

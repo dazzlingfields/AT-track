@@ -91,7 +91,7 @@ const vehicleColors={bus:"#4a90e2",train:"#d0021b",ferry:"#1abc9c",out:"#9b9b9b"
 // merge of the old Eastern (yellow) and Western (green) lines. See resolveTrainLineCode.
 const trainLineColors={
   STH:"#d0021b",WEST:"#7fbf6a",EAST:"#f8e71c",ONE:"#0e76a8",HUIA:"#8e44ad",
-  SC:"#d0021b",EW:"#f5a623",OW:"#0e76a8"
+  SC:"#d0021b",EW:"#278446",OW:"#0e76a8"
 };
 const occupancyLabels=["Empty","Many seats available","Few seats available","Standing only","Limited standing","Full","Not accepting passengers"];
 // Ring colours for the optional occupancy overlay, green (empty) -> red (full).
@@ -351,18 +351,14 @@ function buildExtraLines(ex){
 }
 
 function buildPopup(routeName,destination,nextStopLine,vehicleLabel,busType,licensePlate,speedStr,scheduleLine,occupancy,bikesLine,extraLines){
-  return `<div style="font-size:0.9em;line-height:1.3;">
-      <b>Route:</b> ${escapeHtml(routeName)}<br>
-      <b>Destination:</b> ${escapeHtml(destination)}<br>
-      ${nextStopLine?`${nextStopLine}<br>`:""}
-      <b>Vehicle:</b> ${escapeHtml(vehicleLabel)}<br>
-      ${busType?`<b>Bus model:</b> ${escapeHtml(busType)}<br>`:""}
-      <b>Number plate:</b> ${escapeHtml(licensePlate)}<br>
-      <b>Speed:</b> ${escapeHtml(speedStr)}${scheduleLine||""}<br>
-      <b>Occupancy:</b> ${escapeHtml(occupancy)}
-      ${bikesLine||""}
-      ${extraLines||""}
-    </div>`;
+  const known=value=>value && !['N/A','Unknown'].includes(value);
+  const details=[known(vehicleLabel)?`Vehicle ${escapeHtml(vehicleLabel)}`:'',known(busType)?escapeHtml(busType):'',
+    known(licensePlate)?escapeHtml(licensePlate):'',known(speedStr)?escapeHtml(speedStr):''].filter(Boolean);
+  return `<div class="vehicle-card"><span class="popup-eyebrow">${escapeHtml(routeName)}</span>
+    <h3>${escapeHtml(known(destination)?destination:'Destination unavailable')}</h3>
+    ${scheduleLine||''}${nextStopLine?`<div class="vehicle-next-stop">${nextStopLine}</div>`:''}
+    ${known(occupancy)?`<div class="vehicle-load">${escapeHtml(occupancy)}</div>`:''}
+    ${details.length?`<details class="popup-details" data-detail="vehicle"><summary>Vehicle details</summary><div>${details.join('<br>')}${bikesLine||''}</div></details>`:''}</div>`;
 }
 
 // ---- Schedule adherence (late / early) from GTFS-RT trip updates --------------------
@@ -407,10 +403,12 @@ function formatDelay(sec){
   return sec>0 ? `${t} late` : `${t} early`;
 }
 function scheduleLineHtml(sec){
-  if(sec==null) return "";
-  const txt=formatDelay(sec);
-  const col = txt==="On time" ? "#1a8f3c" : (sec>0 ? "#d0021b" : "#0a84ff");
-  return `<br><b>Schedule:</b> <span style="color:${col}">${txt}</span>`;
+  return serviceDelayHtml(sec);
+}
+function serviceDelayHtml(sec,status='live'){
+  const label=status==='canceled'?'Cancelled':sec==null?'Delay unknown':formatDelay(sec);
+  const tone=status==='canceled'?'cancelled':sec==null?'unknown':Math.abs(sec)<=30?'ontime':sec>0?'late':'early';
+  return `<span class="service-delay delay-${tone}">${escapeHtml(label)}</span>`;
 }
 
 // ---- Next stop (vehicle popup) ------------------------------------------------------
@@ -847,6 +845,30 @@ let stopAliases=new Map(),latestTripUpdates=new Map(),latestStopSequences=new Ma
 let latestScheduleUpdates=new Map();
 const latestPlatformIds=new Map();
 const departuresByStation=new Map(),departuresPending=new Map();
+let stationHistory={status:'idle',data:null,fetchedAt:0},stationHistoryPending=null;
+function isIntercityOnly(marker){return marker?._stopType===1 && /Strand|Frankton|Rotokauri|Huntly/i.test(marker._stopName);}
+function loadStationHistory(marker){
+  if(isIntercityOnly(marker) || navigator.onLine===false || stationHistoryPending || Date.now()-stationHistory.fetchedAt<900000)return;
+  stationHistory.status='loading';
+  stationHistoryPending=(async()=>{
+    const result=await safeFetch('https://at-route-performance.dazzlingfields.workers.dev/api/network/station-averages');
+    stationHistory={status:Array.isArray(result?.stops)?'ready':'error',data:Array.isArray(result?.stops)?result:null,fetchedAt:Date.now()};
+    refreshOpenStopPopup();
+  })().finally(()=>stationHistoryPending=null);
+}
+function stationHistoryHtml(marker){
+  const data=stationHistory.data;
+  if(!data)return `<div class="station-history"><span class="popup-eyebrow">Station average · past 7 days</span><p>${stationHistory.status==='error'?'History temporarily unavailable':'Loading recorded arrivals…'}</p></div>`;
+  const codes=new Set((marker._stopInfo?.platforms||[]).map(p=>TransitData.stopCode(p.id)||String(p.code)));
+  const rows=data.stops.filter(r=>codes.has(r.stop_code) && r.mode===(marker._stopType===1?'train':'bus'));
+  const count=rows.reduce((n,r)=>n+r.measured,0),total=rows.reduce((n,r)=>n+(r.delayTotal||0),0);
+  const routes=[...new Set(rows.flatMap(r=>r.routes))].join(', ');
+  const stale=navigator.onLine===false || Date.now()/1000-data.generatedAt>1800;
+  return `<div class="station-history"><span class="popup-eyebrow">Station average · past 7 days${stale?' · saved':''}</span>
+    <strong>${count?escapeHtml(formatDelay(total/count)):'No recorded arrivals'}</strong>
+    <small>${count?`${count.toLocaleString()} measured arrivals · ${escapeHtml(routes)}`:'Only routes tracked in Performance have history'}</small>
+    <small>${escapeHtml(data.from)} – ${escapeHtml(data.to)}</small></div>`;
+}
 function captureScheduleUpdates(entities){
   latestScheduleUpdates=new Map();
   for(const entity of entities){
@@ -896,6 +918,7 @@ function getTransitDiagnostics(){
     retrySeconds:Object.fromEntries(Object.entries(backoff).map(([key,value])=>[key,Math.max(0,Math.ceil((value.until-Date.now())/1000))]))};
 }
 function loadStationDepartures(marker){
+  if(isIntercityOnly(marker)) return Promise.resolve();
   if(![0,1,3].includes(marker?._stopType) || navigator.onLine===false || !isPageVisible()) return Promise.resolve();
   const key=marker._stopKey,previous=departuresByStation.get(key),now=Date.now();
   if(departuresPending.has(key)) return departuresPending.get(key);
@@ -940,7 +963,8 @@ function loadStationDepartures(marker){
 function stationDepartureRows(marker){
   const record=departuresByStation.get(marker._stopKey);
   if(!record?.data) return [];
-  return ScheduleData.mergeDepartures(record.data,latestScheduleUpdates,{now:Date.now()/1000,
+  const data=record.data.filter(row=>!(/HUIA/i.test([row.routeId,routes[row.routeId]?.route_short_name].join(" "))));
+  return ScheduleData.mergeDepartures(data,latestScheduleUpdates,{now:Date.now()/1000,
     liveFresh:navigator.onLine!==false && arrivalsFeedState==="ready" && Date.now()-arrivalsLastUpdated<=120000,
     sequenceForTrip:id=>latestStopSequences.get(id)});
 }
@@ -966,21 +990,19 @@ function buildStationDepartureBoard(marker){
     const platformName=platform?.label || (platform?.name?.replace(marker._stopName,"").trim()?`Platform ${platform.name.replace(marker._stopName,"").trim()}`:"");
     const label={scheduled:"Scheduled",live:"Live",estimated:"Estimated",canceled:"Cancelled"}[row.status];
     const eta=row.status==="canceled"?"Cancelled":formatEta(row.etaSec).replace("in ","");
-    const delay=row.delaySec==null?"":formatDelay(row.delaySec);
+    const delay=serviceDelayHtml(row.delaySec,row.status);
     const basis={upstream:"Recent stop delay applied to timetable",trip:"Current trip delay applied to timetable",stop:"Reported at this stop"}[row.delaySource]||"";
     const scheduled=row.timingKind==="arrival"?row.scheduledArrival:row.scheduledTime;
     const original=scheduled!=null && row.status!=="scheduled" && row.status!=="canceled" && Math.abs(row.etaSec-scheduled)>30
       ?`<small>Sched. ${clock.format(new Date(scheduled*1000))}</small>`:"";
     return `<div class="departure-row${row.status==="canceled"?" departure-canceled":""}">
       <span class="departure-badge" style="background:${color};color:${badgeTextColor(color)}">${escapeHtml(badge)}</span>
-      <span class="departure-destination">${escapeHtml(dest)}<small title="${basis}">${label}${platformName?` · ${escapeHtml(platformName)}`:""}${Number(row.pickupType)>1?" · Boarding by arrangement":""}</small>${delay?`<small class="departure-delay">${escapeHtml(delay)}</small>`:""}</span>
+      <span class="departure-destination">${escapeHtml(dest)}<small title="${basis}">${label}${platformName?` · ${escapeHtml(platformName)}`:""}${Number(row.pickupType)>1?" · Boarding by arrangement":""}</small>${delay}</span>
       <span class="departure-time">${clock.format(new Date(row.etaSec*1000))}<small>${row.timingKind==="arrival"?"Arrives · ":""}${escapeHtml(eta)}</small>${original}</span></div>`;
   }).join("");
   // Keep a useful live report while a new timetable request is loading or unavailable.
   const reports=rows.length?"":buildArrivalsBoard(marker._stopKey);
-  const summary=ScheduleData.delaySummary(rows);
-  const average=rows.length?`<div class="departure-average">${summary.count?`Average delay: <b>${escapeHtml(formatDelay(summary.average))}</b><small>${summary.count} of ${summary.total} upcoming services${summary.estimated?` · ${summary.estimated} estimated`:""}</small>`:'Average delay unavailable<small>No current delay reports for these services</small>'}</div>`:"";
-  return `<div class="station-details station-departures"><b>${reports?"Station timetable":"Next services"}</b>${average}${items}${message?`<div class="departure-message" role="status">${escapeHtml(message)}</div>`:""}${rows.length?'<div class="station-coordinates">Auckland time · departures unless marked Arrives. Estimates apply reported delays to the timetable; they can change.</div>':""}</div>${reports}`;
+  return `<section class="station-departures"><div class="board-heading"><h3>Next services</h3><small>Auckland time</small></div>${items}${message?`<div class="departure-message" role="status">${escapeHtml(message)}</div>`:""}</section>${reports}`;
 }
 
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
@@ -1053,11 +1075,43 @@ function buildArrivalsBoard(key){
 function buildStopPopup(m){
   const st=STOP_STYLE[m._stopType]||STOP_STYLE[0];
   const rail=[1,3].includes(m._stopType), info=m._stopInfo;
-  const head=`<b>${escapeHtml(m._stopName)}</b><br><span style="color:var(--text-subtle);font-size:0.92em;">${rail ? st.label : `Stop ${escapeHtml(String(m._stopCode||"—"))} &middot; ${st.label}`}</span>`;
-  const platforms=rail && info?.platforms?.length ? `<details class="station-details"><summary>${m._stopType===3?"Bays":"Platforms"} / stop codes</summary>${info.platforms.map(p=>`<div>${escapeHtml(p.label||p.name.replace(m._stopName,"").trim()||"Station")} &middot; ${escapeHtml(p.code)}${p.description?`<br>${escapeHtml(p.description)}`:""}</div>`).join("")}</details>` : "";
-  const position=rail ? `<div class="station-coordinates">${m.getLatLng().lat.toFixed(5)}, ${m.getLatLng().lng.toFixed(5)}</div>` : "";
-  const board=[0,1,3].includes(m._stopType)?buildStationDepartureBoard(m):buildArrivalsBoard(m._stopKey);
-  return `<div style="font-size:0.9em;line-height:1.35;min-width:150px;">${head}${platforms}${board}${position}</div>`;
+  const head=`<header class="station-heading"><span class="popup-eyebrow">${rail?st.label:`Stop ${escapeHtml(String(m._stopCode||'—'))}`}</span><h2>${escapeHtml(m._stopName)}</h2></header>`;
+  const platforms=rail && info?.platforms?.length ? `<details class="popup-details station-details" data-detail="platforms"><summary>${m._stopType===3?"Bays":"Platforms"} / stop codes</summary>${info.platforms.map(p=>`<div>${escapeHtml(p.label||p.name.replace(m._stopName,"").trim()||"Station")} &middot; ${escapeHtml(p.code)}${p.description?`<br>${escapeHtml(p.description)}`:""}</div>`).join("")}</details>` : "";
+  const intercity=m._stopType===1?buildIntercityBoard(m):'';
+  const board=isIntercityOnly(m)?intercity:[0,1,3].includes(m._stopType)?stationHistoryHtml(m)+buildStationDepartureBoard(m)+intercity:buildArrivalsBoard(m._stopKey);
+  return `<div class="station-card">${head}${board}${platforms}</div>`;
+}
+
+function buildIntercityBoard(marker){
+  if(IntercityData.station(marker._stopName)<0)return '';
+  const rows=IntercityData.services(marker._stopName,Date.now()/1000,isIntercityOnly(marker)?8:4);
+  const day=new Intl.DateTimeFormat('en-NZ',{timeZone:'Pacific/Auckland',weekday:'short',day:'numeric',month:'short'});
+  const items=rows.map(r=>`<div class="departure-row intercity-row"><span class="departure-destination"><b>${r.name}</b><small>${escapeHtml(r.destination)}</small><small>${day.format(new Date(r.epoch*1000))} · ${r.kind==='arrival'?'Arrival':'Departure'}</small></span><span class="departure-time">${r.time}<small>Scheduled</small></span></div>`).join('');
+  return `<section class="station-departures intercity-board"><div class="board-heading"><h3>Intercity timetable</h3><small>Next 7 days</small></div>${items||'<p>No scheduled services in the next 7 days.</p>'}
+    <details class="popup-details" data-detail="timetable"><summary>Timetable information</summary><p>Scheduled times only. Check the operator for changes or delays.</p><p>Te Huia does not run on public holidays. Published maintenance and Christmas closures are included.</p><a href="${IntercityData.sources.huiaClosures}" target="_blank" rel="noopener">Te Huia timetable & closures</a><br><a href="${IntercityData.sources.explorer}" target="_blank" rel="noopener">Northern Explorer timetable</a><small>Checked ${IntercityData.checked} · Auckland time</small></details></section>`;
+}
+
+function updateStationPanel(marker){
+  let panel=document.getElementById('station-panel');
+  if(!panel){
+    panel=document.createElement('aside');panel.id='station-panel';panel.hidden=true;
+    panel.setAttribute('aria-label','Station services');
+    panel.innerHTML='<button type="button" class="station-panel-close" aria-label="Close station services">×</button><div class="station-panel-content"></div>';
+    document.body.append(panel);
+    panel.querySelector('button').addEventListener('click',()=>{const selected=_openStopMarker;selected?.closePopup();selected?.getElement?.()?.focus?.();});
+    document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!panel.hidden)_openStopMarker?.closePopup();});
+    window.addEventListener('resize',()=>{if(_openStopMarker){_openStopMarker.getPopup().options.autoPan=window.innerWidth<900;updateStationPanel(_openStopMarker);}});
+  }
+  panel.hidden=!marker || window.innerWidth<900;
+  if(panel.hidden)return;
+  const content=panel.querySelector('.station-panel-content'),html=buildStopPopup(marker);
+  if(content.innerHTML===html)return;
+  const same=panel.dataset.station===marker._stopKey;
+  const open=same?[...content.querySelectorAll('details[open]')].map(d=>d.dataset.detail):[];
+  const scroll=same?content.scrollTop:0;
+  content.innerHTML=html;panel.dataset.station=marker._stopKey;
+  for(const detail of content.querySelectorAll('details'))detail.open=open.includes(detail.dataset.detail);
+  content.scrollTop=scroll;
 }
 
 function makeStopMarker(s){
@@ -1068,10 +1122,11 @@ function makeStopMarker(s){
   m._stopInfo=s[6];
   if([1,3].includes(s[4])) m.bindTooltip(escapeHtml(s[3]),{direction:"top",offset:[0,-12]});
   // Function content => rebuilt on every open, so the arrivals board stays current.
-  m.bindPopup(()=>buildStopPopup(m),{maxWidth:240,className:"vehicle-popup"});
+  m.bindPopup(()=>buildStopPopup(m),{maxWidth:Math.min(320,window.innerWidth-70),className:"vehicle-popup station-popup",autoPan:window.innerWidth<900});
   // Track the open station popup so the poll can refresh its arrivals board live.
   m.on("popupopen",()=>{
     _openStopMarker=m;
+    updateStationPanel(m);
     if([0,1,3].includes(s[4])){
       const mobile=window.innerWidth<=600;
       if(mobile){
@@ -1092,7 +1147,7 @@ function makeStopMarker(s){
     }
     enrichOpenStation();
   });
-  m.on("popupclose",()=>{ if(_openStopMarker===m) _openStopMarker=null; });
+  m.on("popupclose",()=>{ if(_openStopMarker===m){_openStopMarker=null;updateStationPanel(null);} });
   // Open on click/tap (bindPopup's default). Works on both desktop and touch and stays open
   // until dismissed, unlike the old hover behaviour which vanished as the cursor moved off.
   return m;
@@ -1100,10 +1155,12 @@ function makeStopMarker(s){
 let _openStopMarker=null;
 function refreshOpenStopPopup(){
   const m=_openStopMarker;
-  if(m && m.isPopupOpen && m.isPopupOpen()){ try{ m.setPopupContent(buildStopPopup(m)); }catch{} }
+  if(m && m.isPopupOpen && m.isPopupOpen()){ try{ m.setPopupContent(buildStopPopup(m));updateStationPanel(m); }catch{} }
 }
 function enrichOpenStation(loadTimetable=true){
   if(!_openStopMarker || navigator.onLine===false) return;
+  if(isIntercityOnly(_openStopMarker))return;
+  loadStationHistory(_openStopMarker);
   if(loadTimetable) loadStationDepartures(_openStopMarker).catch(()=>{});
   const boardRows=stationDepartureRows(_openStopMarker);
   const ids=(boardRows.length?boardRows.filter(row=>!row.destination || !row.routeId):arrivalsByStop.get(_openStopMarker._stopKey)||[]).filter(a=>a.etaSec>=Date.now()/1000-30)
@@ -1133,31 +1190,7 @@ function renderStopsForViewport(){
   for(const [key,marker] of stopMarkersByKey){
     if(!visible.has(key)){ stopsLayer.removeLayer(marker); stopMarkersByKey.delete(key); }
   }
-  // Nearby rail and bus hubs can occupy the same screen pixels at regional zoom.
-  // Shift only their icons; geographic coordinates and arrival matching stay exact.
-  const occupied=[];
-  for(const marker of stopMarkersByKey.values()){
-    if(![1,3].includes(marker._stopType)) continue;
-    const point=map.latLngToContainerPoint(marker.getLatLng());
-    let dx=0,dy=0,found=false;
-    for(let ring=0;ring<=8 && !found;ring++){
-      for(let x=-ring;x<=ring && !found;x++) for(let y=-ring;y<=ring && !found;y++){
-        if(ring && Math.max(Math.abs(x),Math.abs(y))!==ring) continue;
-        const px=point.x+x*34,py=point.y+y*34;
-        if(occupied.every(p=>Math.abs(px-p.x)>=32 || Math.abs(py-p.y)>=32)){
-          dx=x*34;dy=y*34;occupied.push({x:px,y:py});found=true;
-        }
-      }
-    }
-    const offset=`${dx}|${dy}`;
-    if(marker._stationOffset===offset) continue;
-    const icon=marker._stopType===3?busStationIcon:stationIcon;
-    marker.setIcon(L.divIcon({...icon.options,iconAnchor:[icon.options.iconAnchor[0]-dx,icon.options.iconAnchor[1]-dy],
-      popupAnchor:[dx,dy+icon.options.popupAnchor[1]]}));
-    marker.getTooltip()?.setLatLng(marker.getLatLng());
-    if(marker.getTooltip()) marker.getTooltip().options.offset=L.point(dx,dy-12);
-    marker._stationOffset=offset;
-  }
+  // Icons remain anchored to their real location at every zoom.
 }
 
 let _stopsTimer=null;
@@ -1639,8 +1672,7 @@ function buildPopupForMarker(m){
     m.occupancy||"", m.bikesLine||"", m.extraLines||""
   );
   return base + '<br><button type="button" class="workspace-service-link">View service details →</button>'
-    + (m._progressHtml?`<div style="font-size:0.9em;line-height:1.3;margin-top:3px;">${m._progressHtml}</div>`:"")
-    + (m.pairedTo?`<br><b>Paired to:</b> ${m.pairedTo} (6-car)`:"");
+    + (m.carriageCount && navigator.onLine!==false && Date.now()/1000-m.carriageReportedAt<=120?`<div class="train-carriages">${m.carriageCount} carriages</div>`:'');
 }
 function refreshOpenPopup(m){
   if(m && m.isPopupOpen && m.isPopupOpen()) m.setPopupContent(buildPopupForMarker(m));
@@ -2636,7 +2668,8 @@ async function fetchVehicles(){
       const badgeText=badgeForRoute(typeKey,routeName);
 
       addOrUpdateMarker(vehicleId,lat,lon,color,typeKey,tripId,{
-        currentType:typeKey,delaySec,serviceDate:v.vehicle?.trip?.start_date,tripStart,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText,bearingDeg:(ex.bearingDeg??null),_occColor:occColor
+        currentType:typeKey,delaySec,serviceDate:v.vehicle?.trip?.start_date,tripStart,vehicleLabel,licensePlate,busType,speedStr,scheduleLine,nextStopLine,occupancy,bikesLine,routeName,destination,extraLines,badgeText,bearingDeg:(ex.bearingDeg??null),_occColor:occColor,
+        carriageCount:isTrain?TransitData.carriageCount(v.vehicle):null,carriageReportedAt:toNum(v.vehicle.timestamp)
       });
 
       if(tripId){

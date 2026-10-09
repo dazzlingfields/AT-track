@@ -1,0 +1,21 @@
+/* Shared station board and compact vehicle cards. */
+.station-card,.vehicle-card{font-size:13px;line-height:1.45;color:var(--text-strong)}
+.station-heading{padding-right:15px;margin-bottom:14px}.station-heading h2{font-size:19px;line-height:1.25;margin:4px 0 0;letter-spacing:-.3px}
+.popup-eyebrow{display:block;font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-subtle)}
+.station-history{background:var(--accent-weak);border-radius:10px;padding:12px;margin:0 0 16px}.station-history strong{display:block;font-size:21px;line-height:1.25;margin:4px 0}.station-history small,.popup-details small{display:block;color:var(--text-subtle);font-size:10px;margin-top:3px}.station-history p{margin:6px 0 0!important}
+.board-heading{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:3px}.board-heading h3{font-size:14px;margin:0}.board-heading small{color:var(--text-subtle);font-size:10px;white-space:nowrap}
+.station-departures{margin:0;border:0;padding:0}.station-departures+.station-departures{margin-top:18px}
+.departure-row{display:grid;grid-template-columns:36px minmax(0,1fr) auto;align-items:start;gap:9px;margin:0;padding:12px 0;border-bottom:1px solid var(--panel-border)}
+.departure-row:last-child{border-bottom:0}.departure-badge{min-width:0;margin-top:1px;line-height:18px;border-radius:6px}
+.departure-destination{font-weight:600;line-height:1.35;overflow-wrap:anywhere}.departure-destination small{font-weight:400;font-size:11px;margin:3px 0 5px}.departure-time{font-size:18px;line-height:1.25;font-variant-numeric:tabular-nums}.departure-time small{font-size:10px;font-weight:400}.departure-time small:first-of-type{margin-top:4px}
+.service-delay{display:inline-block;border-radius:5px;padding:3px 6px;font-size:11px;font-weight:700;line-height:1.35;margin-top:3px}
+.delay-late{color:#a62218;background:#ffebe8}.delay-early{color:#174b9c;background:#e9f1ff}.delay-ontime{color:#17623b;background:#e7f6ed}.delay-unknown,.delay-cancelled{color:var(--text-subtle);background:var(--panel-border)}
+.departure-canceled{opacity:.75}.departure-message{font-size:12px;padding:8px 0;color:var(--text-subtle)}
+.popup-details{border-top:1px solid var(--panel-border);padding-top:10px;margin-top:12px;font-size:11px;color:var(--text-subtle)}.popup-details summary{cursor:pointer;font-weight:600;color:var(--text-strong)}.popup-details>div{padding-top:6px}.popup-details p{margin:7px 0!important}.popup-details a{color:var(--accent)}
+.intercity-row{grid-template-columns:minmax(0,1fr) auto}.intercity-board{margin-top:16px}
+.vehicle-card h3{font-size:18px;line-height:1.3;margin:3px 0 7px}.vehicle-next-stop{padding:0;margin:10px 0 0}.vehicle-next-stop>b{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-subtle)}.vehicle-next-stop>div{margin-top:4px!important}.vehicle-next-stop div div{white-space:normal!important}.vehicle-load{font-size:12px;color:var(--text-subtle);margin-top:9px}.train-carriages{font-size:12px;font-weight:600;margin-top:8px}
+#station-panel{position:fixed;top:16px;right:66px;bottom:16px;width:380px;z-index:1250;box-sizing:border-box;background:var(--panel-bg);backdrop-filter:blur(18px);border:1px solid var(--panel-border);border-radius:16px;box-shadow:var(--elev-2);overflow:hidden}
+#station-panel[hidden]{display:none}.station-panel-content{height:100%;overflow:auto;box-sizing:border-box;padding:24px;overscroll-behavior:contain}.station-panel-close{position:absolute;top:10px;right:10px;width:32px;height:32px;border:0;border-radius:50%;background:var(--accent-weak);color:var(--text-strong);font:24px/1 sans-serif;cursor:pointer;z-index:1}.station-panel-close:focus-visible{outline:2px solid var(--accent)}
+@media(min-width:900px){.station-popup{display:none!important}.station-heading h2{font-size:24px}.station-card{font-size:14px}}
+@media(max-width:899px){#station-panel{display:none}.station-popup .leaflet-popup-content{margin:16px}.station-card{min-width:200px}.station-history{padding:10px;margin-bottom:12px}.departure-row{padding:10px 0;gap:7px}}
+@media(prefers-color-scheme:dark){.delay-late{color:#ffb7ae;background:#512b28}.delay-early{color:#b1ceff;background:#223b5e}.delay-ontime{color:#aae3bc;background:#214b33}}

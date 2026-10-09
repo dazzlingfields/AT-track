@@ -30,7 +30,7 @@ test('major bus hubs preserve all bays and IDs; ordinary road stops remain separ
 async function board(responses,type=3){
   const {context,rows}=stops(),station=context.dedupeStops(rows).find(s=>type===0?s[4]===0:s[3]==='Manukau Bus Station');
   const requests=[],records=new Map();
-  Object.assign(context,{navigator:{onLine:true},isPageVisible:()=>true,departuresByStation:records,
+  Object.assign(context,{isIntercityOnly:()=>false,navigator:{onLine:true},isPageVisible:()=>true,departuresByStation:records,
     departuresPending:new Map(),backoff:{departures:{until:0}},latestPlatformIds:new Map(),
     resolveStopKey:()=>null,departuresUrl:'/api/departures',refreshOpenStopPopup:()=>{},_openStopMarker:null,
     applyRateLimitBackoff:()=>{},parseRetryAfterMs:()=>60000,

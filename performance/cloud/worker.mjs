@@ -9,6 +9,7 @@ import Trips from '../trips.cjs';
 import CompactFeed from '../compact-feed.cjs';
 import WebPolicy from '../web-policy.cjs';
 import {allowedOrigin,withCors,preflight,cachedCatalogue} from './pages-api.mjs';
+import {cachedStationAverages} from './station-averages.mjs';
 import {collectorClass} from './alarm-collector.mjs';
 async function loadTripAsset(env,name){const response=await env.ASSETS.fetch(new Request('https://timetable.internal/timetables/'+encodeURIComponent(name)));return response.ok?response.json():null;}
 const {extract,dateAt}=Feed;
@@ -142,6 +143,10 @@ export default {
  async fetch(request,env,ctx){
   const url=new URL(request.url),origin=allowedOrigin(request,env);
   if(url.pathname.startsWith('/api/')&&request.method==='OPTIONS')return preflight(request,env);
+  if(url.pathname==='/api/network/station-averages'){
+   if(request.method!=='GET')return withCors(json({error:'Method not allowed'},405),origin);
+   try{return withCors(await cachedStationAverages(request,env,ctx),origin);}catch{return withCors(json({error:'Station history temporarily unavailable'},503),origin);}
+  }
   if(url.pathname==='/api/network/routes'){
    if(request.method!=='GET')return withCors(json({error:'Method not allowed'},405),origin);
    try{return withCors(await cachedCatalogue(request,env,ctx),origin);}catch{return withCors(json({error:'Route cache unavailable'},503),origin);}

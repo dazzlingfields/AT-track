@@ -12,7 +12,7 @@
  * and re-fetch the shell. Data files self-update via stale-while-revalidate, so a new
  * geojson commit is picked up on the next load or two without a version bump.
  */
-const CACHE_VERSION = "v8";
+const CACHE_VERSION = "v9";
 const SHELL_CACHE = `at-shell-${CACHE_VERSION}`;
 const DATA_CACHE  = `at-data-${CACHE_VERSION}`;
 const TILE_CACHE  = `at-tiles-${CACHE_VERSION}`;
@@ -25,6 +25,8 @@ const SHELL_ASSETS = [
   "./script.js",
   "./transit-data.js",
   "./schedule-data.js",
+  "./intercity-data.js",
+  "./popups.css",
   "./manifest.webmanifest",
   "./icon-192.png",
   "./icon-512.png",
